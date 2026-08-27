@@ -102,14 +102,11 @@ jobs:
       - uses: ./.github/actions/nix-env
         with:
           token: ${{ github.token }}
-      # Two passes, because they answer different questions. The first
-      # evaluates every system this flake claims -- an expression that only
-      # fails on aarch64-darwin is a Mac user's first `nix build`, and the
-      # default single-system check would never see it. It cannot build them:
-      # an x86_64-linux runner asked to build an aarch64-darwin derivation
-      # fails on the platform, which says nothing about the flake. The second
-      # pass builds the checks for the system actually running them.
-      - run: nix flake check --all-systems --no-build
+      # Two steps, because they answer different questions: whether every
+      # output evaluates on every system this flake offers it for, and whether
+      # this system's checks pass. See ci/check-eval.sh for why the obvious
+      # `nix flake check --all-systems` is neither.
+      - run: ci/check-eval.sh
       - run: nix flake check --print-build-logs
 
   test:
