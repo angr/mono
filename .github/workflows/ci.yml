@@ -1,0 +1,142 @@
+name: CI
+
+# One build, then everything in parallel.
+#
+# `warm` builds the whole closure once and publishes it as a Nix binary cache
+# (an actions/cache entry, with a GitHub release asset behind it for when that
+# entry is evicted). Every other job substitutes from it, so the test matrix
+# starts running suites within a minute of starting instead of each of its
+# jobs compiling angr's Rust extension for itself.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Only the job that publishes the store cache needs to write; the matrix jobs
+# run third-party test code and get a read-only token.
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+      # Two statements, not one: `echo "x=$(cmd)"` reports echo's exit status,
+      # so a matrix.py that raised would leave this step green and an empty
+      # matrix for `fromJSON` to choke on later.
+      - id: matrix
+        run: |
+          matrix=$(ci/matrix.py)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  warm:
+    name: Warm the store
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - id: nix
+        uses: ./.github/actions/nix-env
+        with:
+          token: ${{ github.token }}
+
+      - name: Build everything
+        run: nix build --no-link --print-build-logs .#ci-env .#binaries .#angr .#angr-management-lib
+
+      # A no-op when this revision's asset already exists, and skipped
+      # entirely for a fork's pull request, whose token cannot write releases.
+      - name: Publish the store cache
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ci/nix-cache.sh push "${{ steps.nix.outputs.cache-key }}"
+
+      # Saving an empty cache would be worse than saving none: actions/cache
+      # refuses to overwrite a key, so the stub would stick until the tree
+      # changed, and every job would restore it, skip the release fallback,
+      # and rebuild angr from source.
+      - id: worth-saving
+        if: always()
+        run: |
+          if compgen -G '.nix-cache/*.narinfo' > /dev/null; then
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/cache/save@v6
+        if: always() && steps.worth-saving.outputs.ok == '1'
+        with:
+          path: |
+            .nix-cache
+            ~/.cache/nix
+          key: nix-store-${{ steps.nix.outputs.cache-key }}
+
+  checks:
+    name: Flake checks
+    needs: warm
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/nix-env
+        with:
+          token: ${{ github.token }}
+      # --all-systems, because the default checks only the runner's system and
+      # this flake claims three: an expression that fails to evaluate on
+      # aarch64-darwin is a Mac user's first `nix build`, not our problem to
+      # discover later.
+      - run: nix flake check --all-systems --print-build-logs
+
+  test:
+    name: ${{ matrix.label }}
+    needs: [plan, warm]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/nix-env
+        with:
+          token: ${{ github.token }}
+
+      - name: Run ${{ matrix.label }}
+        run: ci/run-job.sh "${{ matrix.suites }}" --shard "${{ matrix.shard }}" --of "${{ matrix.shards }}"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.id }}
+          path: test-results/*.xml
+          if-no-files-found: ignore
+
+  summary:
+    name: Summary
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: test-results
+          pattern: results-*
+          merge-multiple: true
+      - run: ci/summarize.py test-results >> "$GITHUB_STEP_SUMMARY"
+      - name: Fail if any suite failed
+        if: needs.test.result != 'success'
+        run: exit 1

@@ -1,0 +1,60 @@
+{
+  "_comment": [
+    "`jobs` is the CI matrix: one entry per parallel job, and a job with more",
+    "than one shard becomes that many jobs. Group suites that finish in",
+    "seconds -- their cost is job setup, not testing -- and shard the ones",
+    "that do not, so the stage costs what its slowest shard costs.",
+    "`suites` is how each component's own suite is invoked."
+  ],
+  "jobs": [
+    {
+      "label": "components",
+      "suites": [
+        "archinfo",
+        "pyvex",
+        "pypcode",
+        "claripy",
+        "cle"
+      ]
+    },
+    {
+      "label": "angr-management",
+      "suites": [
+        "angr-management"
+      ],
+      "shards": 3
+    },
+    {
+      "label": "angr",
+      "suites": [
+        "angr"
+      ],
+      "shards": 10
+    }
+  ],
+  "suites": {
+    "archinfo": {
+      "env": "test"
+    },
+    "pyvex": {
+      "env": "test"
+    },
+    "pypcode": {
+      "env": "test"
+    },
+    "claripy": {
+      "env": "test"
+    },
+    "cle": {
+      "env": "test"
+    },
+    "angr": {
+      "env": "test",
+      "forked": true
+    },
+    "angr-management": {
+      "env": "gui",
+      "qt": true
+    }
+  }
+}

@@ -1,0 +1,62 @@
+name: Nix with the shared store
+description: >
+  Install Nix and put this revision's prebuilt store closure in front of it, so
+  a job that needs angr does not build angr.
+
+inputs:
+  token:
+    description: Token used to read the cache release.
+    required: true
+
+outputs:
+  cache-key:
+    description: The store-cache key for this revision.
+    value: ${{ steps.key.outputs.key }}
+
+runs:
+  using: composite
+  steps:
+    # Two statements, not one: `echo "key=$(cmd)"` reports echo's status, so a
+    # failed key would come out empty and every job would quietly rebuild.
+    - id: key
+      shell: bash
+      run: |
+        key=$(ci/nix-cache.sh key)
+        echo "key=$key" >> "$GITHUB_OUTPUT"
+
+    # The warm closure (angr, Qt, 450 MB of fixtures, 200 MB of angr-data)
+    # arrives compressed, is unpacked, and is then substituted into the store:
+    # three copies at the peak, against a runner image that leaves ~20 GB free.
+    # The Android SDK and .NET alone are most of what is in the way.
+    - name: Make room for the store
+      shell: bash
+      run: |
+        sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                    /usr/local/share/boost /usr/share/swift
+        df -h /
+
+    - uses: DeterminateSystems/nix-installer-action@v22
+      with:
+        # The cache is an ordinary file:// binary cache, so a job substitutes
+        # only the paths it actually asks for instead of importing 4 GB to run
+        # a two-minute suite. It is unsigned, and it is a directory this
+        # workflow just wrote, so signature checking has nothing to check.
+        extra-conf: |
+          extra-substituters = file://${{ github.workspace }}/.nix-cache
+          extra-trusted-substituters = file://${{ github.workspace }}/.nix-cache
+          require-sigs = false
+          max-jobs = auto
+          cores = 0
+
+    - id: cache
+      uses: actions/cache/restore@v6
+      with:
+        path: .nix-cache
+        key: nix-store-${{ steps.key.outputs.key }}
+
+    - name: Fall back to the release copy
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: ci/nix-cache.sh pull "${{ steps.key.outputs.key }}"
