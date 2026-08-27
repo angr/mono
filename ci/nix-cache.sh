@@ -27,8 +27,20 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cache_dir=${NIX_CACHE_DIR:-$root/.nix-cache}
 tag=${NIX_CACHE_TAG:-nix-cache}
 keep=${NIX_CACHE_KEEP:-5}
-# Everything a CI job might need from the store, warmed in one place.
-default_installables=(".#ci-env" ".#binaries" ".#angr" ".#angr-management-lib")
+# Everything a CI job might need from the store, named one by one.
+#
+# Not an aggregate derivation over the lot: `linkFarmFromDrvs` keys its entries
+# by derivation *name*, and both Python environments here are called
+# `python3-3.12.13-env`, so one silently displaced the other and the published
+# cache was missing an environment every test job needed. Listing the real
+# things is both shorter and impossible to get wrong that way.
+default_installables=(
+    ".#test-env"
+    ".#gui-env"
+    ".#binaries"
+    ".#angr"
+    ".#angr-management-lib"
+)
 
 # Everything the built closure depends on: the pins, the Nix expressions, and
 # each component's source tree. Git already hashes those trees, so the key is a

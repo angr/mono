@@ -270,6 +270,16 @@ in
     disabledTestPaths = (old.disabledTestPaths or [ ]) ++ [ "tests/test_auxiliary_server.py" ];
   });
 
+  # backrefs reaches this tree through pydantic-ai's documentation stack
+  # (pydantic-ai-slim -> griffelib -> mkdocstrings -> mkdocs-material). Its
+  # test_timeout asserts that a regex search exceeds a wall-clock budget and
+  # raises; on a busy CI runner the search finishes first and the test fails
+  # for having been too fast. Nothing here depends on that behaviour, and a
+  # timing assertion is not something to make fourteen jobs depend on.
+  backrefs = python-prev.backrefs.overridePythonAttrs (old: {
+    disabledTests = (old.disabledTests or [ ]) ++ [ "test_timeout" ];
+  });
+
   # py-key-value-aio is a transitive dependency of fastmcp -- a key-value
   # abstraction with a backend per store. fastmcp asks for it with no extras
   # and only ever uses the in-memory backend, but the package's own test suite

@@ -54,7 +54,17 @@ jobs:
           token: ${{ github.token }}
 
       - name: Build everything
-        run: nix build --no-link --print-build-logs .#ci-env .#binaries .#angr .#angr-management-lib
+        run: |
+          nix build --no-link --print-build-logs \
+            .#test-env .#gui-env .#binaries .#angr .#angr-management-lib
+
+      # The test jobs enter these shells, so the warm-up enters them too: it
+      # proves the exact derivations they will ask for are the ones now in the
+      # cache, rather than something that merely contains them.
+      - name: Enter the shells the test jobs use
+        run: |
+          nix develop .#test --command python3 -c 'import angr, pydantic_ai, fastmcp'
+          nix develop .#gui --command python3 -c 'import angrmanagement' 
 
       # A no-op when this revision's asset already exists, and skipped
       # entirely for a fork's pull request, whose token cannot write releases.

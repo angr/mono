@@ -180,11 +180,6 @@
           binaries = pkgs.runCommandLocal "angr-binaries" { } "ln -s ${binaries} $out";
           vex-src = pkgs.runCommandLocal "angr-vex" { } "ln -s ${vex} $out";
 
-          # One derivation that pulls in everything a CI shard needs. Building
-          # this in the warm-up job is what makes the matrix jobs cheap.
-          ci-env = pkgs.linkFarmFromDrvs "angr-mono-ci-env" (
-            [ (testEnvFor pkgs) ] ++ lib.optional (hasGui pkgs) (guiEnvFor pkgs)
-          );
         }
         // lib.optionalAttrs (hasGui pkgs) {
           gui-env = guiEnvFor pkgs;
