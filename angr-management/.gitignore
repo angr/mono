@@ -1,0 +1,33 @@
+projects
+
+# Python cruft
+*.pyc
+*.pyo
+*.egg-info
+dist
+build
+MANIFEST
+start.spec
+
+# vim temp files
+*.swp
+
+# emacs temp files
+*~
+
+# enaml cache
+__enamlcache__/
+
+
+.vscode
+.idea
+
+
+# Packaging
+packaging/pyinstaller/build
+packaging/pyinstaller/onefile
+packaging/pyinstaller/onedir
+packaging/appimage/AppDir
+packaging/appimage/appimage-builder-cache
+packaging/appimage/AppDir
+*.AppImage

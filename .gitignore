@@ -1,0 +1,21 @@
+result
+result-*
+.direnv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.import-cache/
+
+# Fixtures and external sources materialised from flake inputs; both are
+# pinned in flake.lock, neither belongs in this tree.
+/binaries
+/pyvex/vex
+
+# CI scratch.
+/test-results/
+/.nix-cache/
+/.ci-run/
+/.venv/
+
+*.tar.zst
+/.nix-cache-staging.*/

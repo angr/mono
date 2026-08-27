@@ -1,0 +1,14 @@
+*.egg-info/
+__pycache__/
+build/
+dist/
+pypcode/bin/
+docs/_build/
+*.so
+*.sla
+*.manifest
+*.gradle
+*.java
+.coverage
+coverage.xml
+coverage-native.xml

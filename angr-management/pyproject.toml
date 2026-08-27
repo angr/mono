@@ -1,0 +1,161 @@
+[build-system]
+requires = ["setuptools>=77.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "angr-management"
+dynamic = ["version"]
+description = "The official GUI for angr"
+requires-python = ">=3.12"
+readme = "README.md"
+license = "BSD-2-Clause"
+license-files = ["LICENSE"]
+dependencies = [
+  "PySide6-Essentials>=6.4.2,!=6.7.0",
+  "PySide6-QtAds>=4.2.1",
+  "QtAwesome==1.4.0",
+  "QtPy",
+  "angr[angrDB]==9.3.4.dev0",
+  "bidict",
+  "cle==9.3.4.dev0",
+  "ipython",
+  "pyqodeng>=0.0.10",
+  "requests[socks]",
+  "tomlkit",
+  "pyobjc-framework-Cocoa;platform_system == \"Darwin\"",
+  "thefuzz[speedup]",
+  "binsync==5.7.11",
+  "rpyc",
+  "qtconsole",
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only"
+]
+
+[project.urls]
+Homepage = "https://angr.io"
+Repository = "https://github.com/angr/angr-management"
+
+[project.optional-dependencies]
+bintrace = ["bintrace"]
+unicorn = ["angr[unicorn]"]
+llm = ["angr[llm]", "uvicorn"]
+keystone = ["angr[keystone]"]
+
+[dependency-groups]
+dev = [
+  {include-group = "docs"},
+  {include-group = "pyinstaller"},
+  {include-group = "testing"},
+]
+docs = [
+  "furo",
+  "myst-parser",
+  "sphinx",
+  "sphinx-autodoc-typehints"
+]
+pyinstaller = [
+  "pyinstaller~=6.19",
+  "pillow;platform_system == \"Darwin\"",
+  "keystone-engine;platform_system != \"Linux\" or platform_machine != \"aarch64\"",
+  "angr[unicorn]",
+]
+testing = [
+  "coverage",
+  "pytest",
+  "pytest-cov",
+  "pytest-durations",
+  "pytest-profiling",
+  "pytest-split",
+  "pytest-timeout",
+  "pytest-xdist",
+]
+
+[project.scripts]
+am = "angrmanagement.__main__:main"
+angr-management = "angrmanagement.__main__:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+exclude = ["screenshots", "flirt_signatures", "library_docs", "tests"]
+namespaces = false
+
+[tool.setuptools.package-data]
+angrmanagement = [
+  "plugins/**/plugin.toml",
+  "resources/fonts/*.ttf",
+  "resources/images/*",
+  "resources/themes/**/*",
+  "resources/flirt_signatures/**/*",
+  "resources/library_docs/**/*",
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "angrmanagement.__version__"}
+
+[tool.uv.sources]
+archinfo = { git = "https://github.com/angr/archinfo.git", branch = "master" }
+pyvex = { git = "https://github.com/angr/pyvex.git", branch = "master" }
+cle = { git = "https://github.com/angr/cle.git", branch = "master" }
+claripy = { git = "https://github.com/angr/claripy.git", branch = "master" }
+angr = { git = "https://github.com/angr/angr.git", branch = "master" }
+bintrace = { git = "https://github.com/mborgerson/bintrace", branch = "master" }
+
+[tool.ruff]
+line-length = 120
+exclude = ["angrmanagement/vendor/"]
+
+[tool.ruff.lint]
+select =  [
+    "B",
+    "C4",
+    "E",
+    "EXE",
+    "F",
+    "G",
+    "I",
+    "INT",
+    "ISC",
+    "PIE",
+    "PLE",
+    "RSE",
+    "SIM",
+    "T10",
+    "TID",
+    "TCH",
+    "UP",
+    "W",
+    "YTT",
+]
+
+ignore = [
+]
+
+[tool.ruff.lint.isort]
+required-imports = ["from __future__ import annotations"]
+
+[tool.mypy]
+packages = ["angrmanagement", "tests"]
+exclude = [
+    "angrmanagement/vendor/",
+    "/build",
+    "/dist",
+]
+follow_imports = "silent"
+
+[tool.coverage.run]
+branch = true
+source = [ "angrmanagement" ]
+parallel = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_lines = [
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+  "pragma: no cover",
+]

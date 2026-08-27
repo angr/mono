@@ -1,0 +1,108 @@
+[build-system]
+requires = ["setuptools>=77.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cle"
+description = "CLE Loads Everything (at least, many binary formats!) and provides a pythonic interface to analyze what they are and what they would look like in memory."
+license = "BSD-2-Clause"
+license-files = ["LICENSE"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dynamic = ["version"]
+requires-python = ">=3.12"
+dependencies = [
+    "archinfo==9.3.4.dev0",
+    "arpy==1.1.1",
+    "cart",
+    "minidump>=0.0.10",
+    "pefile==2024.8.26",
+    "pyelftools>=0.29",
+    "pyvex==9.3.4.dev0",
+    "pyxbe~=1.0.3",
+    "pyxdia~=0.1; sys_platform != 'emscripten'",
+    "sortedcontainers>=2.0",
+    "uefi-firmware~=1.16; sys_platform != 'emscripten'",
+]
+
+[project.readme]
+file = "README.md"
+content-type = "text/markdown"
+
+[project.urls]
+Homepage = "https://api.angr.io/projects/cle/en/latest/"
+Repository = "https://github.com/angr/cle"
+
+[project.optional-dependencies]
+pcode = [
+    "pypcode>=1.1"
+]
+
+[dependency-groups]
+docs = [
+    "furo",
+    "myst-parser",
+    "sphinx",
+    "sphinx-autodoc-typehints",
+]
+pyodide-testing = [
+    "bitarray",
+    "bitstring<4.4",
+    "cffi",
+    "pycryptodome",
+    "pytest",
+]
+testing = [
+    "cffi",
+    "pypcode>=1.1",
+    "pytest",
+    "pytest-xdist",
+    "setuptools", # Required for cffi runtime compilation support
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = { attr = "cle.__version__" }
+
+[tool.setuptools.package-data]
+cle = ["py.typed"]
+
+[tool.distutils.bdist_wheel]
+py_limited_api = "cp312"
+
+[tool.uv.sources]
+archinfo = { git = "https://github.com/angr/archinfo.git", branch = "master" }
+bitarray = { index = "pyodide", marker = "sys_platform == 'emscripten'" }
+cffi = { index = "pyodide", marker = "sys_platform == 'emscripten'" }
+pycryptodome = { index = "pyodide", marker = "sys_platform == 'emscripten'" }
+pyvex = { git = "https://github.com/angr/pyvex.git", branch = "master" }
+
+[[tool.uv.index]]
+name = "pyodide"
+url = "https://index.pyodide.org/314.0.0/"
+explicit = true
+
+[tool.black]
+line-length = 120
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+    "TID",
+    "UP",
+]
+
+[tool.ruff.lint.isort]
+required-imports = ["from __future__ import annotations"]

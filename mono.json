@@ -1,0 +1,60 @@
+{
+  "schema": 1,
+  "components": {
+    "angr": {
+      "upstream": "https://github.com/angr/angr",
+      "commit": "0e18fa25ef83c3db9813fe5a156da0013052e0e5",
+      "committed_at": "2026-08-26T16:33:23-07:00",
+      "subject": "SootClassHierarchy: Answer the subclass question for an interface (#6949)",
+      "excluded": []
+    },
+    "angr-management": {
+      "upstream": "https://github.com/angr/angr-management",
+      "commit": "aab96b51c95f6a4842ed912061fc46dfb8b22626",
+      "committed_at": "2026-08-24T12:21:44-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#1724)",
+      "excluded": [
+        "angrmanagement/resources/flirt_signatures",
+        "angrmanagement/resources/library_docs"
+      ]
+    },
+    "archinfo": {
+      "upstream": "https://github.com/angr/archinfo",
+      "commit": "bf85c7e47bb469878c564480e28c677abbe35acc",
+      "committed_at": "2026-08-24T12:21:37-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#372)",
+      "excluded": []
+    },
+    "claripy": {
+      "upstream": "https://github.com/angr/claripy",
+      "commit": "6ff4486278af191304ae8188ed6faa643cf43087",
+      "committed_at": "2026-08-24T12:21:21-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#741)",
+      "excluded": []
+    },
+    "cle": {
+      "upstream": "https://github.com/angr/cle",
+      "commit": "d2ecea068794d20b1f14d90eecc1bc4bc4cfa431",
+      "committed_at": "2026-08-26T15:51:09-07:00",
+      "subject": "Test CLE under Pyodide (#704)",
+      "excluded": []
+    },
+    "pypcode": {
+      "upstream": "https://github.com/angr/pypcode",
+      "commit": "559aacdc9d363fd19477d9daa40721279cd99248",
+      "committed_at": "2026-06-29T11:33:46-07:00",
+      "subject": "ci: bump actions/setup-python from 6.2.0 to 6.3.0",
+      "excluded": []
+    },
+    "pyvex": {
+      "upstream": "https://github.com/angr/pyvex",
+      "commit": "bdd5441035e02920eaa72c1c3cf9a4f0d572104d",
+      "committed_at": "2026-08-24T12:21:24-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#575)",
+      "excluded": [
+        "vex"
+      ]
+    }
+  },
+  "imported_at": "2026-08-27T13:03:41+00:00"
+}

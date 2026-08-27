@@ -1,0 +1,4 @@
+[submodule "vex"]
+	path = vex
+	url = https://github.com/angr/vex.git
+	branch = master

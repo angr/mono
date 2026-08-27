@@ -1,0 +1,189 @@
+from __future__ import annotations
+
+from enum import Enum
+from typing import TYPE_CHECKING, Any
+
+from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtGui import QPainter, QTextCursor, QTextDocument
+from PySide6.QtWidgets import QGraphicsSceneMouseEvent, QGraphicsSimpleTextItem
+
+from angrmanagement.config import Conf, ConfigurationManager
+
+from .qgraph_object import QCachedGraphicsItem
+
+if TYPE_CHECKING:
+    from angrmanagement.data.instance import Instance
+    from angrmanagement.logic.disassembly.info_dock import InfoDock
+    from angrmanagement.ui.views import DisassemblyView
+
+    from .block_code_objects import BlockTreeNode
+
+
+class QBlockCodeSelectionMode(Enum):
+    """
+    Defines the selection mode of this QBlockCode object.
+    """
+
+    SELECT_INSTRUCTION = 1
+    INVOKE_OBJ = 2
+    NOOP = 3
+
+
+class QBlockCode(QCachedGraphicsItem):
+    """
+    Top-level code widget for a selection of text. Will construct an AST using
+    QBlockCodeObj, mirroring the structure associated with the target object.
+    This text is then rendered using a QTextDocument, with appropriate styles
+    applied to it. Interaction events will be propagated to corresponding
+    objects.
+    """
+
+    GRAPH_ADDR_SPACING = 20
+
+    addr: int | None
+    _addr_str: str
+    obj: BlockTreeNode
+    _config: ConfigurationManager
+    disasm_view: DisassemblyView
+    infodock: InfoDock
+    parent: Any
+
+    def __init__(
+        self,
+        addr: int | None,
+        obj: BlockTreeNode,
+        config: ConfigurationManager,
+        instance: Instance,
+        infodock: InfoDock,
+        parent: Any = None,
+        selection_mode: QBlockCodeSelectionMode = QBlockCodeSelectionMode.SELECT_INSTRUCTION,
+    ) -> None:
+        super().__init__(parent=parent)
+        self.addr = addr
+        self._addr_str = "" if self.addr is None else f"{self.addr:08x}"
+        self.obj = obj
+        self._width = 0
+        self._height = 0
+        self._config = config
+        self.parent = parent
+        self.instance = instance
+        self.infodock = infodock
+        self._selection_mode = selection_mode
+        self._disasm_view = infodock.disasm_view
+        self._qtextdoc = QTextDocument()
+        self._qtextdoc.setDefaultFont(self._config.disasm_font)
+        self._qtextdoc.setDocumentMargin(0)
+
+        self._addr_item = None
+        if self.obj.display_address:
+            self._addr_item = QGraphicsSimpleTextItem(self._addr_str, self)
+            self._addr_item.setBrush(Conf.disasm_view_node_address_color)
+            self._addr_item.setFont(Conf.disasm_font)
+
+        self.update_document()
+        self.setToolTip("Address: " + self._addr_str)
+
+        self.refresh()
+
+    def refresh(self) -> None:
+        if self._addr_item is not None:
+            self._addr_item.setVisible(self._disasm_view.show_address)
+        self._layout_items_and_update_size()
+
+    def update_document(self) -> None:
+        self._qtextdoc.clear()
+        cur = QTextCursor(self._qtextdoc)
+        self.obj.render_to_doc(cur)
+
+    def paint(self, painter, option, widget=None) -> None:  # pylint: disable=unused-argument
+        self.update_document()
+        painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+        painter.setFont(self._config.disasm_font)
+
+        if self.should_highlight():
+            highlight_color = Conf.disasm_view_node_instruction_selected_background_color
+            painter.setBrush(highlight_color)
+            painter.setPen(highlight_color)
+            painter.drawRect(0, 0, self.width, self.height)
+
+        y = self.obj.top_margin_lines * Conf.disasm_font_height
+        x = 0
+        if self._disasm_view.show_address and self.obj.display_address:
+            x += self._addr_item.boundingRect().width() + self.GRAPH_ADDR_SPACING
+
+        painter.translate(QPointF(x, y))
+        self._qtextdoc.drawContents(painter)
+
+    #
+    # Event handlers
+    #
+
+    def get_obj_for_mouse_event(self, event: QGraphicsSceneMouseEvent) -> BlockTreeNode | None:
+        p = event.pos()
+
+        if self._disasm_view.show_address and self.obj.display_address:
+            offset = self._addr_item.boundingRect().width() + self.GRAPH_ADDR_SPACING
+            p.setX(p.x() - offset)
+
+        if self.obj.top_margin_lines > 0:
+            p.setY(p.y() - self.obj.top_margin_lines * Conf.disasm_font_height)
+
+        if p.x() >= 0:
+            hitpos = self._qtextdoc.documentLayout().hitTest(p, Qt.HitTestAccuracy.ExactHit)
+            if hitpos >= 0:
+                return self.obj.get_hit_obj(hitpos)
+
+        return None
+
+    def mousePressEvent(self, event: QGraphicsSceneMouseEvent) -> None:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._selection_mode == QBlockCodeSelectionMode.SELECT_INSTRUCTION
+            and self.addr is not None
+        ):
+            self.infodock.select_instruction(self.addr)
+
+        obj = self.get_obj_for_mouse_event(event)
+        if obj is not None:
+            obj.mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QGraphicsSceneMouseEvent) -> None:
+        obj = self.get_obj_for_mouse_event(event)
+        if obj is not None:
+            obj.mouseDoubleClickEvent(event)
+
+    def should_highlight(self) -> bool:
+        match self._selection_mode:
+            case QBlockCodeSelectionMode.SELECT_INSTRUCTION:
+                if self.addr is not None and self.infodock.is_instruction_selected(self.addr):
+                    return True
+                if self.obj is not None:
+                    return self.obj.should_highlight() or self.obj.should_highlight_line
+            case QBlockCodeSelectionMode.INVOKE_OBJ:
+                if self.obj is not None:
+                    return self.obj.should_highlight() or self.obj.should_highlight_line
+            case QBlockCodeSelectionMode.NOOP:
+                return False
+        return False
+
+    #
+    # Private methods
+    #
+
+    def _layout_items_and_update_size(self) -> None:
+        self.update_document()
+
+        x, y = 0, self.obj.top_margin_lines * Conf.disasm_font_height
+        if self._disasm_view.show_address and self.obj.display_address:
+            self._addr_item.setPos(x, y)
+            x += self._addr_item.boundingRect().width() + self.GRAPH_ADDR_SPACING
+
+        x += self._qtextdoc.size().width()
+        y += self._qtextdoc.size().height()
+        y += self.obj.bottom_margin_lines * Conf.disasm_font_height
+        self._width = x
+        self._height = y
+        self.recalculate_size()
+
+    def _boundingRect(self):
+        return QRectF(0, 0, self._width, self._height)

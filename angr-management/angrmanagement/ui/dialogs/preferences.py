@@ -1,0 +1,602 @@
+from __future__ import annotations
+
+import enum
+import logging
+from datetime import datetime
+from itertools import chain
+from typing import TYPE_CHECKING, get_args
+
+from bidict import bidict
+from PySide6.QtCore import QSize, QSortFilterProxyModel, Qt
+from PySide6.QtGui import QColor, QStandardItem, QStandardItemModel
+from PySide6.QtWidgets import (
+    QAbstractScrollArea,
+    QCheckBox,
+    QComboBox,
+    QCompleter,
+    QDialog,
+    QDialogButtonBox,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListView,
+    QListWidget,
+    QListWidgetItem,
+    QPushButton,
+    QSizePolicy,
+    QSpinBox,
+    QSplitter,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from angrmanagement.config import Conf, save_config
+from angrmanagement.config.color_schemes import BASE_SCHEME, COLOR_SCHEMES
+from angrmanagement.config.config_manager import ENTRIES
+from angrmanagement.logic import GlobalInfo
+from angrmanagement.logic.url_scheme import AngrUrlScheme
+from angrmanagement.mcp import MCPServerManager
+from angrmanagement.ui.css import refresh_theme
+from angrmanagement.ui.widgets.qfont_option import QFontOption
+from angrmanagement.ui.widgets.qproperty_editor import (
+    ColorPropertyItem,
+    GroupPropertyItem,
+    PropertyModel,
+    QPropertyEditor,
+)
+from angrmanagement.utils.layout import add_to_grid
+
+if TYPE_CHECKING:
+    from angrmanagement.ui.workspace import Workspace
+
+
+class Page(QWidget):
+    """
+    Base class for pages.
+    """
+
+    def save_config(self):
+        raise NotImplementedError
+
+    NAME = NotImplemented
+
+
+class Integration(Page):
+    """
+    The integration page.
+    """
+
+    NAME = "OS Integration"
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+
+        self._url_scheme_chk: QCheckBox
+        self._url_scheme_text: QLineEdit
+
+        self._init_widgets()
+        self._load_config()
+
+    def _init_widgets(self) -> None:
+        # os integration
+        os_integration = QGroupBox("OS integration")
+        self._url_scheme_chk = QCheckBox("Register angr URL scheme (angr://).")
+        self._url_scheme_text = QLineEdit()
+        self._url_scheme_text.setReadOnly(True)
+        self._daemon_chk = QCheckBox("Always use local RPC daemon")
+        url_scheme_lbl = QLabel("Currently registered to:")
+
+        os_layout = QVBoxLayout()
+        os_layout.addWidget(self._url_scheme_chk)
+        os_layout.addWidget(self._daemon_chk)
+        os_layout.addWidget(url_scheme_lbl)
+        os_layout.addWidget(self._url_scheme_text)
+
+        os_integration.setLayout(os_layout)
+
+        layout = QVBoxLayout()
+        layout.addWidget(os_integration)
+        layout.addStretch()
+        self.setLayout(layout)
+
+    def _load_config(self) -> None:
+        scheme = AngrUrlScheme()
+        try:
+            registered, register_as = scheme.is_url_scheme_registered()
+            self._url_scheme_chk.setChecked(registered)
+            self._url_scheme_text.setText(str(register_as) if registered else "")
+        except NotImplementedError:
+            # the current OS is not supported
+            self._url_scheme_chk.setDisabled(True)
+
+        self._daemon_chk.setChecked(Conf.use_daemon)
+
+    def save_config(self) -> None:
+        scheme = AngrUrlScheme()
+        try:
+            registered, _ = scheme.is_url_scheme_registered()
+            if registered != self._url_scheme_chk.isChecked():
+                # we need to do something
+                if self._url_scheme_chk.isChecked():
+                    scheme.register_url_scheme()
+                else:
+                    scheme.unregister_url_scheme()
+        except NotImplementedError:
+            # the current OS is not supported
+            pass
+
+        Conf.use_daemon = self._daemon_chk.isChecked()
+        if Conf.use_daemon and not GlobalInfo.client_id and GlobalInfo.main_window is not None:
+            GlobalInfo.main_window._run_daemon()
+
+
+CUSTOM_SCHEME_NAME = "Custom"
+
+
+class ThemeAndColors(Page):
+    """
+    Theme and Colors preferences page.
+    """
+
+    NAME = "Theme and Colors"
+    _schemes_combo: QComboBox
+    _base_scheme: QLabel
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent=parent)
+
+        self._colors_to_save = {}
+        self._conf_to_save = {}
+
+        self._init_widgets()
+
+    def _init_widgets(self) -> None:
+        page_layout = QGridLayout(self)
+        page_layout.setColumnStretch(1, 1)
+
+        page_layout.addWidget(QLabel("Load Theme:"), 0, 0)
+        self._schemes_combo = QComboBox(self)
+        current_theme_idx = 0
+        for idx, name in enumerate(sorted(COLOR_SCHEMES) + [CUSTOM_SCHEME_NAME]):
+            if name == Conf.theme_name:
+                current_theme_idx = idx
+            self._schemes_combo.addItem(name)
+        self._schemes_combo.setCurrentIndex(current_theme_idx)
+        self._schemes_combo.currentTextChanged.connect(self._on_scheme_selected)
+        page_layout.addWidget(self._schemes_combo, 0, 1)
+
+        page_layout.addWidget(QLabel("Base Theme:"), 1, 0)
+        self._base_scheme = QLabel(Conf.base_theme_name)
+        page_layout.addWidget(self._base_scheme, 1, 1)
+
+        root = GroupPropertyItem("root")
+        for ce in ENTRIES:
+            if ce.type_ is QColor:
+                prop = ColorPropertyItem(ce.name, getattr(Conf, ce.name))
+                root.addChild(prop)
+                self._colors_to_save[ce.name] = (ce, prop)
+            elif issubclass(ce.type_, enum.Enum):
+                self._conf_to_save[ce.name] = ce.value
+
+        self._model = PropertyModel(root)
+        self._tree = QPropertyEditor()
+        self._tree.set_description_visible(False)
+        self._tree.setModel(self._model)
+        page_layout.addWidget(self._tree, 2, 0, 1, 2)
+
+    def _load_color_scheme(self, name: str) -> None:
+        if name not in COLOR_SCHEMES:
+            return
+
+        self._model.beginResetModel()
+        scheme = COLOR_SCHEMES[name] if name == BASE_SCHEME else {**COLOR_SCHEMES[BASE_SCHEME], **COLOR_SCHEMES[name]}
+        for prop, value in scheme.items():
+            if prop in self._colors_to_save:
+                row = self._colors_to_save[prop][1]
+                row.value = value
+            if prop in self._conf_to_save:
+                self._conf_to_save[prop] = value
+        self._model.endResetModel()
+
+    def _on_scheme_selected(self, text: str) -> None:
+        if text != CUSTOM_SCHEME_NAME:
+            self._load_color_scheme(text)
+            self._base_scheme.setText(text)
+
+    def save_config(self) -> None:
+        # pylint: disable=assigning-non-slot
+        Conf.theme_name = self._schemes_combo.currentText()
+        Conf.base_theme_name = self._base_scheme.text()
+        for ce, row in self._colors_to_save.values():
+            setattr(Conf, ce.name, row.value)
+        for name, value in self._conf_to_save.items():
+            setattr(Conf, name, value)
+
+
+class Style(Page):
+    """
+    Preference pane for UI style choices
+    """
+
+    NAME = "Style"
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent=parent)
+        self._init_widgets()
+
+    def _init_widgets(self) -> None:
+        page_layout = QVBoxLayout(self)
+
+        # Log format
+        log_format_layout = QHBoxLayout()
+        log_format_lbl = QLabel("Log datetime Format String:")
+        log_format_lbl.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
+        log_format_layout.addWidget(log_format_lbl)
+
+        self.log_format_entry = QComboBox(self)
+        fmt: str = Conf.log_timestamp_format
+        ts = datetime.now()
+        self._fmt_map = bidict({ts.strftime(i): i for i in [fmt, "%X", "%c"]})
+        # fmt must be in _fmt_map.inverse for this to work
+        if fmt not in self._fmt_map.inverse:
+            fmt = self._fmt_map[ts.strftime(fmt)]
+        for i in self._fmt_map:
+            self.log_format_entry.addItem(i)
+        # pylint: disable=unsubscriptable-object
+        self.log_format_entry.setCurrentText(self._fmt_map.inverse[fmt])
+        self.log_format_entry.setEditable(True)
+        log_format_layout.addWidget(self.log_format_entry)
+        page_layout.addLayout(log_format_layout)
+
+        # Font options
+        fonts_group_box = QGroupBox("Fonts")
+        fonts_layout = QGridLayout()
+        fonts_group_box.setLayout(fonts_layout)
+        page_layout.addWidget(fonts_group_box)
+        entries = [
+            ("Application Font", "ui_default_font"),
+            ("Tabular View Font", "tabular_view_font"),
+            ("Disassembly Font", "disasm_font"),
+            ("SymExc Font", "symexec_font"),
+            ("Code Font", "code_font"),
+        ]
+        self._fonts_widgets = [(QLabel(f"{name}:"), QFontOption(key, self)) for name, key in entries]
+        add_to_grid(fonts_layout, 2, chain(*self._fonts_widgets))
+
+        page_layout.addStretch()
+
+    def save_config(self) -> None:
+        fmt = self.log_format_entry.currentText()
+        if fmt:
+            Conf.log_timestamp_format = self._fmt_map.get(fmt, fmt)
+        for _, font_picker in self._fonts_widgets:
+            font_picker.update()
+
+
+_log = logging.getLogger(__name__)
+
+_known_model_names: list[str] | None = None
+
+
+def _get_known_model_names() -> list[str]:
+    """Return a sorted list of model names that pydantic-ai supports."""
+    global _known_model_names  # pylint:disable=global-statement
+    if _known_model_names is not None:
+        return _known_model_names
+    try:
+        from pydantic_ai.models import KnownModelName  # pylint: disable=import-outside-toplevel
+
+        value = getattr(KnownModelName, "__value__", KnownModelName)
+        names = get_args(value)
+        _known_model_names = sorted(str(n) for n in names) if names else []
+    except (ImportError, AttributeError):
+        _log.debug("Failed to load pydantic-ai model names", exc_info=True)
+        _known_model_names = []
+    return _known_model_names
+
+
+class LLMSettings(Page):
+    """
+    LLM configuration page.
+    """
+
+    NAME = "LLM"
+
+    def __init__(self, workspace: Workspace | None = None, parent=None) -> None:
+        super().__init__(parent)
+        self.workspace = workspace
+
+        self._model_combo: QComboBox
+        self._api_key_edit: QLineEdit
+        self._api_base_edit: QLineEdit
+        self._preload_chk: QCheckBox
+        self._auto_rename_vars_chk: QCheckBox
+        self._auto_rename_func_chk: QCheckBox
+        self._auto_retype_vars_chk: QCheckBox
+        self._auto_summarize_chk: QCheckBox
+
+        self._init_widgets()
+        self._load_config()
+
+    def _init_widgets(self) -> None:
+        group = QGroupBox("LLM Configuration")
+        layout = QGridLayout()
+
+        layout.addWidget(QLabel("Model:"), 0, 0)
+        self._model_combo = QComboBox()
+        self._model_combo.setEditable(True)
+        self._model_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._model_combo.lineEdit().setPlaceholderText("e.g. gpt-4o, claude-sonnet-4-20250514, ollama/llama3")
+
+        # Populate with known pydantic-ai model names
+        model_names = _get_known_model_names()
+        source_model = QStandardItemModel()
+        for name in model_names:
+            source_model.appendRow(QStandardItem(name))
+
+        # Set up a case-insensitive filter proxy so the completer matches anywhere in the string
+        proxy = QSortFilterProxyModel()
+        proxy.setSourceModel(source_model)
+        proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+
+        completer = QCompleter(proxy, self)
+        completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        completer.setMaxVisibleItems(15)
+        self._model_combo.setCompleter(completer)
+
+        # Also populate the combo box dropdown itself
+        self._model_combo.setModel(source_model)
+
+        layout.addWidget(self._model_combo, 0, 1)
+
+        layout.addWidget(QLabel("API Key:"), 1, 0)
+        self._api_key_edit = QLineEdit()
+        self._api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._api_key_edit.setPlaceholderText("Optional (uses env var if empty)")
+        layout.addWidget(self._api_key_edit, 1, 1)
+
+        layout.addWidget(QLabel("API Base URL:"), 2, 0)
+        self._api_base_edit = QLineEdit()
+        self._api_base_edit.setPlaceholderText("Optional (for custom endpoints)")
+        layout.addWidget(self._api_base_edit, 2, 1)
+
+        group.setLayout(layout)
+
+        options_group = QGroupBox("Options")
+        options_layout = QVBoxLayout()
+        self._preload_chk = QCheckBox("Auto-refine callees after decompilation")
+        options_layout.addWidget(self._preload_chk)
+        self._auto_rename_vars_chk = QCheckBox("Auto-rename variables after decompilation")
+        options_layout.addWidget(self._auto_rename_vars_chk)
+        self._auto_rename_func_chk = QCheckBox("Auto-rename function after decompilation")
+        options_layout.addWidget(self._auto_rename_func_chk)
+        self._auto_retype_vars_chk = QCheckBox("Auto-retype variables after decompilation")
+        options_layout.addWidget(self._auto_retype_vars_chk)
+        self._auto_summarize_chk = QCheckBox("Auto-summarize function after decompilation")
+        options_layout.addWidget(self._auto_summarize_chk)
+        options_group.setLayout(options_layout)
+
+        page_layout = QVBoxLayout()
+        page_layout.addWidget(group)
+        page_layout.addWidget(options_group)
+        page_layout.addStretch()
+        self.setLayout(page_layout)
+
+    def _load_config(self) -> None:
+        self._model_combo.setCurrentText(Conf.llm_model)
+        self._api_key_edit.setText(Conf.llm_api_key)
+        self._api_base_edit.setText(Conf.llm_api_base)
+        self._preload_chk.setChecked(Conf.llm_preload_callees)
+        self._auto_rename_vars_chk.setChecked(Conf.llm_auto_rename_variables)
+        self._auto_rename_func_chk.setChecked(Conf.llm_auto_rename_function)
+        self._auto_retype_vars_chk.setChecked(Conf.llm_auto_retype_variables)
+        self._auto_summarize_chk.setChecked(Conf.llm_auto_summarize)
+
+    def save_config(self) -> None:
+        Conf.llm_model = self._model_combo.currentText().strip()
+        Conf.llm_api_key = self._api_key_edit.text().strip()
+        Conf.llm_api_base = self._api_base_edit.text().strip()
+        Conf.llm_preload_callees = self._preload_chk.isChecked()
+        Conf.llm_auto_rename_variables = self._auto_rename_vars_chk.isChecked()
+        Conf.llm_auto_rename_function = self._auto_rename_func_chk.isChecked()
+        Conf.llm_auto_retype_variables = self._auto_retype_vars_chk.isChecked()
+        Conf.llm_auto_summarize = self._auto_summarize_chk.isChecked()
+        self._sync_llm_client_to_project()
+
+    def _sync_llm_client_to_project(self) -> None:
+        if self.workspace is None:
+            return
+        instance = self.workspace.main_instance
+        if instance is None or instance.project.am_none:
+            return
+        model = Conf.llm_model
+        if model:
+            try:
+                from angr.llm_client import LLMClient  # pylint: disable=import-outside-toplevel
+
+                instance.project.am_obj.llm_client = LLMClient(
+                    model=model,
+                    api_key=Conf.llm_api_key or None,
+                    api_base=Conf.llm_api_base or None,
+                )
+            except ImportError:
+                pass
+        else:
+            instance.project.am_obj.llm_client = None
+
+
+class MCPSettings(Page):
+    """
+    MCP server configuration page.
+    """
+
+    NAME = "MCP Server"
+
+    def __init__(self, workspace: Workspace | None = None, parent=None) -> None:
+        super().__init__(parent)
+        self.workspace = workspace
+
+        self._port_spin: QSpinBox
+        self._autostart_chk: QCheckBox
+        self._history_limit_spin: QSpinBox
+        self._auth_chk: QCheckBox
+        self._token_edit: QLineEdit
+
+        self._init_widgets()
+        self._load_config()
+
+    def _init_widgets(self) -> None:
+        group = QGroupBox("MCP Server")
+        layout = QGridLayout()
+
+        layout.addWidget(
+            QLabel(
+                "The MCP server lets an AI agent analyze the loaded binary and show results "
+                "(such as updated decompilation) live in angr management.\n"
+                "Start and stop it from the AI menu. It listens on localhost only."
+            ),
+            0,
+            0,
+            1,
+            2,
+        )
+
+        layout.addWidget(QLabel("Port:"), 1, 0)
+        self._port_spin = QSpinBox()
+        self._port_spin.setRange(1, 65535)
+        layout.addWidget(self._port_spin, 1, 1)
+
+        self._autostart_chk = QCheckBox("Start the MCP server automatically on launch")
+        layout.addWidget(self._autostart_chk, 2, 0, 1, 2)
+
+        layout.addWidget(QLabel("History limit:"), 3, 0)
+        self._history_limit_spin = QSpinBox()
+        self._history_limit_spin.setRange(0, 1_000_000)
+        self._history_limit_spin.setSpecialValueText("Unlimited")  # shown when the value is 0
+        self._history_limit_spin.setToolTip(
+            "Maximum number of tool calls kept in the MCP History view (0 = unlimited)."
+        )
+        layout.addWidget(self._history_limit_spin, 3, 1)
+
+        group.setLayout(layout)
+
+        auth_group = QGroupBox("Authentication")
+        auth_layout = QGridLayout()
+
+        self._auth_chk = QCheckBox("Require a bearer token to connect")
+        self._auth_chk.toggled.connect(self._on_auth_toggled)
+        auth_layout.addWidget(self._auth_chk, 0, 0, 1, 3)
+
+        auth_layout.addWidget(QLabel("Token:"), 1, 0)
+        self._token_edit = QLineEdit()
+        self._token_edit.setPlaceholderText("Leave empty to generate one when the server starts")
+        auth_layout.addWidget(self._token_edit, 1, 1)
+        generate_btn = QPushButton("Generate")
+        generate_btn.clicked.connect(self._on_generate_token)
+        auth_layout.addWidget(generate_btn, 1, 2)
+
+        auth_group.setLayout(auth_layout)
+
+        page_layout = QVBoxLayout()
+        page_layout.addWidget(group)
+        page_layout.addWidget(auth_group)
+        page_layout.addStretch()
+        self.setLayout(page_layout)
+
+    def _on_auth_toggled(self, checked: bool) -> None:
+        self._token_edit.setEnabled(checked)
+
+    def _on_generate_token(self) -> None:
+        self._token_edit.setText(MCPServerManager.generate_auth_token())
+
+    def _load_config(self) -> None:
+        self._port_spin.setValue(Conf.mcp_server_port)
+        self._autostart_chk.setChecked(Conf.mcp_server_autostart)
+        self._history_limit_spin.setValue(max(0, Conf.mcp_server_history_limit))
+        self._auth_chk.setChecked(Conf.mcp_server_auth_enabled)
+        self._token_edit.setText(Conf.mcp_server_auth_token)
+        self._token_edit.setEnabled(Conf.mcp_server_auth_enabled)
+
+    def save_config(self) -> None:
+        Conf.mcp_server_port = self._port_spin.value()
+        Conf.mcp_server_autostart = self._autostart_chk.isChecked()
+        Conf.mcp_server_history_limit = self._history_limit_spin.value()
+        Conf.mcp_server_auth_enabled = self._auth_chk.isChecked()
+        Conf.mcp_server_auth_token = self._token_edit.text().strip()
+
+
+class Preferences(QDialog):
+    """
+    Application preferences dialog.
+    """
+
+    def __init__(self, workspace: Workspace, parent=None) -> None:
+        super().__init__(parent)
+
+        self.workspace = workspace
+
+        self._pages = []
+
+        self._init_widgets()
+
+    def _init_widgets(self) -> None:
+        # contents
+        contents = QListWidget()
+        contents.setViewMode(QListView.ViewMode.ListMode)
+        contents.setMovement(QListView.Movement.Static)
+        # set the width to match the width of the content
+        contents.setSizeAdjustPolicy(QAbstractScrollArea.SizeAdjustPolicy.AdjustToContents)
+
+        def item_changed(item: QListWidgetItem) -> None:
+            pageno: int = item.data(1)
+            pages.setCurrentIndex(pageno)
+
+        contents.itemClicked.connect(item_changed)
+
+        self._pages.append(Integration())
+        self._pages.append(ThemeAndColors())
+        self._pages.append(Style())
+        self._pages.append(LLMSettings(workspace=self.workspace))
+        self._pages.append(MCPSettings(workspace=self.workspace))
+
+        pages = QStackedWidget()
+        for idx, page in enumerate(self._pages):
+            pages.addWidget(page)
+            list_item = QListWidgetItem(page.NAME)
+            list_item.setData(1, idx)
+            contents.addItem(list_item)
+
+        # buttons
+        buttons = QDialogButtonBox(parent=self)
+        buttons.setStandardButtons(QDialogButtonBox.StandardButton.Close | QDialogButtonBox.StandardButton.Ok)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Save")
+        buttons.accepted.connect(self._on_ok_clicked)
+        buttons.rejected.connect(self.close)
+
+        # layout
+        splitter = QSplitter()
+        splitter.addWidget(contents)
+        splitter.addWidget(pages)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+        main_layout = QVBoxLayout()
+        main_layout.addWidget(splitter)
+        main_layout.addWidget(buttons)
+
+        self.setLayout(main_layout)
+
+    def sizeHint(self):  # pylint:disable=no-self-use
+        return QSize(800, 800)
+
+    def _on_ok_clicked(self) -> None:
+        for page in self._pages:
+            page.save_config()
+        save_config()
+        refresh_theme()  # Apply updates to theme
+        self.close()

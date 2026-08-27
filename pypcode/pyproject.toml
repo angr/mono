@@ -1,0 +1,78 @@
+[project]
+name = "pypcode"
+description = "Machine code disassembly and IR translation library"
+license = "BSD-2-Clause AND Apache-2.0 AND Zlib"
+license-files = [ "LICENSE.txt" ]
+readme = { file = "README.md", content-type = "text/markdown" }
+classifiers = [
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+requires-python = ">=3.12"
+dynamic = [ "version" ]
+
+[project.urls]
+Homepage = "https://api.angr.io/projects/pypcode/en/latest/"
+Repository = "https://github.com/angr/pypcode"
+
+[project.optional-dependencies]
+docs = [
+    "furo",
+    "ipython",
+    "myst-parser",
+    "sphinx",
+    "sphinx-autodoc-typehints",
+]
+testing = [
+    "pytest",
+    "pytest-cov",
+    "coverage",
+    "gcovr",
+]
+
+[build-system]
+requires = [ "setuptools", "nanobind", "cmake" ]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+dynamic = { version = { attr = "pypcode.__version__.__version__" } }
+packages = [ "pypcode" ]
+ext-modules = [
+  { name = "pypcode.pypcode_native", sources = [] }
+]
+
+[tool.black]
+line-length = 120
+target-version = ['py312']
+
+[tool.ruff]
+line-length = 120
+extend-ignore = [
+	"E402", # Bottom imports
+]
+
+[tool.pytest.ini_options]
+addopts = [
+  "--cov=pypcode",
+  "--cov-report=term-missing",
+  "--cov-branch",
+]
+testpaths = [ "tests" ]
+
+[tool.coverage.run]
+branch = true
+source = [ "pypcode" ]
+parallel = true
+omit = [ "tests/*" ]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_lines = [
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:"
+]

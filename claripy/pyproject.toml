@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=77.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claripy"
+description = "An abstraction layer for constraint solvers"
+license = "BSD-2-Clause"
+license-files = ["LICENSE"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+urls = { Homepage = "https://github.com/angr/claripy" }
+requires-python = ">=3.12"
+dependencies = ["cachetools", "z3-solver==4.13.0.0"]
+dynamic = ["version"]
+
+[project.readme]
+file = "README.md"
+content-type = "text/markdown"
+
+[dependency-groups]
+dev = ["pytest", "pytest-xdist"]
+docs = ["furo", "myst-parser", "sphinx", "sphinx-autodoc-typehints"]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.package-data]
+claripy = ["py.typed"]
+
+[tool.setuptools.dynamic]
+version = { attr = "claripy.__version__" }
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "B",
+    "BLE",
+    "C4",
+    "E",
+    "EXE",
+    "F",
+    "FLY",
+    "FURB",
+    "G",
+    "I",
+    "INP",
+    "ISC",
+    "LOG",
+    "PERF",
+    "PIE",
+    "RET",
+    "RSE",
+    "RUF",
+    "SIM",
+    "T10",
+    "TCH",
+    "TID",
+    "W",
+    "UP",
+    "YTT",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B011", "BLE", "F841", "INP001"]
+"docs/conf.py" = ["INP001"]
+
+[tool.ruff.lint.isort]
+required-imports = ["from __future__ import annotations"]
