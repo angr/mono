@@ -349,8 +349,14 @@ def run_suite(
     ]
     if workers not in ("0", "1"):
         args += ["-n", workers]
-    if config.get("forked") and os.name != "nt":
-        # pytest-forked needs fork(2); Windows has none.
+    if config.get("forked") and os.name != "nt" and sys.platform != "darwin":
+        # pytest-forked needs fork(2); Windows has none. macOS has it and
+        # must not use it here: forking a process that has started a JVM
+        # (jpype, for pysoot) or touched CoreFoundation aborts, and angr's
+        # macOS shards died on `Fatal Python error: Aborted` until this.
+        # Upstream agrees -- its nightly runs Windows and macOS as
+        # `pytest -n auto --splits N --group M` with no --forked at all, and
+        # only the Linux container lane forks.
         args += ["--forked"]
     for test, reason in (excluded or {}).items():
         print(f"{name}: EXCLUDED {test}\n    {reason}", flush=True)

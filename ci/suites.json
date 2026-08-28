@@ -107,7 +107,11 @@
     },
     "phuzzer": {
       "env": "test",
-      "forked": true
+      "forked": true,
+      "excluded": {
+        "tests/test_fuzzer.py::test_multicb_spawn": "needs the afl-multi-cgc variant, which the shellphish-afl wheel does not ship -- it carries afl-cgc and afl-unix only, and upstream gets the multi-binary CGC fuzzer from an image that builds AFL from source. Fails with FileNotFoundError on .../bin/afl-multi-cgc/afl/afl-fuzz. The other five phuzzer tests run.",
+        "tests/test_fuzzer.py::test_pollenate": "needs the afl-multi-cgc variant, which the shellphish-afl wheel does not ship -- it carries afl-cgc and afl-unix only, and upstream gets the multi-binary CGC fuzzer from an image that builds AFL from source. Fails with FileNotFoundError on .../bin/afl-multi-cgc/afl/afl-fuzz. The other five phuzzer tests run."
+      }
     }
   },
   "native": [
