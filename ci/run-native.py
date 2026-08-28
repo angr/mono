@@ -176,6 +176,8 @@ def install(
     # does not is a ratchet that disagrees with the one it ports.
     install_one(
         "pytest", "pytest-xdist", "pytest-timeout", "pytest-split",
+        # Windows and macOS only in effect; see run_suite.
+        "pytest-rerunfailures",
         *(["pytest-cov", "coverage[toml]"] if coverage else []),
         "pytest-forked", "sortedcontainers-stubs>=2.4.3", "types-pefile",
         # cle's test_cclemory compiles a CFFI module at run time, and cffi
@@ -384,6 +386,16 @@ def run_suite(
     ]
     if workers not in ("0", "1"):
         args += ["-n", workers]
+    if sys.platform in ("win32", "darwin"):
+        # angr's native engines crash an xdist worker every so often on these
+        # two platforms -- `worker 'gw2' crashed while running
+        # test_veritesting_a`, one failure in 1356 -- and upstream's own
+        # nightly fails the same way on the same tests. A rerun distinguishes
+        # that from a real failure, which fails every attempt, instead of
+        # deselecting a test that passes nearly always. Linux does not need
+        # it and does not get it.
+        args += ["--reruns", "2", "--only-rerun", "crashed"]
+
     if config.get("forked") and os.name != "nt" and sys.platform != "darwin":
         # pytest-forked needs fork(2); Windows has none. macOS has it and
         # must not use it here: forking a process that has started a JVM

@@ -356,6 +356,11 @@ jobs:
       CFLAGS: "--coverage -O0 -g"
       LDFLAGS: "--coverage -g"
       COVERAGE: "1"
+      # No cached wheels. uv caches what it builds and setup-uv shares that
+      # cache between jobs, so this lane happily reused an extension built
+      # by an uninstrumented job -- pypcode's C measurement reported
+      # "nothing measured" because there was not a single .gcda to find.
+      UV_NO_CACHE: "1"
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -379,6 +384,13 @@ jobs:
             libxcb-render-util0 libxcb-shape0
       - name: Profile output path
         run: echo "LLVM_PROFILE_FILE=$PWD/test-results/%p-%m.profraw" >> "$GITHUB_ENV"
+      # rustup puts llvm-profdata and llvm-cov inside the toolchain, not on
+      # PATH, so the Rust measurement found neither and reported nothing --
+      # which is precisely what "expected but not measured" caught.
+      - name: The toolchain's LLVM on PATH
+        run: |
+          echo "$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's|host: ||p')/bin" \
+            >> "$GITHUB_PATH"
       - name: Install instrumented
         env:
           COMPONENTS: ${{ matrix.components }}
@@ -766,7 +778,7 @@ jobs:
           cp -r wheelhouse "$work/wheels"
           cd "$work/cle"
           uv sync --python pyodide@3.14 --group pyodide-testing \
-            --find-links ../../wheels --no-sources-package pyvex \
+            --find-links ../wheels --no-sources-package pyvex \
             --no-build-package bitarray --no-build-package cffi \
             --no-build-package pycryptodome
           uv run --no-sync pytest tests
