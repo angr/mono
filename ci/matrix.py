@@ -18,11 +18,13 @@ ROOT = Path(__file__).resolve().parent.parent
 # other field this file emits is either a suite name checked against
 # suites.json or an integer.
 RUNNERS = {
+    "ubuntu-22.04",
     "ubuntu-24.04",
     "ubuntu-24.04-arm",
     "ubuntu-latest",
     "windows-2022",
     "windows-latest",
+    "macos-14",
     "macos-15",
     "macos-15-intel",
     "macos-latest",
@@ -37,7 +39,6 @@ PYTHON = re.compile(r"^3\.\d{1,2}\Z", re.ASCII)
 # Naming one in a `native` entry would install, run, and fail a long way from
 # the cause, so it is refused here instead.
 NIX_ONLY = {
-    "pysoot": "needs a JVM; the native lane sets no JAVA_HOME",
     "tracer": "needs a 32-bit loader; the native lane sets no QEMU_LD_PREFIX",
     # 74 of angrop's assertions are `Keystone is not installed!`. The Nix test
     # environment carries keystone-engine; adding it to the native install
@@ -45,6 +46,10 @@ NIX_ONLY = {
     # wheel. Covered in the Nix lane, 122 passing.
     "angrop": "needs keystone-engine, which has no aarch64 Linux wheel",
 }
+
+# The reverse: suites the Nix lane cannot serve. phuzzer needs
+# shellphish-afl, a prebuilt AFL that nixpkgs does not carry and pip does.
+NATIVE_ONLY = {"phuzzer": "needs shellphish-afl, which nixpkgs does not carry"}
 
 
 def validate(config: dict) -> None:
@@ -68,9 +73,11 @@ def validate(config: dict) -> None:
             raise SystemExit(f"{job['label']}: a sharded job runs exactly one suite")
         covered.update(job["suites"])
 
-    missing = sorted(known - covered)
+    missing = sorted(known - covered - set(NATIVE_ONLY))
     if missing:
         raise SystemExit(f"no job runs: {', '.join(missing)}")
+    for suite in sorted(set(config["jobs"] and covered) & set(NATIVE_ONLY)):
+        raise SystemExit(f"{suite} is native-lane only: {NATIVE_ONLY[suite]}")
 
     for job in config.get("coverage", []):
         if job["suite"] not in known:

@@ -34,7 +34,18 @@ CORE = ["archinfo", "pyvex", "pypcode", "claripy", "cle", "angr", "angr-manageme
 
 # Upstream's dependents. `--ecosystem` adds them, because they are what makes
 # a core API change fail before it is merged rather than after.
-ECOSYSTEM = ["pysoot", "tracer", "angr-platforms", "angrop", "phuzzer"]
+# Each dependent, and how far into CORE it actually needs. Four of them need
+# angr; pysoot needs nothing from CORE at all -- jpype1 and frozendict, and
+# `requires-python = ">=3.10"` against angr's ">=3.12". Treating them alike
+# put angr in front of pysoot and made its 3.10 and 3.11 cells impossible to
+# build, which is two of the twelve upstream runs.
+ECOSYSTEM = {
+    "pysoot": [],
+    "tracer": ["angr"],
+    "angr-platforms": ["angr"],
+    "angrop": ["angr"],
+    "phuzzer": ["angr"],
+}
 
 # The extras upstream installs alongside angr.
 ANGR_EXTRAS = "[angrdb,unicorn,llm]"
@@ -66,14 +77,24 @@ def needed_core(names: list[str]) -> list[str]:
     """
     if not names:
         return CORE
-    # Every dependent needs angr, so naming one pulls the prefix out to angr
-    # however shallow the CORE names beside it are. Getting that wrong is
-    # quiet: the install succeeds and the suite fails on an import.
-    deepest = CORE.index("angr") if any(n in ECOSYSTEM for n in names) else -1
+    # A dependent pulls the prefix out to whatever it needs, however shallow
+    # the CORE names beside it are. Getting that wrong is quiet: the install
+    # succeeds and the suite fails on an import.
+    deepest = -1
     for n in names:
+        if n not in CORE and n not in ECOSYSTEM:
+            # A name nothing here recognises. Build everything rather than
+            # guess: a typo that installs nothing fails much later, on an
+            # import, and looks like a broken suite.
+            return CORE
         if n in CORE:
             deepest = max(deepest, CORE.index(n))
-    return CORE if deepest < 0 else CORE[: deepest + 1]
+        for dep in ECOSYSTEM.get(n, []):
+            deepest = max(deepest, CORE.index(dep))
+    # Below zero means every name asked for was a dependent that needs
+    # nothing from CORE -- pysoot on its own. Not the same as asking for
+    # nothing, which is handled above and means everything.
+    return CORE[: deepest + 1]
 
 
 def install(
@@ -164,6 +185,10 @@ def install(
     # needed_core() only knows about CORE and everything else fell through to
     # "install everything".
     for name in ECOSYSTEM if ecosystem else [n for n in ECOSYSTEM if n in (only or [])]:
+        if name == "phuzzer":
+            # AFL itself, as a prebuilt wheel. nixpkgs does not carry it,
+            # which is why phuzzer is a native-lane suite and not a Nix one.
+            install_one("shellphish-afl")
         install_one("-f", dist, str(ROOT / name))
 
     # After angr, as upstream does, and with its llm extra: angr-management's

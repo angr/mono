@@ -253,6 +253,21 @@ jobs:
         if: runner.os == 'macOS' && contains(matrix.suites, 'angr-management')
         run: brew install flatcc flatbuffers keystone
 
+      # phuzzer's _check_environment refuses to start a fuzzer until the
+      # kernel is tuned for it. Upstream writes these through a /hostproc
+      # bind mount in a privileged container; a Linux runner is a VM with
+      # sudo, so they can be set directly. The governor is best-effort: a
+      # virtualised runner usually has no cpufreq at all, and phuzzer skips
+      # that check when the path is absent.
+      - name: Tune the kernel for AFL
+        if: runner.os == 'Linux' && contains(matrix.suites, 'phuzzer')
+        run: |
+          echo core | sudo tee /proc/sys/kernel/core_pattern
+          echo 1 | sudo tee /proc/sys/kernel/sched_child_runs_first || true
+          for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+              [ -e "$g" ] && echo performance | sudo tee "$g" || true
+          done
+
       - name: Install the workspace
         env:
           PYVER: ${{ matrix.python }}
@@ -676,6 +691,20 @@ jobs:
           name: pyodide-pyvex
           path: wheelhouse/*.whl
           if-no-files-found: error
+
+      # cle's own Pyodide job, which is what the pyvex wheel above exists
+      # for. Its emscripten markers and sys.platform guards were dead weight
+      # in this tree while nothing ran them; the pyodide-testing group is in
+      # the snapshot already.
+      - uses: astral-sh/setup-uv@v5
+      - name: cle under Pyodide
+        working-directory: cle
+        run: |
+          uv sync --python pyodide@3.14 --group pyodide-testing \
+            --find-links ../wheelhouse --no-sources-package pyvex \
+            --no-build-package bitarray --no-build-package cffi \
+            --no-build-package pycryptodome
+          uv run --no-sync pytest tests
 
   # Sphinx. Every component reports a readthedocs status on its pull
   # requests, and pypcode builds its docs inside Actions on top of that.

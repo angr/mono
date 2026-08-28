@@ -96,6 +96,10 @@
     "angrop": {
       "env": "test",
       "forked": true
+    },
+    "phuzzer": {
+      "env": "test",
+      "forked": true
     }
   },
   "native": [
@@ -232,6 +236,109 @@
       "shards": 3,
       "with": [
         "pysoot"
+      ]
+    },
+    {
+      "os": "ubuntu-22.04",
+      "python": "3.10",
+      "suites": [
+        "pysoot"
+      ]
+    },
+    {
+      "os": "ubuntu-22.04",
+      "python": "3.11",
+      "suites": [
+        "pysoot"
+      ]
+    },
+    {
+      "os": "ubuntu-22.04",
+      "python": "3.12",
+      "suites": [
+        "pysoot"
+      ]
+    },
+    {
+      "os": "ubuntu-22.04",
+      "python": "3.13",
+      "suites": [
+        "pysoot"
+      ]
+    },
+    {
+      "os": "macos-14",
+      "python": "3.10",
+      "suites": [
+        "pysoot"
+      ]
+    },
+    {
+      "os": "macos-14",
+      "python": "3.11",
+      "suites": [
+        "pysoot"
+      ]
+    },
+    {
+      "os": "macos-14",
+      "python": "3.12",
+      "suites": [
+        "pysoot"
+      ]
+    },
+    {
+      "os": "macos-14",
+      "python": "3.13",
+      "suites": [
+        "pysoot"
+      ]
+    },
+    {
+      "os": "windows-2022",
+      "python": "3.10",
+      "suites": [
+        "pysoot"
+      ]
+    },
+    {
+      "os": "windows-2022",
+      "python": "3.11",
+      "suites": [
+        "pysoot"
+      ]
+    },
+    {
+      "os": "windows-2022",
+      "python": "3.12",
+      "suites": [
+        "pysoot"
+      ]
+    },
+    {
+      "os": "windows-2022",
+      "python": "3.13",
+      "suites": [
+        "pysoot"
+      ]
+    },
+    {
+      "os": "ubuntu-24.04",
+      "python": "3.12",
+      "suites": [
+        "archinfo",
+        "pyvex",
+        "pypcode",
+        "claripy",
+        "cle",
+        "angr-management"
+      ]
+    },
+    {
+      "os": "ubuntu-24.04",
+      "python": "3.12",
+      "suites": [
+        "phuzzer"
       ]
     }
   ],
