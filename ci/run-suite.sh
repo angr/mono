@@ -139,7 +139,7 @@ esac
 echo "$suite: testing $module from $origin"
 
 args=(-m pytest tests -p no:cacheprovider -q -rfEs -o addopts=
-      --rootdir="$run_dir" --junitxml="$results/$suite-$shard.xml" --durations=25)
+      --rootdir="$run_dir" --junitxml="$results/$suite-nix-$shard.xml" --durations=25)
 if [[ $workers != 0 && $workers != 1 ]]; then
     args+=(-n "$workers")
 fi
@@ -167,7 +167,7 @@ if [[ -n $pytest_args ]]; then
     args+=("${extra[@]}")
 fi
 
-log=$results/$suite-$shard.log
+log=$results/$suite-nix-$shard.log
 echo "=== $suite ${shard}/${of}: python3 ${args[*]}" | tee "$log"
 start=$SECONDS
 rc=0

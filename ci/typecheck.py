@@ -28,6 +28,14 @@ def git(*args: str) -> str:
     ).stdout.strip()
 
 
+def merge_base(base: str) -> str:
+    """The revision to compare against; see the note in ci/lint.py."""
+    resolved = git("merge-base", base, "HEAD")
+    if resolved == git("rev-parse", "HEAD"):
+        return git("rev-parse", "HEAD^")
+    return resolved
+
+
 def badness(paths: list[Path]) -> dict[str, float]:
     """pyright badness per file: (errors * 10 + warnings) / lines."""
     if not paths:
@@ -46,14 +54,24 @@ def badness(paths: list[Path]) -> dict[str, float]:
         raise SystemExit("pyright produced no JSON") from exc
 
     counts: dict[str, list[int]] = {str(p): [0, 0] for p in paths}
+    unattributed = 0
     for item in report.get("generalDiagnostics", []):
         f = item.get("file")
         if f not in counts:
+            # Never silently: if pyright ever spells a path differently than
+            # we do, every diagnostic lands here, both measurements come out
+            # zero, and the ratchet passes everything forever.
+            unattributed += 1
             continue
         if item.get("severity") == "error":
             counts[f][0] += 1
         elif item.get("severity") == "warning":
             counts[f][1] += 1
+    if unattributed:
+        raise SystemExit(
+            f"pyright reported {unattributed} diagnostics against paths this "
+            "script did not ask about; the comparison would be meaningless."
+        )
 
     out = {}
     for f, (errors, warnings) in counts.items():
@@ -70,7 +88,7 @@ def main() -> int:
     parser.add_argument("--base", default="origin/main")
     args = parser.parse_args()
 
-    base = git("merge-base", args.base, "HEAD")
+    base = merge_base(args.base)
     changed = [
         p
         for p in git("diff", "--name-only", base, "HEAD").splitlines()
@@ -93,11 +111,11 @@ def main() -> int:
 
     regressions = []
     for path in changed:
-        after = head.get(str(ROOT / path), 0.0)
-        was = before.get(str(BASE_TREE / path))
-        if was is None:
-            print(f"{path}: new file, badness {after:.4f}")
-            continue
+        after = head[str(ROOT / path)]
+        # A file that did not exist scores against zero, as upstream does:
+        # a new module is allowed no errors at all. Exempting new files meant
+        # an arbitrarily broken one passed.
+        was = before.get(str(BASE_TREE / path), 0.0)
         print(f"{path}: badness {was:.4f} -> {after:.4f}")
         if after > was:
             regressions.append((path, was, after))

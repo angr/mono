@@ -115,6 +115,12 @@
       guiPackages = p: [
         p.angr-management
         p.unicorn
+        # angr-management's MCP suite skips itself unless fastmcp and uvicorn
+        # are importable -- 29 tests that looked like they ran and did not.
+        p.pydantic-ai
+        p.mcp
+        p.fastmcp
+        p.uvicorn
         p.pytest
         p.pytest-xdist
         p.pytest-timeout

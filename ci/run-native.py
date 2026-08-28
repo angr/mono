@@ -29,7 +29,11 @@ VENV = ROOT / ".venv-native"
 
 # Install order matters: a component's build imports the ones under it --
 # angr's unicornlib compiles against pyvex's headers.
-COMPONENTS = ["archinfo", "pyvex", "pypcode", "claripy", "cle", "angr", "angr-management"]
+CORE = ["archinfo", "pyvex", "pypcode", "claripy", "cle", "angr", "angr-management"]
+
+# Upstream's dependents. `--ecosystem` adds them, because they are what makes
+# a core API change fail before it is merged rather than after.
+ECOSYSTEM = ["pysoot", "tracer", "angr-platforms", "angrop", "phuzzer"]
 
 # The extras upstream installs alongside angr.
 ANGR_EXTRAS = "[angrdb,unicorn,llm]"
@@ -47,46 +51,64 @@ def run(*args: str, cwd: Path | None = None, env: dict | None = None) -> None:
     subprocess.run([str(a) for a in args], cwd=cwd, env=env, check=True)
 
 
-def install(python_version: str) -> None:
-    # pyvex compiles VEX out of ./vex and angr's tests read ../../binaries;
+def install(python_version: str, ecosystem: bool = False) -> None:
+    """Build the environment the way ci-settings' ga-build.sh builds it.
+
+    Component by component, in dependency order, each with `--no-sources` so
+    every `[tool.uv.sources]` entry is ignored: the sibling git URLs, angr's
+    `angr-data = { git = ..., branch = "master" }`, all of it. The components
+    resolve to the ones installed here and the third-party packages resolve
+    from PyPI against the pins the components actually declare.
+
+    angr build-requires pyvex, and with sources off there is no
+    `pyvex==9.3.4.dev0` on PyPI to satisfy that, so pyvex is built into a
+    wheel first and angr is pointed at it with `--find-links`. Upstream hits
+    the same wall and solves it the same way.
+    """
+    # pyvex compiles VEX out of ./vex and the suites read ../../binaries;
     # both are pinned in flake.lock rather than tracked here.
     run(sys.executable, ROOT / "ci" / "fetch-external.py")
 
     run("uv", "venv", "--python", python_version, str(VENV))
-
-    targets = []
-    for name in COMPONENTS:
-        spec = str(ROOT / name)
-        if name == "angr":
-            spec += ANGR_EXTRAS
-        targets.append(spec)
-
     env = {**os.environ, "VIRTUAL_ENV": str(VENV)}
-    # Editable, so a suite tests this tree and not a copy of it.
-    run("uv", "pip", "install", "--python", str(venv_python()), *(
-        arg for target in targets for arg in ("--editable", target)
-    ), env=env)
-    run("uv", "pip", "install", "--python", str(venv_python()),
-        "pytest", "pytest-xdist", "pytest-timeout", "pytest-split", env=env)
+    python = str(venv_python())
+
+    def install_one(*args: str) -> None:
+        run("uv", "pip", "install", "--python", python, "--no-sources", *args, env=env)
+
+    # The test tooling first, so a component build cannot pick a different one.
+    # The stubs are upstream's: pyright sees them there, and a ratchet that
+    # does not is a ratchet that disagrees with the one it ports.
+    install_one(
+        "pytest", "pytest-xdist", "pytest-timeout", "pytest-split",
+        "pytest-forked", "sortedcontainers-stubs>=2.4.3", "types-pefile",
+    )
+
+    install_one(str(ROOT / "archinfo"))
+    run("uv", "build", "--out-dir", str(ROOT / "pyvex" / "dist"), str(ROOT / "pyvex"), env=env)
+    install_one(str(ROOT / "pyvex"))
+    install_one(str(ROOT / "pypcode"))
+    install_one(str(ROOT / "claripy"))
+    install_one(str(ROOT / "cle"))
+    install_one("-f", str(ROOT / "pyvex" / "dist"), str(ROOT / "angr") + ANGR_EXTRAS)
+
+    if ecosystem:
+        for name in ECOSYSTEM:
+            install_one("-f", str(ROOT / "pyvex" / "dist"), str(ROOT / name))
+
+    # After angr, as upstream does, and with its llm extra: angr-management's
+    # MCP suite skips itself unless fastmcp and uvicorn are importable.
+    install_one("-f", str(ROOT / "pyvex" / "dist"), str(ROOT / "angr-management") + "[llm]")
 
 
-def link_dir(target: Path, link: Path) -> None:
-    """Point `link` at `target` without copying it.
+def tag() -> str:
+    """What distinguishes this lane's results from another's.
 
-    Windows has no symlink for an unprivileged process, but it does have
-    directory junctions, and `mklink /J` needs no privilege at all.
+    Every lane wrote `<suite>-<shard>.xml`, and the summary job merges all of
+    them into one directory -- so claripy's five runs across five platforms
+    became one row, whichever landed last.
     """
-    if link.exists():
-        return
-    link.parent.mkdir(parents=True, exist_ok=True)
-    if os.name == "nt":
-        subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
-            check=True,
-            capture_output=True,
-        )
-    else:
-        link.symlink_to(target, target_is_directory=True)
+    return f"{sys.platform}-py{sys.version_info.major}.{sys.version_info.minor}"
 
 
 def suite_config(name: str) -> dict:
@@ -97,8 +119,8 @@ def suite_config(name: str) -> dict:
     return suite
 
 
-def run_suite(name: str, shard: int, of: int, workers: str) -> int:
-    """Run one suite from a directory that holds only its tests.
+def stage(name: str) -> Path:
+    """A directory holding only this suite's tests, with fixtures beside it.
 
     The component's source sits next to its tests in this tree, and pytest
     would put that directory on sys.path -- importing a source tree with no
@@ -116,6 +138,18 @@ def run_suite(name: str, shard: int, of: int, workers: str) -> int:
     # path now points beside the run directories, and the fixtures have to be
     # reachable from there too.
     link_dir(ROOT / "binaries", ROOT / ".ci-run-native" / "binaries")
+    return run_dir
+
+
+def run_suite(name: str, shard: int, of: int, workers: str) -> int:
+    """Run one suite from a directory that holds only its tests.
+
+    The component's source sits next to its tests in this tree, and pytest
+    would put that directory on sys.path -- importing a source tree with no
+    compiled extension in it rather than what was installed. Same reason as
+    ci/run-suite.sh; see the note there.
+    """
+    run_dir = stage(name)
 
     results = ROOT / "test-results"
     results.mkdir(exist_ok=True)
@@ -125,7 +159,7 @@ def run_suite(name: str, shard: int, of: int, workers: str) -> int:
         str(venv_python()), "-m", "pytest", "tests",
         "-p", "no:cacheprovider", "-q", "-rfEs", "-o", "addopts=",
         f"--rootdir={run_dir}",
-        f"--junitxml={results / f'{name}-{shard}.xml'}",
+        f"--junitxml={results / f'{name}-{tag()}-{shard}.xml'}",
         "--durations=25",
     ]
     if workers not in ("0", "1"):
@@ -148,15 +182,22 @@ def run_suite(name: str, shard: int, of: int, workers: str) -> int:
     return subprocess.run(args, cwd=run_dir, env=env, check=False).returncode
 
 
-def smoke(name: str) -> int:
-    """What upstream runs for angr on Windows and macOS: does it install and import."""
-    module = name.replace("-", "")
-    code = (
-        f"import {module}; "
-        f"print('{module}', getattr({module}, '__version__', 'ok'))"
-    )
-    print(f"+ {venv_python()} -c {code!r}", flush=True)
-    return subprocess.run([str(venv_python()), "-c", code], check=False).returncode
+def collect(name: str) -> int:
+    """Upstream's `installation` job: `uv run pytest --collect-only tests`.
+
+    Importing the package proves almost nothing -- collection imports all 326
+    of angr's test modules and every symbol they pull out of it, which is what
+    actually catches a refactor that does not survive the platform.
+    """
+    run_dir = stage(name)
+    args = [
+        str(venv_python()), "-m", "pytest", "tests",
+        "--collect-only", "-q", "-p", "no:cacheprovider", "-o", "addopts=",
+        f"--rootdir={run_dir}",
+    ]
+    print(f"+ {' '.join(args)}", flush=True)
+    env = {**os.environ, "CI": "true", "PYTHONDONTWRITEBYTECODE": "1"}
+    return subprocess.run(args, cwd=run_dir, env=env, check=False).returncode
 
 
 def main() -> int:
@@ -164,22 +205,33 @@ def main() -> int:
     parser.add_argument("suites", nargs="*")
     parser.add_argument("--install", action="store_true")
     parser.add_argument(
+        "--ecosystem",
+        action="store_true",
+        help="also install the dependents upstream tests core changes against",
+    )
+    parser.add_argument(
         "--python",
         default=f"{sys.version_info.major}.{sys.version_info.minor}",
         help="Python version for the environment (default: the one running this)",
     )
-    parser.add_argument("--smoke", action="store_true", help="import only, no suite")
+    parser.add_argument(
+        "--collect", action="store_true", help="collect the suite, do not run it"
+    )
     parser.add_argument("--shard", type=int, default=1)
     parser.add_argument("--of", type=int, default=1)
     parser.add_argument("--workers", default="auto")
     args = parser.parse_args()
 
     if args.install:
-        install(args.python)
+        install(args.python, ecosystem=args.ecosystem)
 
     failed = []
     for name in args.suites:
-        rc = smoke(name) if args.smoke else run_suite(name, args.shard, args.of, args.workers)
+        rc = (
+            collect(name)
+            if args.collect
+            else run_suite(name, args.shard, args.of, args.workers)
+        )
         print(f"=== {name}: exit={rc}", flush=True)
         if rc != 0:
             failed.append(name)

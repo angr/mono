@@ -1,0 +1,15 @@
+*.pyc
+*.pyo
+*.egg-info
+.idea
+*.class
+
+pysoot/jython_bin/cachedir
+tests/test_samples/android1_code/build
+
+build
+dist
+
+.venv
+
+uv.lock

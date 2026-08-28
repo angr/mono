@@ -31,6 +31,22 @@
         "pyvex"
       ]
     },
+    "angr-platforms": {
+      "upstream": "https://github.com/angr/angr-platforms",
+      "commit": "d9231f2306f5d5f1acdf7d464a81b0925c78e140",
+      "committed_at": "2025-03-24T14:18:43-07:00",
+      "subject": "Support multiple angr versions",
+      "excluded": [],
+      "sibling_sources_repointed_at_workspace": []
+    },
+    "angrop": {
+      "upstream": "https://github.com/angr/angrop",
+      "commit": "e7c3c1edfc4c25887f5017544f7dd46505795cce",
+      "committed_at": "2026-05-18T23:17:17-07:00",
+      "subject": "Merge pull request #156 from pollingsoon/fix/nt_sigalrm_timeout",
+      "excluded": [],
+      "sibling_sources_repointed_at_workspace": []
+    },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
       "commit": "bf85c7e47bb469878c564480e28c677abbe35acc",
@@ -58,11 +74,27 @@
         "pyvex"
       ]
     },
+    "phuzzer": {
+      "upstream": "https://github.com/angr/phuzzer",
+      "commit": "2718cb48c2d8580b39f3568627402905d42baaec",
+      "committed_at": "2024-06-06T18:25:28Z",
+      "subject": "Check sched_child_runs_first exists",
+      "excluded": [],
+      "sibling_sources_repointed_at_workspace": []
+    },
     "pypcode": {
       "upstream": "https://github.com/angr/pypcode",
       "commit": "559aacdc9d363fd19477d9daa40721279cd99248",
       "committed_at": "2026-06-29T11:33:46-07:00",
       "subject": "ci: bump actions/setup-python from 6.2.0 to 6.3.0",
+      "excluded": [],
+      "sibling_sources_repointed_at_workspace": []
+    },
+    "pysoot": {
+      "upstream": "https://github.com/angr/pysoot",
+      "commit": "60e02181532bf1a5ddb487bb372a2f4aaf8e2680",
+      "committed_at": "2026-08-27T10:01:45-07:00",
+      "subject": "Lift a bare DEX (#56)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -75,7 +107,15 @@
         "vex"
       ],
       "sibling_sources_repointed_at_workspace": []
+    },
+    "tracer": {
+      "upstream": "https://github.com/angr/tracer",
+      "commit": "097c81755d02fd0386fa76a8962a0329835019de",
+      "committed_at": "2025-03-24T13:02:43-07:00",
+      "subject": "support multiple versions of angr",
+      "excluded": [],
+      "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-08-27T13:03:41+00:00"
+  "imported_at": "2026-08-28T00:13:13+00:00"
 }

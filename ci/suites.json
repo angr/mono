@@ -5,7 +5,8 @@
     "finish in seconds -- their cost is job setup, not testing -- and shard",
     "the ones that do not, so the stage costs what its slowest shard costs.",
     "`native` is the second lane: the platforms Nix cannot reach, which is",
-    "where upstream gates. `suites` is how each component's suite is invoked."
+    "where upstream gates. `suites` is how each component's suite is invoked.",
+    "`forked` is on for every suite because upstream's test.py passes --forked to all of them, not just angr; running a suite in shared workers when upstream runs it one process per test is a different test."
   ],
   "jobs": [
     {
@@ -35,19 +36,24 @@
   ],
   "suites": {
     "archinfo": {
-      "env": "test"
+      "env": "test",
+      "forked": true
     },
     "pyvex": {
-      "env": "test"
+      "env": "test",
+      "forked": true
     },
     "pypcode": {
-      "env": "test"
+      "env": "test",
+      "forked": true
     },
     "claripy": {
-      "env": "test"
+      "env": "test",
+      "forked": true
     },
     "cle": {
-      "env": "test"
+      "env": "test",
+      "forked": true
     },
     "angr": {
       "env": "test",
@@ -55,7 +61,8 @@
     },
     "angr-management": {
       "env": "gui",
-      "qt": true
+      "qt": true,
+      "forked": true
     }
   },
   "native": [
@@ -69,7 +76,7 @@
         "claripy",
         "cle"
       ],
-      "smoke": [
+      "collect": [
         "angr"
       ]
     },
@@ -83,7 +90,17 @@
         "claripy",
         "cle"
       ],
-      "smoke": [
+      "collect": [
+        "angr"
+      ]
+    },
+    {
+      "os": "macos-13",
+      "python": "3.12",
+      "suites": [
+        "pyvex"
+      ],
+      "collect": [
         "angr"
       ]
     },
@@ -115,7 +132,11 @@
         "claripy",
         "archinfo",
         "pyvex",
-        "cle"
+        "cle",
+        "pypcode"
+      ],
+      "collect": [
+        "angr"
       ]
     },
     {
@@ -125,7 +146,39 @@
         "claripy",
         "archinfo",
         "pyvex",
-        "cle"
+        "cle",
+        "pypcode"
+      ],
+      "collect": [
+        "angr"
+      ]
+    },
+    {
+      "os": "windows-2022",
+      "python": "3.13",
+      "suites": [
+        "claripy"
+      ]
+    },
+    {
+      "os": "windows-2022",
+      "python": "3.14",
+      "suites": [
+        "claripy"
+      ]
+    },
+    {
+      "os": "macos-15",
+      "python": "3.13",
+      "suites": [
+        "claripy"
+      ]
+    },
+    {
+      "os": "macos-15",
+      "python": "3.14",
+      "suites": [
+        "claripy"
       ]
     }
   ]

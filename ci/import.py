@@ -34,7 +34,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 # Components imported into the tree, in dependency order.
-COMPONENTS = [
+CORE = [
     "archinfo",
     "pyvex",
     "pypcode",
@@ -43,6 +43,29 @@ COMPONENTS = [
     "angr",
     "angr-management",
 ]
+
+# The dependents upstream tests on every core-component pull request.
+#
+# `ci-settings/ci-image/conf/repo-list.txt` records a dependency graph, and
+# `test.py` runs the suite of everything transitively downstream of the repo
+# under test: a change to archinfo runs thirteen suites, not one. Without
+# these, a green run here means an API change was tried against angr and
+# angr-management and nothing else.
+#
+# Two of them also matter to angr's own suite. `angr/tests/engines/test_java.py`
+# guards fifteen tests behind `skipUnless(pysoot)` and `test_cfgfast_soot.py`
+# four more; `angr/tests/common.py` guards its CGC trace helpers behind
+# `skipUnless(tracer)`. Without those two in the tree, those tests do not
+# fail -- they report as skips, which is worse.
+ECOSYSTEM = [
+    "pysoot",
+    "tracer",
+    "angr-platforms",
+    "angrop",
+    "phuzzer",
+]
+
+COMPONENTS = CORE + ECOSYSTEM
 
 # Paths dropped from every component snapshot.
 COMMON_EXCLUDES = [".git", ".github"]

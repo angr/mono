@@ -178,11 +178,13 @@ jobs:
         if: matrix.suites != ''
         run: python ci/run-native.py ${{ matrix.suites }}
 
-      # What upstream's own Windows and macOS jobs do for angr: prove it
-      # installs and imports there. The suite itself is the Nix lane's job.
-      - name: Import ${{ matrix.smoke }}
-        if: matrix.smoke != ''
-        run: python ci/run-native.py ${{ matrix.smoke }} --smoke
+      # Upstream's `installation` job, verbatim in effect: collect the suite
+      # without running it. That imports every test module and every symbol
+      # they pull out of angr, which is what catches a refactor that does not
+      # survive the platform. Running the suite itself is the Nix lane's job.
+      - name: Collect ${{ matrix.collect }}
+        if: matrix.collect != ''
+        run: python ci/run-native.py ${{ matrix.collect }} --collect
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -204,11 +206,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # angr/rust-toolchain.toml pins the toolchain, so rustup switches to it
+      # inside angr/ and the components have to be added there rather than to
+      # whatever the action installed as stable.
+      - run: rustup component add rustfmt clippy
+        working-directory: angr
       - run: cargo fmt --all -- --check
         working-directory: angr
         if: runner.os == 'Linux'
@@ -234,8 +239,8 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - name: Install the workspace
         run: python ci/run-native.py --install --python 3.12
-      - run: |
-          .venv-native/bin/python -m pip install "pylint>=2.14.0" pyright
+      # A uv-created venv has no pip in it, so uv installs into it too.
+      - run: uv pip install --python .venv-native/bin/python "pylint>=2.14.0" pyright
       - name: pylint score ratchet
         run: .venv-native/bin/python ci/lint.py --base origin/${{ github.base_ref || 'main' }}
       - name: pyright badness ratchet
@@ -253,7 +258,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2022, macos-15]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2022, macos-15, macos-13]
     steps:
       - uses: actions/checkout@v5
       - name: Fetch the pinned VEX sources
@@ -262,7 +267,7 @@ jobs:
         with:
           package-dir: pypcode
         env:
-          CIBW_BUILD: cp312-*
+          CIBW_BUILD: cp312-* cp313-* cp314-*
           CIBW_ARCHS: native
           CIBW_SKIP: "*musllinux*"
           CIBW_TEST_COMMAND: python -m unittest discover -v -s {package}/tests

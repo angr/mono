@@ -53,14 +53,14 @@ def main() -> int:
         native = []
         for job in config["native"]:
             suites = job.get("suites", [])
-            smoke = job.get("smoke", [])
+            collect = job.get("collect", [])
             native.append(
                 {
                     **job,
                     "suites": " ".join(suites),
-                    "smoke": " ".join(smoke),
-                    "label": f"{'+'.join(suites + smoke)} · {job['os']} py{job['python']}",
-                    "id": f"{'-'.join(suites + smoke)}-{job['os']}-py{job['python']}",
+                    "collect": " ".join(collect),
+                    "label": f"{'+'.join(suites + collect)} · {job['os']} py{job['python']}",
+                    "id": f"{'-'.join(suites + collect)}-{job['os']}-py{job['python']}",
                 }
             )
         print(json.dumps(native))

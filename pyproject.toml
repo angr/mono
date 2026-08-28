@@ -19,6 +19,11 @@ members = [
     "cle",
     "angr",
     "angr-management",
+    # Of the dependents only pysoot has a PEP 621 `[project]` table; angrop,
+    # tracer, angr-platforms and phuzzer are setup.py/setup.cfg packages and
+    # uv cannot make them members. None of them declares a sibling source, so
+    # they are installed by path instead and lose nothing by it.
+    "pysoot",
 ]
 
 [tool.uv.sources]
@@ -29,3 +34,4 @@ claripy = { workspace = true }
 cle = { workspace = true }
 angr = { workspace = true }
 angr-management = { workspace = true }
+pysoot = { workspace = true }
