@@ -68,9 +68,18 @@ most tests still pass.
 
 ## What is in the tree, and what is not
 
-Imported, one directory each: `archinfo`, `pyvex`, `pypcode`, `claripy`,
-`cle`, `angr`, `angr-management`. `ci/import.py` re-snapshots them from
-upstream and records what it took in `mono.json`.
+Imported, one directory each. The seven components with suites of their own:
+`archinfo`, `pyvex`, `pypcode`, `claripy`, `cle`, `angr`, `angr-management`.
+Then five of the dependents upstream tests every core change against --
+`pysoot`, `tracer`, `angr-platforms`, `angrop`, `phuzzer` -- which are here
+because two of them gate tests inside angr's own suite: nineteen tests in
+`tests/engines/test_java.py` and `test_cfgfast_soot.py` are behind
+`skipUnless(pysoot)`, and the CGC trace helpers in `tests/common.py` are
+behind `skipUnless(tracer)`. Without them in the tree those tests do not
+fail, which would be honest -- they report as skips.
+
+`ci/import.py` re-snapshots them all from upstream and records what it took
+in `mono.json`.
 
 Three things are pinned in `flake.lock` instead of vendored:
 
@@ -80,10 +89,15 @@ Three things are pinned in `flake.lock` instead of vendored:
 | `angr/binaries` | 450 MB of test fixtures. `ci/link-external.sh` puts it at `./binaries`, where every suite already looks. |
 | `angr/angr-data` | 200 MB of generated JSON. |
 
-Nothing is deselected. Every test each component ships runs, including the
-suites for angr's optional `llm` extra: `pydantic-ai`, `mcp` and `fastmcp` are
+Nothing is deselected in the seven suites that run. That includes the suites
+for angr's optional `llm` extra: `pydantic-ai`, `mcp` and `fastmcp` are
 packaged in `nix/python-overlay.nix` rather than skipped, because a suite that
 is skipped for want of a dependency is a suite that tells you nothing.
+
+The five dependents are a different matter: they are in the tree, and no job
+runs their suites yet. Upstream's `ga-build.sh` does, driven by
+`ci-settings/ci-image/conf/repo-list.txt`, so this is a gap and not a
+decision -- see below.
 
 A component's own `.github/` does not come in: only the workflow at the root
 of this repository runs, and seven dead copies of upstream's workflows would
@@ -123,6 +137,21 @@ wall time per suite; that is the measurement, and quoting a second one here
 would only go stale. angr is the only suite big enough for the shape of the
 matrix to matter — it is what the ten shards are dividing, and the other six
 put together finish in under a minute.
+
+## What upstream does that this does not
+
+An experiment is only useful if it is honest about its edges. Each of these
+is a thing upstream CI does today and this repository does not.
+
+| | what is missing | why it is not here yet |
+| --- | --- | --- |
+| Dependent suites | `pysoot`, `tracer`, `angr-platforms`, `angrop`, `phuzzer` are imported; no job runs their tests. | Each needs machinery of its own -- a JVM, `shellphish-qemu`, AFL -- and none of it is packaged here yet. |
+| Coverage | `angr/coverage.yml` and `angr-management/coverage.yml` measure Python, C and Rust coverage and upload to Codecov on every pull request. | Nothing here measures coverage. Codecov also needs a project and a token this repository does not have. |
+| Decompiler snapshots | `ci-settings`' `corpus-test` job diffs decompiler output against `angr/dec-snapshots` and uploads the diff. | The corpus job is not ported. It is the decompiler's only regression detector, so this is the largest single omission. |
+| Nightly | Ten repositories run a nightly that widens the matrix -- angr's runs the full suite on Windows and macOS, which is `--collect` only here. | A nightly on an experiment is recurring cost on somebody else's account. Deliberate. |
+| Release | `angr-release.yml` bumps versions, builds sdists and wheels for six components, verifies them with `--only-binary`, tags and publishes to PyPI. | Only `pypcode` wheels are built here, and nothing is published. Publishing from an experiment is not something to do by accident. |
+| Bundles | `angr-management`'s nightly build produces an NSIS installer, an AppImage and a macOS `.app`, and tests each by launching it. | Only the raw PyInstaller freeze is built, and only the Linux one is launched. |
+| Cross-repo fixtures | `ci-settings/actions/binaries-ref` reads `angr/binaries#N` out of a pull-request body so a fixture and the code that needs it go green together. | `binaries` is pinned in `flake.lock` with no override. A new fixture therefore needs two rounds here. |
 
 ## Regenerating the tree
 
