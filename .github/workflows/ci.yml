@@ -433,18 +433,12 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install flatcc flatbuffers keystone
       - run: python ci/run-native.py --install --python 3.12
-      # The venv's scripts live in Scripts/ on Windows and bin/ everywhere
-      # else, and every step below needs one of them. VIRTUAL_ENV is what uv
-      # reads to pick the environment, so it does not need the split.
+      # From the script that made the environment, because only it knows
+      # that Windows puts the interpreter in Scripts/ and that bash's own
+      # $PWD there is an MSYS path -- `/d/a/mono/mono`, which uv rejects with
+      # "failed to inspect Python interpreter". This is the native path.
       - name: Locate the environment
-        shell: bash
-        run: |
-          echo "VIRTUAL_ENV=$PWD/.venv-native" >> "$GITHUB_ENV"
-          if [[ -d .venv-native/Scripts ]]; then
-              echo "VBIN=$PWD/.venv-native/Scripts" >> "$GITHUB_ENV"
-          else
-              echo "VBIN=$PWD/.venv-native/bin" >> "$GITHUB_ENV"
-          fi
+        run: echo "VENV_PY=$(python ci/run-native.py --print-python)" >> "$GITHUB_ENV"
       # angr-management's `pyinstaller` dependency group, which upstream gets
       # from `uv sync` and this lane installs by hand, minus its
       # `angr[unicorn]` entry that ci/run-native.py already built from the
@@ -452,11 +446,11 @@ jobs:
       # what converts the spec's .ico to the .icns macOS insists on, and
       # without it the freeze dies on the icon; keystone has no aarch64 Linux
       # wheel.
-      - run: uv pip install "pyinstaller~=6.19"
+      - run: uv pip install --python "$VENV_PY" "pyinstaller~=6.19"
       - if: runner.os == 'macOS'
-        run: uv pip install pillow
+        run: uv pip install --python "$VENV_PY" pillow
       - if: runner.os != 'Linux' || runner.arch != 'ARM64'
-        run: uv pip install keystone-engine
+        run: uv pip install --python "$VENV_PY" keystone-engine
       # ci/import.py drops these two submodules -- 195 MB of FLIRT
       # signatures and 7 MB of library docs, runtime data rather than code
       # under test -- but the spec names both in its `datas` and PyInstaller
@@ -468,9 +462,12 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/angr/flirt_signatures
           git clone --depth 1 https://github.com/angr/library_docs
+      # `-m PyInstaller`, not the console script: resolving
+      # `Scripts/pyinstaller` by hand is the same platform guess again.
       - name: Freeze
         working-directory: angr-management
-        run: ${{ env.VBIN }}/pyinstaller angr-management.spec
+        run: |
+          "$VENV_PY" -m PyInstaller angr-management.spec
       # Upstream's test_ubuntu: start the thing and look for its window.
       - name: Start it
         if: runner.os == 'Linux'

@@ -289,6 +289,12 @@ def main() -> int:
     parser.add_argument("--of", type=int, default=1)
     parser.add_argument("--workers", default="auto")
     parser.add_argument(
+        "--print-python",
+        action="store_true",
+        help="print the environment's interpreter and exit; a caller in a "
+        "shell should not have to know that Windows puts it in Scripts/",
+    )
+    parser.add_argument(
         "--for",
         dest="wanted",
         default="",
@@ -296,6 +302,10 @@ def main() -> int:
         "(default: every component)",
     )
     args = parser.parse_args()
+
+    if args.print_python:
+        print(venv_python())
+        return 0
 
     if args.install:
         install(args.python, ecosystem=args.ecosystem, only=args.wanted.split())
