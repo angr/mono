@@ -99,6 +99,10 @@
         p.pydantic-ai
         p.mcp
         p.fastmcp
+        # Twenty-one of angr's tests are behind `skipUnless(pysoot)` and
+        # they skipped here while pysoot sat in the tree unpackaged, which
+        # is the failure mode importing it was meant to remove.
+        p.pysoot
         p.pytest
         p.pytest-xdist
         p.pytest-timeout

@@ -197,7 +197,10 @@ let
   mkComponent =
     {
       pname,
-      versionFile,
+      # Six of the seven components declare their version in a `__version__`
+      # the release tooling rewrites; pysoot declares it in pyproject.toml,
+      # so `versionFile` is optional and that is the fallback.
+      versionFile ? null,
       extraDependencies ? [ ],
       extraRemoveDeps ? [ ],
       nativeBuildInputs ? [ ],
@@ -223,7 +226,7 @@ let
       ])
       // {
         inherit pname;
-        version = versionFrom (dir + "/${versionFile}");
+        version = if versionFile == null then pyproject.project.version else versionFrom (dir + "/${versionFile}");
         pyproject = true;
         src = dir;
 
@@ -556,6 +559,45 @@ in
       "angr.rustylib"
       "angr.ailment"
     ];
+  };
+
+  # One of the five dependents in the tree, and the only one that could be
+  # packaged: it needs jpype1 at exactly 1.6.0 (which nixpkgs has) and
+  # frozendict, and it ships its own soot-trunk.jar. It earns its place in
+  # the test environment rather than in the closure for its own sake --
+  # angr's tests/engines/test_java.py and analyses/cfg/test_cfgfast_soot.py
+  # guard twenty-one tests behind `skipUnless(pysoot)`, and importing pysoot
+  # is what makes them run.
+  #
+  # `tracer` is the other half of that and is not here: it install_requires
+  # `shellphish-qemu`, a binary distribution of a patched QEMU that nixpkgs
+  # does not carry.
+  pysoot = mkComponent {
+    pname = "pysoot";
+    pythonImportsCheck = [ "pysoot" ];
+
+    # pysoot reads $JAVA_HOME and otherwise runs `java` off PATH; a Nix
+    # environment guarantees neither, and angr's Java tests failed with
+    # JavaNotFoundError once pysoot was importable enough to reach them.
+    # The JDK it was built against becomes the fallback -- which also makes
+    # it a runtime dependency of this derivation rather than something the
+    # caller has to remember -- and an explicit $JAVA_HOME still wins,
+    # because pysoot checks that first.
+    #
+    # JAVA_HOME on top of that, because jpype does not go through pysoot's
+    # lookup at all -- it has its own finder, which reads only JAVA_HOME and
+    # otherwise raises JVMNotFoundException for want of libjvm.so.
+    # `setdefault`, so a caller who sets it still chooses.
+    postPatch = ''
+      substituteInPlace pysoot/lifter.py \
+        --replace-fail 'command = ["java",' 'command = ["${pkgs.jdk}/bin/java",'
+      cat >> pysoot/__init__.py <<'EOF'
+
+      import os as _os
+
+      _os.environ.setdefault("JAVA_HOME", "${pkgs.jdk.home}")
+      EOF
+    '';
   };
 
   angr-management = mkComponent {

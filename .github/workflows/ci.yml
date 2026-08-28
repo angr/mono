@@ -192,6 +192,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
+      # Git ships its own link.exe in usr/bin, and bash -- now the default
+      # shell everywhere -- puts that directory on PATH ahead of the MSVC
+      # tools, so cargo's build scripts link with the wrong one and every
+      # Rust crate fails. Upstream's release workflow deletes it for the
+      # same reason.
+      - name: Unshadow the MSVC linker
+        if: runner.os == 'Windows'
+        run: rm -f "/c/Program Files/Git/usr/bin/link.exe"
       - name: Qt and X11 for angr-management
         if: runner.os == 'Linux' && contains(matrix.suites, 'angr-management')
         run: |
@@ -422,6 +430,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
+      # Git ships its own link.exe in usr/bin, and bash -- now the default
+      # shell everywhere -- puts that directory on PATH ahead of the MSVC
+      # tools, so cargo's build scripts link with the wrong one and every
+      # Rust crate fails. Upstream's release workflow deletes it for the
+      # same reason.
+      - name: Unshadow the MSVC linker
+        if: runner.os == 'Windows'
+        run: rm -f "/c/Program Files/Git/usr/bin/link.exe"
       - name: Qt and X11
         if: runner.os == 'Linux'
         run: |
