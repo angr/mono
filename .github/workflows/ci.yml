@@ -288,16 +288,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pipx install pre-commit
-      # --all-files means the whole git repository, not the working
-      # directory: archinfo's hooks went looking at angr-platforms and found
-      # a Python 2 print statement. The file list is scoped with git ls-files
-      # instead, and the hooks still run from the component directory so its
-      # own exclude patterns keep matching.
       - name: Run ${{ matrix.component }}'s own hooks
-        working-directory: ${{ matrix.component }}
-        run: |
-          git ls-files -z -- . > /tmp/files.z
-          xargs -0 -a /tmp/files.z pre-commit run --show-diff-on-failure --files
+        run: ci/pre-commit.sh ${{ matrix.component }}
 
   # pypcode is the one component upstream keeps out of the ecosystem sweep:
   # it ships wheels across five platforms and tests them with unittest, not
@@ -305,18 +297,36 @@ jobs:
   wheels:
     name: wheels · ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2022, macos-15, macos-15-intel]
     steps:
       - uses: actions/checkout@v5
-      - name: Fetch the pinned VEX sources
-        run: python ci/fetch-external.py vex
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # From an unpacked sdist, as upstream does, not from the tree.
+      #
+      # Two reasons, and the second one bit. It proves the sdist is complete
+      # -- the thing a tree build can never tell you. And cibuildwheel reuses
+      # one CMake build directory across Python versions, so a tree build
+      # leaves cp312's CMakeCache behind and cp313 configures against the
+      # wrong interpreter and dies.
+      - name: Build the sdist
+        run: |
+          python -m pip install --upgrade build
+          python -m build --sdist --outdir dist pypcode
+      - name: Unpack it
+        run: |
+          mkdir sdist
+          tar --strip-components 1 -xf dist/*.tar.gz -C sdist
+
       - uses: pypa/cibuildwheel@v4.1.0
         with:
-          package-dir: pypcode
+          package-dir: sdist
         env:
           CIBW_BUILD: cp312-* cp313-* cp314-*
           CIBW_ARCHS: native
@@ -362,7 +372,11 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install flatcc flatbuffers keystone
       - run: python ci/run-native.py --install --python 3.12
-      - run: uv pip install --python .venv-native/bin/python "pyinstaller~=6.19"
+      # angr-management's spec imports keystone; upstream gets it from the
+      # pyinstaller dependency group that `uv sync` installs.
+      - run: |
+          uv pip install --python .venv-native/bin/python \
+            "pyinstaller~=6.19" keystone-engine
       - name: Freeze
         working-directory: angr-management
         run: ../.venv-native/bin/pyinstaller angr-management.spec
@@ -382,18 +396,18 @@ jobs:
           path: angr-management/dist
           if-no-files-found: error
 
-  # pyvex and cle both gate on a Pyodide build upstream, and cle is pinned
-  # here at the commit titled "Test CLE under Pyodide (#704)". The emscripten
-  # markers in cle's pyproject and the sys.platform guards in its tests are
-  # otherwise dead weight in this tree.
+  # pyvex gates on a Pyodide build upstream, and cle is pinned here at the
+  # commit titled "Test CLE under Pyodide (#704)" -- the emscripten markers in
+  # its pyproject and the sys.platform guards in its tests are otherwise dead
+  # weight in this tree.
+  #
+  # Only pyvex for now. cle's pyodide job runs its suite inside a
+  # `uv sync --python pyodide@3.14` environment against the pyvex wheel built
+  # here, which is a second thing to get right and is not done yet.
   pyodide:
-    name: pyodide · ${{ matrix.component }}
+    name: pyodide · pyvex
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        component: [pyvex, cle]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -403,19 +417,22 @@ jobs:
         run: python ci/fetch-external.py vex
       - uses: pypa/cibuildwheel@v4.1.0
         with:
-          package-dir: ${{ matrix.component == 'cle' && 'pyvex' || matrix.component }}
+          package-dir: pyvex
         env:
           CIBW_PLATFORM: pyodide
           CIBW_PYODIDE_VERSION: "314.0.0"
+          # pyvex's own config says `pytest {project}/tests`, and {project} is
+          # the repository root -- which upstream is pyvex and here is not.
+          CIBW_TEST_COMMAND: pytest {package}/tests
       - uses: actions/upload-artifact@v4
         with:
-          name: pyodide-${{ matrix.component }}
+          name: pyodide-pyvex
           path: wheelhouse/*.whl
           if-no-files-found: ignore
 
   summary:
     name: Summary
-    needs: [test, native, rust, ratchets, wheels, checks, pre-commit, pyinstaller, pyodide]
+    needs: [test, native, rust, ratchets, wheels, checks, pre-commit, pyinstaller, pyodide, docs]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
