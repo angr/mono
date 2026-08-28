@@ -171,7 +171,18 @@ fi
 log=$results/$suite-nix-$shard.log
 echo "=== $suite ${shard}/${of}: python3 ${args[*]}" | tee "$log"
 start=$SECONDS
-rc=0
-(cd -- "$run_dir" && in_env python3 "${args[@]}") 2>&1 | tee -a "$log" || rc=${PIPESTATUS[0]}
+# `|| rc=${PIPESTATUS[0]}` looks like it reports the suite, and does when
+# pytest is what failed -- but when only `tee` fails the pipeline is non-zero,
+# the `||` fires, and PIPESTATUS[0] is pytest's 0. A suite whose log could not
+# be written reported green. Read both ends, and let either one fail the run.
+set +e
+(cd -- "$run_dir" && in_env python3 "${args[@]}") 2>&1 | tee -a "$log"
+pipe=("${PIPESTATUS[@]}")
+set -e
+rc=${pipe[0]}
+if (( pipe[1] != 0 )); then
+    echo "tee failed writing $log (exit ${pipe[1]})" >&2
+    (( rc == 0 )) && rc=${pipe[1]}
+fi
 echo "=== $suite ${shard}/${of} done: exit=$rc wall=$(( SECONDS - start ))s" | tee -a "$log"
 exit "$rc"

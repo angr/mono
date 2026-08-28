@@ -57,7 +57,15 @@ key_for()
 import json
 print('\n'.join(json.load(open('$root/mono.json'))['components']))
 ")
-    git -C "$root" rev-parse "${paths[@]/#/HEAD:}" | sha256sum | cut -c1-32
+    # The system is part of the key, not just the sources: the closure for
+    # aarch64-darwin shares none of its store paths with x86_64-linux, and
+    # without this the second system to run finds the first one's asset,
+    # concludes it is already published, and its consumers unpack gigabytes
+    # containing nothing they can use.
+    local system
+    system=$(nix eval --raw --impure --expr builtins.currentSystem 2>/dev/null || echo unknown)
+    printf '%s-%s\n' "$system" \
+        "$(git -C "$root" rev-parse "${paths[@]/#/HEAD:}" | sha256sum | cut -c1-32)"
 }
 
 case ${1:-} in
@@ -69,8 +77,17 @@ case ${1:-} in
         shift 2
         installables=("$@")
         (( ${#installables[@]} )) || installables=("${default_installables[@]}")
-        if gh release view "$tag" --json assets \
-                --jq '.assets[].name' 2>/dev/null | grep -qxF "$key.tar.zst"; then
+        # `select(.state == "uploaded")`, because a run cancelled mid-upload
+        # leaves the asset in state "starter": present in the listing, and a
+        # 404 for everyone who downloads it. Without the filter every later
+        # run reports it published and exits, and the key stays wedged until
+        # someone deletes the asset by hand.
+        #
+        # Process substitution rather than a pipe: `gh … | grep -q` makes grep
+        # exit on the first match and kills gh with SIGPIPE, which under
+        # `pipefail` is a non-zero pipeline -- a match reported as a miss.
+        if grep -qxF "$key.tar.zst" < <(gh release view "$tag" --json assets \
+                --jq '.assets[] | select(.state == "uploaded") | .name' 2>/dev/null); then
             echo "$key is already published; nothing to upload."
             exit 0
         fi
@@ -90,20 +107,34 @@ case ${1:-} in
         tar -C "$staging" -cf - . | zstd -1 -T0 -o "$root/$key.tar.zst" -f
         ls -lh "$root/$key.tar.zst"
 
+        # Two runs can reach this together and the loser's `create` fails
+        # with "already exists"; under `set -e` that would kill the script
+        # after a successful build.
         gh release view "$tag" >/dev/null 2>&1 ||
             gh release create "$tag" --title "Nix store cache" --notes \
-                "Binary caches for CI, one asset per source revision. Machine-managed; delete freely."
+                "Binary caches for CI, one asset per source revision. Machine-managed; delete freely." ||
+            gh release view "$tag" >/dev/null
         gh release upload "$tag" "$root/$key.tar.zst" --clobber
+
+        # The same closure into the directory the workflow saves to
+        # actions/cache. Without this, `push` deletes its staging directory
+        # and leaves nothing behind, so the fast path in front of the release
+        # is only ever populated by a re-run of an already-published key --
+        # every first build sends the whole matrix to the release download.
+        mkdir -p -- "$cache_dir"
+        cp -a "$staging/." "$cache_dir/"
 
         # One asset per source revision adds up fast on a public repository.
         # Keep the newest few and drop the rest; a job whose asset was pruned
         # falls back to building, which is what it would have done anyway.
-        gh release view "$tag" --json assets \
-            --jq '.assets | sort_by(.createdAt) | reverse | .['"$keep"':] | .[].name' |
-            while read -r stale; do
-                echo "pruning $stale"
-                gh release delete-asset "$tag" "$stale" --yes
-            done
+        # Never the key this run just published, and never fatal: a prune is
+        # housekeeping, and a build that succeeded should not be failed by it.
+        while read -r stale; do
+            [[ $stale == "$key.tar.zst" ]] && continue
+            echo "pruning $stale"
+            gh release delete-asset "$tag" "$stale" --yes || true
+        done < <(gh release view "$tag" --json assets \
+            --jq '.assets | sort_by(.createdAt) | reverse | .['"$keep"':] | .[].name' || true)
         ;;
     pull)
         key=${2:?pull needs a key}
@@ -111,7 +142,10 @@ case ${1:-} in
             echo "$cache_dir already populated."
             exit 0
         fi
-        if ! gh release download "$tag" --pattern "$key.tar.zst" --dir "$root" --clobber 2>/dev/null; then
+        # stderr is kept: swallowing it made a rate limit, a 5xx and an auth
+        # failure all indistinguishable from "this revision has no cache",
+        # and the only symptom was fourteen jobs quietly building angr.
+        if ! gh release download "$tag" --pattern "$key.tar.zst" --dir "$root" --clobber; then
             # Deliberately leave nothing behind. A substituter pointing at a
             # directory that does not exist is a warning Nix carries on past;
             # an empty one that gets saved as this revision's cache is a

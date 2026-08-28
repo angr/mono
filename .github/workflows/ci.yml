@@ -16,7 +16,11 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Not on main, as upstream guards it too. A superseded pull-request run is
+  # wasted work; a superseded main run may be halfway through uploading the
+  # store cache, and an upload killed there leaves the asset in state
+  # "starter" -- listed, and a 404 for every job that asks for it.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Only the job that publishes the store cache needs to write; the matrix jobs
 # run third-party test code and get a read-only token.
@@ -50,7 +54,14 @@ jobs:
     permissions:
       contents: write
     steps:
+      # This job imports angr and angrmanagement below -- component code from
+      # the tree under test, outside the Nix sandbox -- and it is the one job
+      # holding a release-writable token. The publish step takes that token
+      # through GH_TOKEN, so it does not also need to be sitting in
+      # .git/config while that import runs.
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - id: nix
         uses: ./.github/actions/nix-env
         with:
@@ -73,6 +84,10 @@ jobs:
       # entirely for a fork's pull request, whose token cannot write releases.
       - name: Publish the store cache
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        # Publishing is an optimisation for the jobs downstream. A release
+        # API hiccup here would otherwise fail `warm`, and `warm` failing
+        # skips `checks` and every one of the test jobs.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: ci/nix-cache.sh push "${{ steps.nix.outputs.cache-key }}"
@@ -179,7 +194,9 @@ jobs:
         run: brew install flatcc flatbuffers keystone
 
       - name: Install the workspace
-        run: python ci/run-native.py --install --python ${{ matrix.python }}
+        env:
+          PYVER: ${{ matrix.python }}
+        run: python ci/run-native.py --install --python "$PYVER"
 
       - name: Run ${{ matrix.label }}
         if: matrix.suites != ''
@@ -260,12 +277,19 @@ jobs:
         run: python ci/run-native.py --install --python 3.12
       # A uv-created venv has no pip in it, so uv installs into it too.
       - run: uv pip install --python .venv-native/bin/python "pylint>=2.14.0" pyright
+      # Through the environment, not interpolated into the command: git
+      # permits `;`, `$` and backticks in a branch name, so a base branch can
+      # otherwise choose what this step runs.
       - name: pylint score ratchet
-        run: .venv-native/bin/python ci/lint.py --base origin/${{ github.base_ref || 'main' }}
+        env:
+          BASE: ${{ github.base_ref || 'main' }}
+        run: .venv-native/bin/python ci/lint.py --base "origin/$BASE"
       - name: pyright badness ratchet
+        env:
+          BASE: ${{ github.base_ref || 'main' }}
         run: |
           PATH="$PWD/.venv-native/bin:$PATH" .venv-native/bin/python ci/typecheck.py \
-            --base origin/${{ github.base_ref || 'main' }}
+            --base "origin/$BASE"
 
   # Every component ships a .pre-commit-config.yaml, three of the commits
   # this tree imported are literally "[pre-commit.ci] pre-commit autoupdate",
@@ -398,11 +422,30 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install flatcc flatbuffers keystone
       - run: python ci/run-native.py --install --python 3.12
-      # angr-management's spec imports keystone; upstream gets it from the
-      # pyinstaller dependency group that `uv sync` installs.
-      - run: |
-          uv pip install --python .venv-native/bin/python \
-            "pyinstaller~=6.19" keystone-engine
+      # The venv's scripts live in Scripts/ on Windows and bin/ everywhere
+      # else, and every step below needs one of them. VIRTUAL_ENV is what uv
+      # reads to pick the environment, so it does not need the split.
+      - name: Locate the environment
+        shell: bash
+        run: |
+          echo "VIRTUAL_ENV=$PWD/.venv-native" >> "$GITHUB_ENV"
+          if [[ -d .venv-native/Scripts ]]; then
+              echo "VBIN=$PWD/.venv-native/Scripts" >> "$GITHUB_ENV"
+          else
+              echo "VBIN=$PWD/.venv-native/bin" >> "$GITHUB_ENV"
+          fi
+      # angr-management's `pyinstaller` dependency group, which upstream gets
+      # from `uv sync` and this lane installs by hand, minus its
+      # `angr[unicorn]` entry that ci/run-native.py already built from the
+      # tree. Both markers are load-bearing rather than decoration: pillow is
+      # what converts the spec's .ico to the .icns macOS insists on, and
+      # without it the freeze dies on the icon; keystone has no aarch64 Linux
+      # wheel.
+      - run: uv pip install "pyinstaller~=6.19"
+      - if: runner.os == 'macOS'
+        run: uv pip install pillow
+      - if: runner.os != 'Linux' || runner.arch != 'ARM64'
+        run: uv pip install keystone-engine
       # ci/import.py drops these two submodules -- 195 MB of FLIRT
       # signatures and 7 MB of library docs, runtime data rather than code
       # under test -- but the spec names both in its `datas` and PyInstaller
@@ -416,7 +459,7 @@ jobs:
           git clone --depth 1 https://github.com/angr/library_docs
       - name: Freeze
         working-directory: angr-management
-        run: ../.venv-native/bin/pyinstaller angr-management.spec
+        run: ${{ env.VBIN }}/pyinstaller angr-management.spec
       # Upstream's test_ubuntu: start the thing and look for its window.
       - name: Start it
         if: runner.os == 'Linux'
@@ -465,7 +508,7 @@ jobs:
         with:
           name: pyodide-pyvex
           path: wheelhouse/*.whl
-          if-no-files-found: ignore
+          if-no-files-found: error
 
   # Sphinx. Every component reports a readthedocs status on its pull
   # requests, and pypcode builds its docs inside Actions on top of that.

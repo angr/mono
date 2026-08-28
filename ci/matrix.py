@@ -9,9 +9,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# The two native fields that reach a `run:` string and a `runs-on:`. Every
+# other field this file emits is either a suite name checked against
+# suites.json or an integer.
+RUNNERS = {
+    "ubuntu-24.04",
+    "ubuntu-24.04-arm",
+    "ubuntu-latest",
+    "windows-2022",
+    "windows-latest",
+    "macos-15",
+    "macos-15-intel",
+    "macos-latest",
+}
+PYTHON = re.compile(r"^3\.\d{1,2}$")
 
 
 def validate(config: dict) -> None:
@@ -46,6 +62,14 @@ def validate(config: dict) -> None:
         unknown = sorted(set(named) - known)
         if unknown:
             raise SystemExit(f"native {job['os']}: no such suite: {', '.join(unknown)}")
+        # `os` and `python` were the two fields nothing here looked at, and
+        # both land in the workflow -- one as `runs-on:`, one in a `run:`
+        # command. A gate that exists to refuse a matrix that quietly does
+        # the wrong thing should not skip the fields that choose what runs.
+        if job["os"] not in RUNNERS:
+            raise SystemExit(f"native {job['os']}: not a known runner label")
+        if not PYTHON.match(str(job["python"])):
+            raise SystemExit(f"native {job['os']}: bad python {job['python']!r}")
 
 
 def entries() -> list[dict]:

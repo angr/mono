@@ -35,6 +35,21 @@ runs:
                     /usr/local/share/boost /usr/share/swift
         df -h /
 
+    # `.nix-cache` is written by the restore step below and by nothing else.
+    # A copy committed on a branch would already be on disk at this point,
+    # and the installer is about to trust that directory as a substituter
+    # with signature checking off -- so a branch could hand every job store
+    # paths it did not build, under a key whose inputs it did not change.
+    # Refuse it rather than configure around it.
+    - name: Refuse a checked-in store cache
+      shell: bash
+      run: |
+        if [[ -e .nix-cache ]]; then
+            echo "::error::.nix-cache is present in the checkout." >&2
+            echo "It is created by CI from the release asset, never committed." >&2
+            exit 1
+        fi
+
     - uses: DeterminateSystems/nix-installer-action@v22
       with:
         # The cache is an ordinary file:// binary cache, so a job substitutes
