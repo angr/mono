@@ -356,15 +356,18 @@
       "shards": 10,
       "with": [
         "pysoot"
-      ]
+      ],
+      "python": "3.12"
     },
     {
       "suite": "angr-management",
-      "shards": 2
+      "shards": 2,
+      "python": "3.12"
     },
     {
       "suite": "pypcode",
-      "shards": 1
+      "shards": 1,
+      "python": "3.13"
     }
   ]
 }

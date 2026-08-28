@@ -50,6 +50,11 @@ ECOSYSTEM = {
 # The extras upstream installs alongside angr.
 ANGR_EXTRAS = "[angrdb,unicorn,llm]"
 
+# Set by --coverage. The coverage lane runs the same suites on the same OS and
+# Python as a native entry does, so without this both write
+# `pypcode-linux-x86_64-py3.12-1.xml` and the summary job's merge keeps one.
+COVERAGE_LANE = False
+
 
 def venv_python() -> Path:
     return VENV / ("Scripts" if os.name == "nt" else "bin") / (
@@ -144,7 +149,12 @@ def install(
         # comes from, not where the compiled objects land, and turning it off
         # would mean pinning scikit-build-core, setuptools-rust and cmake into
         # this venv by hand.
-        install_one(*editable, *args)
+        #
+        # `--editable` goes immediately before the path, not at the front:
+        # the callers that pass `-f <dir>` first produced
+        # `uv pip install --editable -f <dir> <path>`, and uv read `-f` as the
+        # value of `--editable`. That was every coverage cell except pypcode.
+        install_one(*args[:-1], *editable, args[-1])
 
     # The test tooling first, so a component build cannot pick a different one.
     # The stubs are upstream's: pyright sees them there, and a ratchet that
@@ -189,7 +199,15 @@ def install(
             # AFL itself, as a prebuilt wheel. nixpkgs does not carry it,
             # which is why phuzzer is a native-lane suite and not a Nix one.
             install_one("shellphish-afl")
-        install_one("-f", dist, str(ROOT / name))
+        # `-f <dist>` only where the dependent actually needs angr, which is
+        # the only thing that wants the locally built pyvex wheel. pysoot
+        # needs nothing from CORE, so pyvex is never built for it and the
+        # directory does not exist -- uv fails with "Failed to read
+        # '--find-links' directory". That was all twelve pysoot cells; it
+        # passed here only because this checkout had a pyvex/dist left over
+        # from an earlier run.
+        links = ["-f", dist] if ECOSYSTEM[name] else []
+        install_component(*links, str(ROOT / name))
 
     # After angr, as upstream does, and with its llm extra: angr-management's
     # MCP suite skips itself unless fastmcp and uvicorn are importable.
@@ -211,7 +229,8 @@ def tag() -> str:
     it was quietly reporting one of those platforms twice.
     """
     version = f"py{sys.version_info.major}.{sys.version_info.minor}"
-    return f"{sys.platform}-{platform.machine().lower()}-{version}"
+    lane = "-coverage" if COVERAGE_LANE else ""
+    return f"{sys.platform}-{platform.machine().lower()}-{version}{lane}"
 
 
 def suite_config(name: str) -> dict:
@@ -419,6 +438,9 @@ def main() -> int:
         "(default: every component)",
     )
     args = parser.parse_args()
+
+    global COVERAGE_LANE
+    COVERAGE_LANE = args.coverage
 
     if args.print_python:
         print(venv_python())

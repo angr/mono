@@ -47,7 +47,7 @@ NIX_LANE = "-nix"
 
 # `<suite>-<sys.platform>-py<x.y>` for the native lanes. sys.platform is
 # `win32`, not `windows`, which two of these three used to omit.
-NATIVE_TAG = re.compile(r"-(?:linux|darwin|win32)-[a-z0-9_]+-py\d+\.\d+$")
+NATIVE_TAG = re.compile(r"-(?:linux|darwin|win32)-[a-z0-9_]+-py\d+\.\d+(?:-coverage)?$")
 
 
 def base_suite(name: str) -> str:
@@ -199,6 +199,29 @@ def main() -> int:
         f"| **total** | {tests} | {tests - failures - errors - skipped} | {failures} "
         f"| {errors} | {skipped} | {sum(excluded.values())} | {totals[4] / 60:.1f} min |"
     )
+
+    # Every lane, not just the budgeted one. The skip ratchet below is
+    # Nix-only by design -- that is the lane whose skip count is stable --
+    # which leaves the Windows and macOS angr runs, the twelve pysoot cells
+    # and the coverage lane with nothing watching them. This is the
+    # baseline-free half: a suite that ran and skipped all of it did not
+    # test anything, wherever it ran. `collect()` writes no junit, so every
+    # file here is a real run.
+    empty = [
+        suite
+        for suite, (tests, failures, errors, skipped, _time, _slow) in per_suite.items()
+        if tests > 0 and tests - failures - errors - skipped == 0
+    ]
+    if empty:
+        print("\nthese suites ran and skipped everything:", file=sys.stderr)
+        for suite in sorted(empty):
+            print(f"  {suite}", file=sys.stderr)
+        print(
+            "\nA suite that skips every test is a suite that did not run. "
+            "Find the dependency that went missing.",
+            file=sys.stderr,
+        )
+        return 1
 
     if args.baseline:
         return ratchet(per_suite, args.baseline, args.update_baseline)

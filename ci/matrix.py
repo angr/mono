@@ -86,6 +86,15 @@ def validate(config: dict) -> None:
             raise SystemExit(f"coverage: no such suite: {job['suite']}")
         if job.get("shards", 1) < 1:
             raise SystemExit(f"coverage {job['suite']}: shards must be at least 1")
+        # The coverage lane installs and runs through run-native.py, so the
+        # same two things that disqualify a suite there disqualify it here.
+        if job["suite"] in NIX_ONLY:
+            raise SystemExit(
+                f"coverage {job['suite']}: Nix-lane only: {NIX_ONLY[job['suite']]}"
+            )
+        for extra in job.get("with", []):
+            if extra not in known:
+                raise SystemExit(f"coverage {job['suite']}: no such component: {extra}")
 
     for job in config["native"]:
         named = job.get("suites", []) + job.get("collect", [])
@@ -163,6 +172,7 @@ def main() -> int:
                 out.append(
                     {
                         "suite": suite,
+                        "python": job.get("python", "3.12"),
                         "components": " ".join([suite, *job.get("with", [])]),
                         "shard": shard,
                         "shards": shards,

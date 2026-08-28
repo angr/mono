@@ -75,6 +75,23 @@ def suites() -> list[str]:
     return [job["suite"] for job in config.get("coverage", [])]
 
 
+def expected() -> list[str]:
+    """Every measurement this repository intends to have.
+
+    Without this, a metric that fails every time is invisible: the C and Rust
+    helpers return None on any error, main() omits the key, and a ratchet that
+    only compares the keys it was given has nothing to compare. Rust coverage
+    could have been silently unmeasured forever.
+    """
+    names = []
+    for suite in suites():
+        names.append(f"{suite}:python")
+        if suite in C_SOURCES:
+            names.append(f"{suite}:c")
+    names.append("angr:rust")
+    return names
+
+
 def python_percent(results: Path, suite: str) -> float | None:
     """Combine one component's shards and return its line percentage."""
     shards = sorted(results.glob(f".coverage.{suite}.*"))
@@ -169,6 +186,8 @@ def main() -> int:
     if rust is not None:
         observed["angr:rust"] = rust
 
+    missing = sorted(set(expected()) - set(observed))
+
     if not observed:
         print("No coverage data found.")
         # The lane uploads with if-no-files-found: error, so an empty results
@@ -180,6 +199,9 @@ def main() -> int:
     print("| --- | ---: |")
     for name, pct in sorted(observed.items()):
         print(f"| {name} | {pct:.2f}% |")
+
+    if missing:
+        print(f"\nnot measured: {', '.join(missing)}")
 
     if args.baseline is None:
         return 0
@@ -196,7 +218,9 @@ def main() -> int:
 
     budget = json.loads(args.baseline.read_text())
     regressions = []
-    for name in sorted(set(budget) - set(observed)):
+    for name in missing:
+        regressions.append(f"  {name}: expected, but this run measured nothing")
+    for name in sorted(set(budget) - set(observed) - set(missing)):
         regressions.append(f"  {name}: recorded, but this run measured nothing")
     for name, pct in sorted(observed.items()):
         floor = budget.get(name)

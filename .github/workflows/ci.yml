@@ -334,15 +334,15 @@ jobs:
     env:
       # As upstream's coverage.yml sets them. `%p-%m` keeps one profile per
       # process, which matters because the suites run forked.
-      RUSTFLAGS: "-C instrument-coverage -C codegen-units=1"
+      RUSTFLAGS: "-C instrument-coverage -C codegen-units=1 -C link-dead-code"
       CFLAGS: "--coverage -O0 -g"
-      LDFLAGS: "--coverage"
+      LDFLAGS: "--coverage -g"
       COVERAGE: "1"
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
       - uses: astral-sh/setup-uv@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -364,7 +364,10 @@ jobs:
       - name: Install instrumented
         env:
           COMPONENTS: ${{ matrix.components }}
-        run: python ci/run-native.py --install --python 3.12 --coverage --for "$COMPONENTS"
+          PYVER: ${{ matrix.python }}
+        run: |
+          python ci/run-native.py --install --python "$PYVER" --coverage \
+            --for "$COMPONENTS"
       - name: Measure ${{ matrix.label }}
         env:
           SUITE: ${{ matrix.suite }}
@@ -373,6 +376,18 @@ jobs:
         run: |
           python ci/run-native.py "$SUITE" --coverage \
             --shard "$SHARD" --of "$SHARDS"
+      # A coverage job that produced no coverage is the failure this lane
+      # exists to prevent, and the upload's own check cannot see it: the
+      # junit file is always there.
+      - name: There is coverage data
+        run: |
+          shopt -s nullglob
+          data=(test-results/.coverage.*)
+          if (( ${#data[@]} == 0 )); then
+              echo "::error::no coverage database was written" >&2
+              exit 1
+          fi
+          printf 'coverage databases: %s\n' "${#data[@]}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -383,6 +398,8 @@ jobs:
             test-results/*.profraw
             test-results/*.xml
             test-results/*.log
+          # junit always exists, so this alone cannot tell that the coverage
+          # data is missing -- the step below is what checks that.
           if-no-files-found: error
 
   # angr's Rust extension. The Nix lane compiles it; nothing there runs its
@@ -663,9 +680,6 @@ jobs:
   # its pyproject and the sys.platform guards in its tests are otherwise dead
   # weight in this tree.
   #
-  # Only pyvex for now. cle's pyodide job runs its suite inside a
-  # `uv sync --python pyodide@3.14` environment against the pyvex wheel built
-  # here, which is a second thing to get right and is not done yet.
   pyodide:
     name: pyodide · pyvex
     runs-on: ubuntu-24.04
@@ -846,7 +860,11 @@ jobs:
         run: |
           python -m pip install --quiet "coverage[toml]" gcovr
           sudo apt-get update
-          sudo apt-get install -y llvm
+          # Pinned, as upstream pins llvm-20: llvm-profdata refuses a profile
+          # written by a different major version, and coverage-report.py
+          # reports that as "not measured" rather than as an error.
+          sudo apt-get install -y llvm-20 llvm-20-tools
+          echo "/usr/lib/llvm-20/bin" >> "$GITHUB_PATH"
       - name: Coverage report
         run: |
           echo '### Coverage' >> "$GITHUB_STEP_SUMMARY"
