@@ -83,6 +83,12 @@
             "win32",
             "darwin"
           ]
+        },
+        "tests/exploration_techniques/test_veritesting.py": {
+          "reason": "veritesting is unstable on Windows and upstream has the same problem: its own nightly fails Test Windows (3) on test_veritesting_b, and has every day this week. Here the module has produced an access violation, a crashed xdist worker, a SimSolverModeError and a bare assertion failure across four runs -- different symptoms, one unstable area. The reruns absorb the transient shapes; these are what is left. Runs and gates on Linux and macOS, where it passes.",
+          "platforms": [
+            "win32"
+          ]
         }
       }
     },

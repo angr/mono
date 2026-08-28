@@ -2,5 +2,7 @@
   "angr-management:python": 57.1,
   "angr:c": 2.2,
   "angr:python": 17.13,
+  "angr:rust": 3.83,
+  "pypcode:c": 5.4,
   "pypcode:python": 27.89
 }
