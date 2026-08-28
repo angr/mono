@@ -176,7 +176,8 @@
         "pyvex",
         "cle",
         "pypcode",
-        "angr-platforms"
+        "angr-platforms",
+        "angrop"
       ],
       "collect": [
         "angr"

@@ -108,6 +108,7 @@ angr-management and nothing else. It is not the whole of it. Upstream's
 transitively downstream of the one being changed; five of them are here. See
 the table below for what that leaves out.
 
+Every one of them also runs where upstream runs it, not only under Nix.
 `pysoot` additionally runs its own twelve-cell matrix -- Python 3.10 through
 3.13 across ubuntu-22.04, macos-14 and windows-2022 -- because that is what
 its own CI does, and `phuzzer` runs on a Linux runner with the kernel tuned

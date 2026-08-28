@@ -42,11 +42,6 @@ PYTHON = re.compile(r"^3\.\d{1,2}\Z", re.ASCII)
 # the cause, so it is refused here instead.
 NIX_ONLY = {
     "tracer": "needs a 32-bit loader; the native lane sets no QEMU_LD_PREFIX",
-    # 74 of angrop's assertions are `Keystone is not installed!`. The Nix test
-    # environment carries keystone-engine; adding it to the native install
-    # would put it on every job including linux-aarch64, where it has no
-    # wheel. Covered in the Nix lane, 122 passing.
-    "angrop": "needs keystone-engine, which has no aarch64 Linux wheel",
 }
 
 # The reverse: suites the Nix lane cannot serve. phuzzer needs

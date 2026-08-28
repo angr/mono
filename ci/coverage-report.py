@@ -44,10 +44,6 @@ C_SOURCES = {
 # The instrumented extension llvm-cov attributes the .profraw files to.
 RUST_OBJECT = ROOT / "angr" / "angr"
 
-# Filled by coverage_cmd() at start-up.
-COVERAGE: list[str] = []
-
-
 def run(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         [str(a) for a in args], capture_output=True, text=True, check=check
@@ -92,7 +88,7 @@ def expected() -> list[str]:
     return names
 
 
-def python_percent(results: Path, suite: str) -> float | None:
+def python_percent(results: Path, suite: str, coverage: list[str]) -> float | None:
     """Combine one component's shards and return its line percentage."""
     shards = sorted(results.glob(f".coverage.{suite}.*"))
     if not shards:
@@ -103,11 +99,11 @@ def python_percent(results: Path, suite: str) -> float | None:
     # --keep, so a rerun of this script over the same artifacts is not
     # destructive; the shards are the only copy CI has.
     run(
-        *COVERAGE, "combine",
+        *coverage, "combine",
         f"--rcfile={rcfile}", f"--data-file={combined}", "--keep", *shards,
     )
     report = run(
-        *COVERAGE, "json",
+        *coverage, "json",
         f"--rcfile={rcfile}", f"--data-file={combined}",
         "-o", str(results / f"coverage-{suite}.json"),
         check=False,
@@ -171,12 +167,11 @@ def main() -> int:
     parser.add_argument("--tolerance", type=float, default=1.0)
     args = parser.parse_args()
 
-    global COVERAGE
-    COVERAGE = coverage_cmd()
+    coverage = coverage_cmd()
 
     observed: dict[str, float] = {}
     for suite in suites():
-        py = python_percent(args.results, suite)
+        py = python_percent(args.results, suite, coverage)
         if py is not None:
             observed[f"{suite}:python"] = py
         c = c_percent(args.results, suite)

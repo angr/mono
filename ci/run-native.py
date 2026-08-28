@@ -47,8 +47,20 @@ ECOSYSTEM = {
     "phuzzer": ["angr"],
 }
 
-# The extras upstream installs alongside angr.
-ANGR_EXTRAS = "[angrdb,unicorn,llm]"
+def angr_extras() -> str:
+    """The extras upstream installs alongside angr.
+
+    angr's own dev group is `angr[angrdb,keystone,unicorn,llm]`, and its
+    tests import keystone -- `Exception: Keystone is not installed!` failed
+    every Windows and macOS shard of its suite the first time they ran for
+    real. keystone-engine has no aarch64 Linux wheel, which is the one place
+    it has to be left out; upstream's angr-management marks it the same way.
+    """
+    extras = ["angrdb", "unicorn", "llm"]
+    if not (sys.platform.startswith("linux") and platform.machine().lower() in
+            ("aarch64", "arm64")):
+        extras.insert(1, "keystone")
+    return "[" + ",".join(extras) + "]"
 
 # Set by --coverage. The coverage lane runs the same suites on the same OS and
 # Python as a native entry does, so without this both write
@@ -187,7 +199,7 @@ def install(
     if "cle" in core:
         install_component(str(ROOT / "cle"))
     if "angr" in core:
-        install_component("-f", dist, str(ROOT / "angr") + ANGR_EXTRAS)
+        install_component("-f", dist, str(ROOT / "angr") + angr_extras())
 
     # `--ecosystem` installs all of them; `--for` installs the ones a job
     # actually names. Without the second, a native entry naming angrop
