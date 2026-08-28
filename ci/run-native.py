@@ -20,7 +20,6 @@ import argparse
 import json
 import os
 import platform
-import tomllib
 import shutil
 import subprocess
 import sys
@@ -329,6 +328,12 @@ def coverage_rcfile(name: str, module: str, results: Path) -> Path:
     Written beside the results so the artifact carries it, and generated
     rather than committed into the component, which stays as upstream has it.
     """
+    # Imported here, not at the top: this script runs under the matrix's
+    # own Python, and pysoot's cells go down to 3.10, where tomllib does not
+    # exist. Only the coverage lane calls this, and that lane is 3.12 and
+    # 3.13 -- but a module-level import broke both 3.10 cells outright.
+    import tomllib  # pylint: disable=import-outside-toplevel
+
     with (ROOT / name / "pyproject.toml").open("rb") as handle:
         declared = tomllib.load(handle).get("tool", {}).get("coverage", {})
 
