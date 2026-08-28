@@ -249,9 +249,20 @@ jobs:
           sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0 \
             libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
             libxcb-render-util0 libxcb-shape0
-      - name: Keystone and flatbuffers for angr-management
-        if: runner.os == 'macOS' && contains(matrix.suites, 'angr-management')
-        run: brew install flatcc flatbuffers keystone
+      # keystone for anything that assembles, not just angr-management.
+      # keystone-engine 0.9.2 builds from source on macOS and produces a
+      # dylib that will not load, so `import keystone` fails and archinfo
+      # reports "Keystone is not installed!" -- fourteen of angr's macOS
+      # tests, and the same tests upstream's own macOS nightly fails on.
+      # Homebrew's keystone is a working one, and installing it is what
+      # upstream's angr-management jobs already do.
+      - name: Keystone and flatbuffers
+        if: runner.os == 'macOS'
+        run: |
+          brew install keystone
+          if [[ "${{ contains(matrix.suites, 'angr-management') }}" == true ]]; then
+              brew install flatcc flatbuffers
+          fi
 
       # phuzzer's _check_environment refuses to start a fuzzer until the
       # kernel is tuned for it. Upstream writes these through a /hostproc
