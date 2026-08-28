@@ -139,7 +139,8 @@ esac
 echo "$suite: testing $module from $origin"
 
 args=(-m pytest tests -p no:cacheprovider -q -rfEs -o addopts=
-      --rootdir="$run_dir" --junitxml="$results/$suite-nix-$shard.xml" --durations=25)
+      --rootdir="$run_dir" --junitxml="$results/$suite-nix-$shard.xml"
+      -o junit_family=legacy --durations=25)
 if [[ $workers != 0 && $workers != 1 ]]; then
     args+=(-n "$workers")
 fi

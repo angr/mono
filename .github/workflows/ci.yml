@@ -139,7 +139,10 @@ jobs:
         with:
           name: results-${{ matrix.id }}
           path: test-results/*.xml
-          if-no-files-found: ignore
+          # A pytest that dies during collection writes no XML. With `ignore`
+          # the lane contributes no row to the summary table and nothing
+          # anywhere says a suite went missing.
+          if-no-files-found: error
 
   # The second lane. Nix does not run on Windows, and upstream gates on
   # Windows, macOS and Python versions past 3.12 -- so those get the same
@@ -204,7 +207,10 @@ jobs:
         with:
           name: results-${{ matrix.id }}
           path: test-results/*.xml
-          if-no-files-found: ignore
+          # A pytest that dies during collection writes no XML. With `ignore`
+          # the lane contributes no row to the summary table and nothing
+          # anywhere says a suite went missing.
+          if-no-files-found: error
 
   # angr's Rust extension. The Nix lane compiles it; nothing there runs its
   # tests or looks at it the way upstream's rust_check/rust_test jobs do.
@@ -503,9 +509,13 @@ jobs:
           pattern: results-*
           merge-multiple: true
       - run: ci/summarize.py test-results >> "$GITHUB_STEP_SUMMARY"
+      # `needs.*` over the whole dependency list rather than a hand-written
+      # enumeration: the enumeration named six of the ten lanes, so
+      # pre-commit, pyinstaller, pyodide and docs could each go red with this
+      # job green. A gate you have to remember to extend is a gate that
+      # eventually lies about a lane nobody is looking at.
       - name: Fail if any lane failed
         if: >-
-          needs.test.result != 'success' || needs.native.result != 'success'
-          || needs.rust.result != 'success' || needs.ratchets.result != 'success'
-          || needs.wheels.result != 'success' || needs.checks.result != 'success'
+          contains(needs.*.result, 'failure')
+          || contains(needs.*.result, 'cancelled')
         run: exit 1

@@ -182,6 +182,10 @@ def run_suite(name: str, shard: int, of: int, workers: str) -> int:
         "-p", "no:cacheprovider", "-q", "-rfEs", "-o", "addopts=",
         f"--rootdir={run_dir}",
         f"--junitxml={results / f'{name}-{tag()}-{shard}.xml'}",
+        # As upstream pins it: Codecov's test-results ingestion reads
+        # the legacy family, not pytest's xunit2 default.
+        "-o",
+        "junit_family=legacy",
         "--durations=25",
     ]
     if workers not in ("0", "1"):

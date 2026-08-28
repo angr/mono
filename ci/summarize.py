@@ -54,7 +54,9 @@ def main() -> int:
 
     if not per_suite:
         print("No test results found.")
-        return 0
+        # Every lane that reaches here uploads XML, so an empty
+        # directory means a suite vanished rather than passed.
+        return 1
 
     print("| suite | tests | passed | failed | errors | skipped | slowest shard |")
     print("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
