@@ -394,7 +394,19 @@ def run_suite(
         # that from a real failure, which fails every attempt, instead of
         # deselecting a test that passes nearly always. Linux does not need
         # it and does not get it.
-        args += ["--reruns", "2", "--only-rerun", "crashed"]
+        args += [
+            "--reruns", "2",
+            # Both shapes the instability takes. A crashed xdist worker is
+            # reported as "worker 'gwN' crashed"; unicorn faulting inside the
+            # process comes back as an OSError naming an access violation,
+            # and one of those cascades through every later test the worker
+            # picks up -- the same shard gave 36 failures, then 1, then 35
+            # across three runs. A real failure still fails all three
+            # attempts, which is how test_similarity_fauxware was identified
+            # as deterministic rather than flaky.
+            "--only-rerun", "crashed",
+            "--only-rerun", "access violation",
+        ]
 
     if config.get("forked") and os.name != "nt" and sys.platform != "darwin":
         # pytest-forked needs fork(2); Windows has none. macOS has it and
