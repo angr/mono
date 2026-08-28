@@ -37,7 +37,7 @@ SCORE = re.compile(r"rated at (-?[\d.]+)/10")
 
 # pylint prints no score for a file with nothing in it. Upstream reads that
 # as a perfect 10; this treated it as a parse failure, so every new empty
-# __init__.py -- there are 60 in this tree -- failed the gate.
+# __init__.py -- there are 59 tracked in this tree -- failed the gate.
 NO_STATEMENTS = "0 statements analysed."
 
 

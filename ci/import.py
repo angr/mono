@@ -7,8 +7,9 @@ so a snapshot can always be traced back and re-created.
 
 Two things deliberately do not come in:
 
-* ``.github/`` from a component.  Only the root workflow runs here, and a
-  dead copy of six upstream workflows per component reads as if it did.
+* ``.github/`` from a component.  Only the root workflow runs here, and all
+  twelve components have one upstream -- thirty workflow files between them,
+  every one of which would read as if it ran.
 * ``pyvex/vex``.  VEX stays an external dependency; the flake's ``vex`` input
   is repinned to whatever commit pyvex's submodule names, so the pin follows
   upstream without the sources living here.
@@ -52,9 +53,11 @@ CORE = [
 # these, a green run here means an API change was tried against angr and
 # angr-management and nothing else.
 #
-# Two of them also matter to angr's own suite. `angr/tests/engines/test_java.py`
-# guards fifteen tests behind `skipUnless(pysoot)` and `test_cfgfast_soot.py`
-# four more; `angr/tests/common.py` guards its CGC trace helpers behind
+# Two of them also matter to angr's own suite. Twenty-one tests are behind
+# `skipUnless(pysoot)` -- fourteen decorated in
+# `angr/tests/engines/test_java.py`, three more through the `create_project`
+# helper it decorates, and four from the class decorator in
+# `test_cfgfast_soot.py` -- and eighteen more are behind
 # `skipUnless(tracer)`. Without those two in the tree, those tests do not
 # fail -- they report as skips, which is worse.
 ECOSYSTEM = [
@@ -74,8 +77,11 @@ COMMON_EXCLUDES = [".git", ".github"]
 EXCLUDES = {
     # VEX stays external: pinned as a flake input, not vendored here.
     "pyvex": ["vex"],
-    # 195 MB of FLIRT signatures and 7 MB of library docs are submodules of
-    # angr-management; they are runtime data, not code under test.
+    # FLIRT signatures and library docs are submodules of angr-management,
+    # a couple of hundred megabytes between them and growing; they are
+    # runtime data, not code under test. The pyinstaller lane clones both at
+    # a pinned commit, so the frozen bundle still carries what upstream's
+    # does.
     "angr-management": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs",

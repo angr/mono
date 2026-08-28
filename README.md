@@ -94,7 +94,8 @@ printed on every run of that suite. Nothing else is. That includes the suites
 for angr's optional `llm` extra: `pydantic-ai`, `mcp` and `fastmcp` are
 packaged in `nix/python-overlay.nix` rather than skipped, because a suite that
 is skipped for want of a dependency is a suite that tells you nothing. The
-same reasoning packaged `pysoot` -- with a JDK, since jpype needs one -- and
+same reasoning packaged `pysoot` -- with a JDK in the test shell, since
+jpype needs one and pysoot's own suite proves it is absent -- and
 `tracer`, with the prebuilt `shellphish-qemu` wheel it requires: those two
 gate thirty-nine of angr's own tests, which reported as skips for as long as
 the components sat in the tree unpackaged. What the counts are now is a
@@ -104,7 +105,7 @@ Four of the five now run their own suites too -- `pysoot`, `tracer`,
 `angr-platforms` and `angrop` -- which is the shape of what upstream's
 `ga-build.sh` does: without them a claripy change is tried against angr and
 angr-management and nothing else. It is not the whole of it. Upstream's
-`repo-list.txt` names twenty-one repositories and tests everything
+`repo-list.txt` names twenty-two repositories and tests everything
 transitively downstream of the one being changed; five of them are here. See
 the table below for what that leaves out.
 
@@ -116,14 +117,15 @@ suggest otherwise.
 
 One job builds the whole closure and publishes it as a Nix binary cache; every
 other job substitutes from it, so a test job starts its suite instead of
-compiling angr's Rust extension for itself. Fourteen test jobs then run at
+compiling angr's Rust extension for itself. Fifteen test jobs then run at
 once.
 
 The cache lands in two places. `actions/cache` is the fast path — same
 datacentre, restored in seconds — but it is a 10 GB LRU shared by the whole
 repository, and one busy afternoon evicts the entry that fourteen jobs are
 about to ask for. So a GitHub release holds the authoritative copy, one asset
-per source revision, with no eviction and no budget to share; `ci/nix-cache.sh`
+per source revision, on no shared budget and evicted only by this
+repository's own prune, which keeps the newest few; `ci/nix-cache.sh`
 manages both and the jobs fall back from one to the other.
 
 The key is a hash of the git tree hashes of the pins, the Nix expressions and
@@ -132,7 +134,7 @@ otherwise. Editing this README does not invalidate it.
 
 The test matrix is one job per shard, so the stage costs what its slowest
 *shard* costs rather than what its slowest suite costs. `ci/suites.json` is
-the whole of it: which suites share a job — the five that finish in seconds
+the whole of it: which suites share a job — the eight that finish in seconds
 are billed for setup, not testing, so they share one — and how many shards
 the two that do not get. `pytest-split` does the splitting with the same
 `--splits`/`--group` flags upstream angr CI already shards with, against
@@ -175,9 +177,8 @@ is a thing upstream CI does today and this repository does not.
 
 | | what is missing | why it is not here yet |
 | --- | --- | --- |
-| The rest of the dependency graph | `ci-settings/ci-image/conf/repo-list.txt` names twenty-one repositories, and `test.py` runs the suite of everything transitively downstream of the one under test. Five are imported here. `rex`, `patcherex`, `heaphopper`, `shellphish/driller` and the three `mechaphish` packages are not, nor is `archr`, which `rex` builds against. | Each is another repository to snapshot and another dependency set to package. The five here were chosen because two of them gate tests inside angr's own suite; the rest are a straightforward extension of the same work, not a different problem. |
-| `phuzzer`'s suite | The other four imported dependents run; `phuzzer` does not. | `shellphish-afl` is a prebuilt AFL binary distribution and nixpkgs does not carry it. `phuzzer/phuzzers/afl.py` also refuses to start unless `/proc/sys/kernel/core_pattern` reads `core`; upstream writes it through a `/hostproc` bind mount in a privileged container, which an unprivileged runner cannot do. (It checks the cpufreq governor too, but only where `/sys/.../scaling_governor` exists, which on a virtualised runner it does not -- upstream sets `core_pattern` and nothing else.) |
-| Freeze coverage | `angr-management`'s `pyinstaller-build.yml` freezes on `ubuntu-22.04`, `ubuntu-24.04`, `ubuntu-24.04-arm`, `windows-2022` and `macos-15`. | Fixed below: this ran on three of the five, so ARM64 Linux and the older Ubuntu upstream uses as its AppImage baseline were never built at all. |
+| The rest of the dependency graph | `ci-settings/ci-image/conf/repo-list.txt` names twenty-two repositories, and `test.py` runs the suite of everything transitively downstream of the one under test. Five are imported here. `rex`, `patcherex`, `heaphopper`, `shellphish/driller` and the three `mechaphish` packages are not, nor is `archr`, which `rex` builds against. | Each is another repository to snapshot and another dependency set to package. The five here were chosen because two of them gate tests inside angr's own suite; the rest are a straightforward extension of the same work, not a different problem. |
+| `phuzzer`'s suite | The other four imported dependents run; `phuzzer` does not. | `shellphish-afl` is a prebuilt AFL binary distribution and nixpkgs does not carry it. `phuzzer/phuzzers/afl.py` also refuses to start unless `/proc/sys/kernel/core_pattern` reads `core`; upstream writes it, along with `sched_child_runs_first`, through a `/hostproc` bind mount in a privileged container, which an unprivileged runner cannot do. (It checks the cpufreq governor too, but only where `/sys/.../scaling_governor` exists, which on a virtualised runner it does not.) |
 | Runner images | angr's `installation` job gates on `windows-2025`, `macos-26` and `ubuntu-24.04` py3.14. | The native matrix here uses `windows-2022` and `macos-15` -- two generations behind what upstream currently gates on. Bumping them is a one-line change per entry in `ci/suites.json` and has not been tried. |
 | Coverage | `angr/coverage.yml` and `angr-management/coverage.yml` re-run the whole sharded suite under `pytest --cov` and `cargo llvm-cov` and upload to Codecov on every pull request. | Deliberate, for now. It is a second full matrix -- ten more angr shards, three more angr-management -- to catch untested lines, which is not a failure this repository has had. The one it has had twice is a suite quietly skipping, and coverage would not have caught either instance: a test that skips still executes every line up to the `skip()` call. That is what `ci/skips.json` is for. Revisit once a Codecov project exists. |
 | Decompiler snapshots | `ci-settings`' `corpus-test` job diffs decompiler output against `angr/dec-snapshots` and uploads the diff. | The corpus job is not ported. It is the decompiler's only regression detector, so this is the largest single omission. |

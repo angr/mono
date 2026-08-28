@@ -9,7 +9,7 @@
 # Why a release and not just actions/cache: the warm closure for this tree is
 # several gigabytes, one entry per source revision, and the Actions cache is a
 # 10 GB LRU for the whole repository -- a busy afternoon evicts the entry that
-# fourteen matrix jobs are about to ask for, and they all rebuild angr from
+# fifteen matrix jobs are about to ask for, and they all rebuild angr from
 # source. Release assets have no such budget and no eviction, so the release is
 # the authoritative copy and actions/cache is a same-datacentre fast path in
 # front of it (the workflow tries the cache first and falls back to here).
