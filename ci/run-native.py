@@ -384,6 +384,16 @@ def run_suite(
         "--timeout-method=thread",
         "--durations=25",
     ]
+    if workers == "auto" and sys.platform == "win32":
+        # Two, not one per core. Linux runs every test in its own process
+        # (--forked), so a test that corrupts memory cannot reach its
+        # neighbours; Windows has no fork(2), so an xdist worker runs many
+        # tests in one process and a fault cascades through everything it
+        # picks up afterwards -- 26 failures in a shard, all the same
+        # `access violation`, and 52 reruns that could not help because the
+        # process was already poisoned. Fewer workers means less concurrent
+        # unicorn and VEX state on a runner with four cores and 16 GB.
+        workers = "2"
     if workers not in ("0", "1"):
         args += ["-n", workers]
     if sys.platform in ("win32", "darwin"):
