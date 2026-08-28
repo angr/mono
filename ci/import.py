@@ -229,10 +229,20 @@ def main() -> int:
             "sibling_sources_repointed_at_workspace": workspaced,
         }
 
-    manifest["imported_at"] = dt.datetime.now(dt.timezone.utc).replace(
-        microsecond=0
-    ).isoformat()
     manifest["components"] = dict(sorted(manifest["components"].items()))
+
+    # Stamp a time only when something moved, so re-importing an unchanged
+    # upstream leaves the manifest alone and the tree stays clean. Otherwise
+    # the one command the README gives for regenerating the tree always
+    # reports a diff, and "did upstream move?" cannot be answered by running
+    # it.
+    previous = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    if {k: v for k, v in manifest.items() if k != "imported_at"} != {
+        k: v for k, v in previous.items() if k != "imported_at"
+    }:
+        manifest["imported_at"] = (
+            dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+        )
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     return 0
 

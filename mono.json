@@ -49,9 +49,9 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "bf85c7e47bb469878c564480e28c677abbe35acc",
-      "committed_at": "2026-08-24T12:21:37-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#372)",
+      "commit": "f92307b32e138de45b6ed4e8ca7794b67fdff6f8",
+      "committed_at": "2026-08-27T11:12:25-07:00",
+      "subject": "Support narrow p-code stack pointers (#363)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -117,5 +117,5 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-08-28T00:13:13+00:00"
+  "imported_at": "2026-08-28T01:02:34+00:00"
 }
