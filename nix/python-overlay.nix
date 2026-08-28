@@ -308,6 +308,24 @@ in
     disabledTests = (old.disabledTests or [ ]) ++ [ "test_same_millisecond_overflow" ];
   });
 
+  # The fourth, and the pattern is now the point rather than the instance.
+  # backrefs, portalocker, python-ulid and cyclopts all reach this closure
+  # through pydantic-ai / fastmcp -- packages angr's `llm` extra needs at run
+  # time and whose own test suites are not what this repository gates on --
+  # and each has a check that measures the clock. cyclopts' is the most
+  # obviously so: tests/completion/ drives real bash, zsh and fish through a
+  # pty and gives each prompt five seconds to come back, which a loaded
+  # runner does not always manage. The whole directory goes rather than one
+  # parameterisation, because they are all the same shape of test.
+  #
+  # They sit under `warm`, which gates every other job, so one of these
+  # taking the whole matrix down is a recurring cost with no upside. If a
+  # fifth appears, the answer is probably to stop running this stack's own
+  # suites altogether rather than to add a line here.
+  cyclopts = python-prev.cyclopts.overridePythonAttrs (old: {
+    disabledTestPaths = (old.disabledTestPaths or [ ]) ++ [ "tests/completion" ];
+  });
+
   # py-key-value-aio is a transitive dependency of fastmcp -- a key-value
   # abstraction with a backend per store. fastmcp asks for it with no extras
   # and only ever uses the in-memory backend, but the package's own test suite
