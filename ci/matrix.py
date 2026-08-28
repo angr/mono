@@ -45,7 +45,26 @@ def entries() -> list[dict]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="plain text, one job per line")
+    parser.add_argument("--native", action="store_true", help="the non-Nix matrix instead")
     args = parser.parse_args()
+
+    if args.native:
+        config = json.loads((ROOT / "ci" / "suites.json").read_text())
+        native = []
+        for job in config["native"]:
+            suites = job.get("suites", [])
+            smoke = job.get("smoke", [])
+            native.append(
+                {
+                    **job,
+                    "suites": " ".join(suites),
+                    "smoke": " ".join(smoke),
+                    "label": f"{'+'.join(suites + smoke)} · {job['os']} py{job['python']}",
+                    "id": f"{'-'.join(suites + smoke)}-{job['os']}-py{job['python']}",
+                }
+            )
+        print(json.dumps(native))
+        return 0
 
     if args.list:
         for entry in entries():

@@ -6,7 +6,13 @@
       "commit": "0e18fa25ef83c3db9813fe5a156da0013052e0e5",
       "committed_at": "2026-08-26T16:33:23-07:00",
       "subject": "SootClassHierarchy: Answer the subclass question for an interface (#6949)",
-      "excluded": []
+      "excluded": [],
+      "sibling_sources_repointed_at_workspace": [
+        "archinfo",
+        "claripy",
+        "cle",
+        "pyvex"
+      ]
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
@@ -16,6 +22,13 @@
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
+      ],
+      "sibling_sources_repointed_at_workspace": [
+        "angr",
+        "archinfo",
+        "claripy",
+        "cle",
+        "pyvex"
       ]
     },
     "archinfo": {
@@ -23,28 +36,35 @@
       "commit": "bf85c7e47bb469878c564480e28c677abbe35acc",
       "committed_at": "2026-08-24T12:21:37-07:00",
       "subject": "[pre-commit.ci] pre-commit autoupdate (#372)",
-      "excluded": []
+      "excluded": [],
+      "sibling_sources_repointed_at_workspace": []
     },
     "claripy": {
       "upstream": "https://github.com/angr/claripy",
       "commit": "6ff4486278af191304ae8188ed6faa643cf43087",
       "committed_at": "2026-08-24T12:21:21-07:00",
       "subject": "[pre-commit.ci] pre-commit autoupdate (#741)",
-      "excluded": []
+      "excluded": [],
+      "sibling_sources_repointed_at_workspace": []
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
       "commit": "d2ecea068794d20b1f14d90eecc1bc4bc4cfa431",
       "committed_at": "2026-08-26T15:51:09-07:00",
       "subject": "Test CLE under Pyodide (#704)",
-      "excluded": []
+      "excluded": [],
+      "sibling_sources_repointed_at_workspace": [
+        "archinfo",
+        "pyvex"
+      ]
     },
     "pypcode": {
       "upstream": "https://github.com/angr/pypcode",
       "commit": "559aacdc9d363fd19477d9daa40721279cd99248",
       "committed_at": "2026-06-29T11:33:46-07:00",
       "subject": "ci: bump actions/setup-python from 6.2.0 to 6.3.0",
-      "excluded": []
+      "excluded": [],
+      "sibling_sources_repointed_at_workspace": []
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
@@ -53,7 +73,8 @@
       "subject": "[pre-commit.ci] pre-commit autoupdate (#575)",
       "excluded": [
         "vex"
-      ]
+      ],
+      "sibling_sources_repointed_at_workspace": []
     }
   },
   "imported_at": "2026-08-27T13:03:41+00:00"

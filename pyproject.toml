@@ -1,0 +1,31 @@
+# A uv workspace over the components, and nothing else.
+#
+# There is no `[project]` table here on purpose: this is a virtual root, not a
+# package. Its whole job is the two tables below.
+#
+# Each component's own pyproject.toml carries a `[tool.uv.sources]` block
+# pointing its siblings at `git+https://github.com/angr/<name>` — the only
+# thing that can work when they live in different repositories, and exactly
+# wrong when they do not. Without this file `uv` fetches archinfo from GitHub
+# while an archinfo sits in the next directory, and then refuses the tree for
+# having two conflicting URLs for one package. The workspace sources below
+# take precedence and point every one of them at the checkout.
+[tool.uv.workspace]
+members = [
+    "archinfo",
+    "pyvex",
+    "pypcode",
+    "claripy",
+    "cle",
+    "angr",
+    "angr-management",
+]
+
+[tool.uv.sources]
+archinfo = { workspace = true }
+pyvex = { workspace = true }
+pypcode = { workspace = true }
+claripy = { workspace = true }
+cle = { workspace = true }
+angr = { workspace = true }
+angr-management = { workspace = true }

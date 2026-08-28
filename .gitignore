@@ -19,3 +19,8 @@ __pycache__/
 
 *.tar.zst
 /.nix-cache-staging.*/
+
+/.lint-base/
+/.typecheck-base/
+/.ci-run-native/
+/.venv-native/

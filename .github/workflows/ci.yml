@@ -30,6 +30,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
+      native: ${{ steps.matrix.outputs.native }}
     steps:
       - uses: actions/checkout@v5
       # Two statements, not one: `echo "x=$(cmd)"` reports echo's exit status,
@@ -39,6 +40,8 @@ jobs:
         run: |
           matrix=$(ci/matrix.py)
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          native=$(ci/matrix.py --native)
+          echo "native=$native" >> "$GITHUB_OUTPUT"
 
   warm:
     name: Warm the store
@@ -134,9 +137,144 @@ jobs:
           path: test-results/*.xml
           if-no-files-found: ignore
 
+  # The second lane. Nix does not run on Windows, and upstream gates on
+  # Windows, macOS and Python versions past 3.12 -- so those get the same
+  # suites through uv, against the same component sources and, because both
+  # lanes read flake.lock, the same external commits.
+  native:
+    name: ${{ matrix.label }}
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.native) }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v5
+      # angr's rustylib and pyvex's libvex are compiled here, not substituted.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - name: Qt and X11 for angr-management
+        if: runner.os == 'Linux' && contains(matrix.suites, 'angr-management')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0
+      - name: Keystone and flatbuffers for angr-management
+        if: runner.os == 'macOS' && contains(matrix.suites, 'angr-management')
+        run: brew install flatcc flatbuffers keystone
+
+      - name: Install the workspace
+        run: python ci/run-native.py --install --python ${{ matrix.python }}
+
+      - name: Run ${{ matrix.label }}
+        if: matrix.suites != ''
+        run: python ci/run-native.py ${{ matrix.suites }}
+
+      # What upstream's own Windows and macOS jobs do for angr: prove it
+      # installs and imports there. The suite itself is the Nix lane's job.
+      - name: Import ${{ matrix.smoke }}
+        if: matrix.smoke != ''
+        run: python ci/run-native.py ${{ matrix.smoke }} --smoke
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.id }}
+          path: test-results/*.xml
+          if-no-files-found: ignore
+
+  # angr's Rust extension. The Nix lane compiles it; nothing there runs its
+  # tests or looks at it the way upstream's rust_check/rust_test jobs do.
+  rust:
+    name: rust · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2022]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: cargo fmt --all -- --check
+        working-directory: angr
+        if: runner.os == 'Linux'
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+        working-directory: angr
+        if: runner.os == 'Linux'
+      - run: cargo test --release
+        working-directory: angr
+
+  # The two ratchets upstream gates on. Neither demands a clean score; both
+  # demand that a file you touched did not get worse. See the scripts.
+  ratchets:
+    name: Lint and typecheck ratchets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - name: Install the workspace
+        run: python ci/run-native.py --install --python 3.12
+      - run: |
+          .venv-native/bin/python -m pip install "pylint>=2.14.0" pyright
+      - name: pylint score ratchet
+        run: .venv-native/bin/python ci/lint.py --base origin/${{ github.base_ref || 'main' }}
+      - name: pyright badness ratchet
+        run: |
+          PATH="$PWD/.venv-native/bin:$PATH" .venv-native/bin/python ci/typecheck.py \
+            --base origin/${{ github.base_ref || 'main' }}
+
+  # pypcode is the one component upstream keeps out of the ecosystem sweep:
+  # it ships wheels across five platforms and tests them with unittest, not
+  # pytest. This is that job, for the platforms actions can reach.
+  wheels:
+    name: wheels · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2022, macos-15]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Fetch the pinned VEX sources
+        run: python ci/fetch-external.py vex
+      - uses: pypa/cibuildwheel@v2.21.3
+        with:
+          package-dir: pypcode
+        env:
+          CIBW_BUILD: cp312-*
+          CIBW_ARCHS: native
+          CIBW_SKIP: "*musllinux*"
+          CIBW_TEST_COMMAND: python -m unittest discover -v -s {package}/tests
+          CIBW_BUILD_VERBOSITY: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-pypcode-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
   summary:
     name: Summary
-    needs: test
+    needs: [test, native, rust, ratchets, wheels, checks]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -148,6 +286,9 @@ jobs:
           pattern: results-*
           merge-multiple: true
       - run: ci/summarize.py test-results >> "$GITHUB_STEP_SUMMARY"
-      - name: Fail if any suite failed
-        if: needs.test.result != 'success'
+      - name: Fail if any lane failed
+        if: >-
+          needs.test.result != 'success' || needs.native.result != 'success'
+          || needs.rust.result != 'success' || needs.ratchets.result != 'success'
+          || needs.wheels.result != 'success' || needs.checks.result != 'success'
         run: exit 1

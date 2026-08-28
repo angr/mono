@@ -1,10 +1,11 @@
 {
   "_comment": [
-    "`jobs` is the CI matrix: one entry per parallel job, and a job with more",
-    "than one shard becomes that many jobs. Group suites that finish in",
-    "seconds -- their cost is job setup, not testing -- and shard the ones",
-    "that do not, so the stage costs what its slowest shard costs.",
-    "`suites` is how each component's own suite is invoked."
+    "`jobs` is the Nix lane's matrix: one entry per parallel job, and a job",
+    "with more than one shard becomes that many jobs. Group suites that",
+    "finish in seconds -- their cost is job setup, not testing -- and shard",
+    "the ones that do not, so the stage costs what its slowest shard costs.",
+    "`native` is the second lane: the platforms Nix cannot reach, which is",
+    "where upstream gates. `suites` is how each component's suite is invoked."
   ],
   "jobs": [
     {
@@ -56,5 +57,76 @@
       "env": "gui",
       "qt": true
     }
-  }
+  },
+  "native": [
+    {
+      "os": "windows-2022",
+      "python": "3.12",
+      "suites": [
+        "archinfo",
+        "pyvex",
+        "pypcode",
+        "claripy",
+        "cle"
+      ],
+      "smoke": [
+        "angr"
+      ]
+    },
+    {
+      "os": "macos-15",
+      "python": "3.12",
+      "suites": [
+        "archinfo",
+        "pyvex",
+        "pypcode",
+        "claripy",
+        "cle"
+      ],
+      "smoke": [
+        "angr"
+      ]
+    },
+    {
+      "os": "windows-2022",
+      "python": "3.12",
+      "suites": [
+        "angr-management"
+      ]
+    },
+    {
+      "os": "macos-15",
+      "python": "3.12",
+      "suites": [
+        "angr-management"
+      ]
+    },
+    {
+      "os": "ubuntu-24.04-arm",
+      "python": "3.12",
+      "suites": [
+        "angr-management"
+      ]
+    },
+    {
+      "os": "ubuntu-24.04",
+      "python": "3.13",
+      "suites": [
+        "claripy",
+        "archinfo",
+        "pyvex",
+        "cle"
+      ]
+    },
+    {
+      "os": "ubuntu-24.04",
+      "python": "3.14",
+      "suites": [
+        "claripy",
+        "archinfo",
+        "pyvex",
+        "cle"
+      ]
+    }
+  ]
 }

@@ -221,6 +221,10 @@
               pkgs.binutils
               pkgs.cargo
               pkgs.rustc
+              # CI runs cargo fmt and clippy over angr's extension; a dev
+              # shell that cannot is a dev shell that finds out on the PR.
+              pkgs.rustfmt
+              pkgs.clippy
               pkgs.cmake
               pkgs.ninja
               pkgs.git

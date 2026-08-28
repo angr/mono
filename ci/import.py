@@ -81,6 +81,47 @@ def fetch(name: str, cache: Path) -> Path:
     return dest
 
 
+# Sibling pins inside a component's `[tool.uv.sources]`.
+#
+# Every component points its siblings at `git+https://github.com/angr/<name>`,
+# which is the only thing that can work across repositories and is exactly
+# wrong inside one: uv fetches archinfo from GitHub while an archinfo sits in
+# the next directory, then refuses the tree for holding two conflicting URLs
+# for one package. Worse, it would test a component against upstream's head
+# rather than against the tree it is being changed in, which is the whole
+# point of putting them together.
+#
+# So the import rewrites those entries to `{ workspace = true }`. It is the
+# one edit made to imported source, it is mechanical, and mono.json records
+# it per component.
+SIBLING_SOURCE = re.compile(
+    r"^(?P<indent>\s*)(?P<name>[A-Za-z0-9._-]+)\s*=\s*\{[^}]*"
+    r"git\s*=\s*[\"']https://github\.com/angr/(?P<repo>[A-Za-z0-9._-]+?)(?:\.git)?[\"'][^}]*\}\s*$",
+    re.MULTILINE,
+)
+
+
+def use_workspace_sources(dest: Path) -> list[str]:
+    """Repoint a component's sibling git sources at the workspace."""
+    pyproject = dest / "pyproject.toml"
+    if not pyproject.exists():
+        return []
+
+    rewritten = []
+
+    def replace(match: re.Match) -> str:
+        if match.group("repo") not in COMPONENTS:
+            return match.group(0)
+        rewritten.append(match.group("name"))
+        return f"{match.group('indent')}{match.group('name')} = {{ workspace = true }}"
+
+    text = pyproject.read_text()
+    updated = SIBLING_SOURCE.sub(replace, text)
+    if rewritten:
+        pyproject.write_text(updated)
+    return sorted(rewritten)
+
+
 def submodule_commit(repo: Path, path: str) -> str:
     """The commit a gitlink points at, e.g. pyvex's `vex`."""
     line = run("git", "-C", str(repo), "ls-tree", "HEAD", path)
@@ -150,6 +191,7 @@ def main() -> int:
         committed = run("git", "-C", str(src), "log", "-1", "--format=%cI")
         print(f"{name}: {commit[:12]} {subject}", file=sys.stderr)
         snapshot(name, src, ROOT / name)
+        workspaced = use_workspace_sources(ROOT / name)
         if name == "pyvex":
             vex = submodule_commit(src, "vex")
             manifest["external"] = {"vex": vex}
@@ -161,6 +203,7 @@ def main() -> int:
             "committed_at": committed,
             "subject": subject,
             "excluded": sorted(set(EXCLUDES.get(name, []))),
+            "sibling_sources_repointed_at_workspace": workspaced,
         }
 
     manifest["imported_at"] = dt.datetime.now(dt.timezone.utc).replace(

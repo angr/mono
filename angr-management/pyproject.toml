@@ -97,11 +97,11 @@ angrmanagement = [
 version = {attr = "angrmanagement.__version__"}
 
 [tool.uv.sources]
-archinfo = { git = "https://github.com/angr/archinfo.git", branch = "master" }
-pyvex = { git = "https://github.com/angr/pyvex.git", branch = "master" }
-cle = { git = "https://github.com/angr/cle.git", branch = "master" }
-claripy = { git = "https://github.com/angr/claripy.git", branch = "master" }
-angr = { git = "https://github.com/angr/angr.git", branch = "master" }
+archinfo = { workspace = true }
+pyvex = { workspace = true }
+cle = { workspace = true }
+claripy = { workspace = true }
+angr = { workspace = true }
 bintrace = { git = "https://github.com/mborgerson/bintrace", branch = "master" }
 
 [tool.ruff]
