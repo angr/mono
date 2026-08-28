@@ -47,6 +47,27 @@ def git(*args: str) -> str:
     ).stdout.strip()
 
 
+def require_pylint() -> None:
+    """Refuse to compare scores with no pylint to produce them.
+
+    Without this the gate passed by accident: `score()` returns 0.0 for a file
+    pylint could not parse, and an absent pylint produces no score either, so
+    both revisions came back 0.0, compared equal, and the run printed "no
+    pylint score regressed" over a comparison it had never made. A guard that
+    reports all clear has to be able to report not clear.
+    """
+    result = subprocess.run(
+        [sys.executable, "-m", "pylint", "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        print(result.stdout[-2000:], file=sys.stderr)
+        print(result.stderr[-2000:], file=sys.stderr)
+        raise SystemExit("pylint does not run; the score ratchet cannot mean anything")
+
+
 def score(target: Path, cwd: Path) -> float | None:
     """pylint score for one file, or None if it is not there."""
     if not target.exists():
@@ -66,7 +87,12 @@ def score(target: Path, cwd: Path) -> float | None:
         # number matters: the scale is unbounded below (a short file with a
         # few unresolvable imports scores -32), so a sentinel in the middle
         # of the range reads as an improvement over a bad-but-parsing file.
+        #
+        # stderr too: without it, "pylint emitted no score" and "pylint did
+        # not run" looked identical here, and require_pylint() above exists
+        # because the second one used to pass the gate.
         print(result.stdout[-2000:])
+        print(result.stderr[-2000:], file=sys.stderr)
         return 0.0
     return float(match.group(1))
 
@@ -121,6 +147,7 @@ def main() -> int:
     parser.add_argument("--base", default="origin/main")
     args = parser.parse_args()
 
+    require_pylint()
     base = merge_base(args.base)
     changed = [
         p

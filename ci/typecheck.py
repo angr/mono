@@ -36,6 +36,26 @@ def merge_base(base: str) -> str:
     return resolved
 
 
+def require_pyright() -> None:
+    """Same reason as ci/lint.py's require_pylint.
+
+    This one already failed loudly -- an absent pyright raises FileNotFoundError
+    out of subprocess -- but it failed as a traceback naming `pyright`, not as a
+    sentence saying the gate cannot mean anything without it.
+    """
+    try:
+        result = subprocess.run(
+            ["pyright", "--version"], capture_output=True, text=True, check=False
+        )
+    except OSError as exc:
+        raise SystemExit(
+            f"pyright does not run ({exc}); the badness ratchet cannot mean anything"
+        ) from exc
+    if result.returncode != 0:
+        print(result.stderr[-2000:], file=sys.stderr)
+        raise SystemExit("pyright does not run; the badness ratchet cannot mean anything")
+
+
 def badness(paths: list[Path]) -> dict[str, float]:
     """pyright badness per file: (errors * 10 + warnings) / lines."""
     if not paths:
@@ -88,6 +108,7 @@ def main() -> int:
     parser.add_argument("--base", default="origin/main")
     args = parser.parse_args()
 
+    require_pyright()
     base = merge_base(args.base)
     changed = [
         p
