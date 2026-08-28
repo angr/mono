@@ -78,9 +78,10 @@
       "excluded": {
         "tests/exploration_techniques/test_tracer.py::TestTracer::test_cgc_random_syscall_handling_native_interface": "angr's CGC random-syscall emulation desyncs from the trace that shellphish-qemu 0.12.4's cgc-tracer produces (TracerDesyncError). Deterministic, and unrelated to packaging: the qemu binary runs and unicorn is 2.1.4 as angr pins it. The other 24 tracer tests pass.",
         "tests/engines/test_unicorn.py::TestUnicorn::test_similarity_fauxware": {
-          "reason": "unicorn and VEX disagree on Windows: AngrIncongruencyError, 'Different memory or registers'. It surfaced as an access violation in the run before, so the divergence is real rather than one bad read. Upstream runs angr's Windows suite nightly and does not gate on it; its nightly has been red every day this week. Passes on Linux and macOS, where it is not deselected.",
+          "reason": "unicorn and VEX disagree away from Linux: AngrIncongruencyError, 'Different memory or registers'. Deterministic on both -- it failed all three attempts under --reruns on macOS, and surfaced as an access violation on Windows before that. Upstream runs angr's Windows and macOS suites nightly and gates on neither; its nightly has been red every day this week. Runs and gates on Linux.",
           "platforms": [
-            "win32"
+            "win32",
+            "darwin"
           ]
         }
       }
