@@ -115,6 +115,15 @@ ln -sfn -- "$root/binaries" "$run_dir/../binaries"
 # is not one. Named per suite in ci/suites.json rather than guessed.
 while read -r fixture; do
     [[ -z $fixture ]] && continue
+    # A name inside the component, not a route out of it: `..` or a leading
+    # slash would link something from outside the suite's own tree into a run
+    # directory whose whole point is holding nothing else.
+    case $fixture in
+        /* | *..*)
+            echo "$suite: fixture must be a path inside the component: $fixture" >&2
+            exit 1
+            ;;
+    esac
     [[ -e $root/$suite/$fixture ]] || {
         echo "$suite: no such fixture directory: $suite/$fixture" >&2
         exit 1
@@ -128,8 +137,12 @@ print('\n'.join(suite.get('fixtures') or []))
 
 # angr writes LMDB stores for its type and function database; keep them out
 # of the checkout so a test run never dirties the tree.
+# Removed first: a forked worker killed by the timeout never runs the parent's
+# atexit hook, so its LMDB directory is left behind. 698 of them and 3 GB had
+# accumulated locally, on a runner that has about 20 GB after the store.
 export RTDB_BASE=$results/rtdb
 export PYTHONDONTWRITEBYTECODE=1
+rm -rf -- "$RTDB_BASE"
 mkdir -p -- "$RTDB_BASE"
 
 # angr's tests skip their "is angr/binaries beside me" check when in CI. The
@@ -147,7 +160,14 @@ export CI=true
 # all three in that one file, and removing it removes them. So they are
 # deliberate, and what they cost is disk on a runner that has ~20 GB for a
 # store several of those wide.
-ulimit -c 0 || true
+# -S, the soft limit only. Plain `ulimit -c 0` sets the hard limit too, and a
+# hard limit cannot be raised again by an unprivileged process -- which broke
+# all six of tracer's tests: qemu_runner.py raises RLIMIT_CORE to infinity in
+# a preexec_fn, because a core file is how it detects that the traced program
+# crashed, and it got EPERM and a dead child instead. The soft limit still
+# stops the deliberate dumps above, and lets anything that genuinely needs
+# cores ask for them back.
+ulimit -S -c 0 || true
 
 if (( qt )); then
     export QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-minimal:enable_fonts}

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -44,9 +45,14 @@ def counts(path: Path) -> tuple[int, int, int, int, float]:
 NIX_LANE = "-nix"
 
 
+# `<suite>-<sys.platform>-py<x.y>` for the native lanes. sys.platform is
+# `win32`, not `windows`, which two of these three used to omit.
+NATIVE_TAG = re.compile(r"-(?:linux|darwin|win32)-py\d+\.\d+$")
+
+
 def base_suite(name: str) -> str:
     head, sep, _ = name.partition(NIX_LANE)
-    return head if sep else name.rsplit("-linux-", 1)[0].rsplit("-darwin-", 1)[0]
+    return head if sep else NATIVE_TAG.sub("", name)
 
 
 def deselected() -> dict[str, int]:
@@ -86,12 +92,29 @@ def ratchet(per_suite: dict, path: Path, update: bool) -> int:
         return 0
 
     if update:
-        path.write_text(json.dumps(dict(sorted(observed.items())), indent=2) + "\n")
-        print(f"\nwrote {path}")
+        # Merged into what is already there, not written over it. A developer
+        # regenerating after one suite has a results directory holding one
+        # suite, and overwriting left a baseline naming only that one -- every
+        # other suite then reported "no budget recorded" on the next full run.
+        # The README documents exactly that workflow, so the destructive
+        # version was one plausible-looking diff away.
+        budget = json.loads(path.read_text()) if path.exists() else {}
+        untouched = sorted(set(budget) - set(observed))
+        budget.update(observed)
+        path.write_text(json.dumps(dict(sorted(budget.items())), indent=2) + "\n")
+        print(f"\nwrote {path}: {', '.join(sorted(observed)) or 'nothing'}")
+        if untouched:
+            print(f"left alone (not in this run): {', '.join(untouched)}")
         return 0
 
     budget = json.loads(path.read_text())
     regressions = []
+    # A suite that produced no results at all skipped everything, and the
+    # loop below only walks what did arrive -- so without this, losing a
+    # suite's XML reads as "no suite skipped more than allowed". Every
+    # budgeted suite runs in the Nix lane, so every one of them must be here.
+    for suite in sorted(set(budget) - set(observed)):
+        regressions.append(f"  {suite}: budgeted, but produced no results")
     for suite, count in sorted(observed.items()):
         allowed = budget.get(suite)
         if allowed is None:

@@ -91,7 +91,30 @@ jobs:
       - name: Enter the shells the test jobs use
         run: |
           nix develop .#test --command python3 -c 'import angr, pydantic_ai, fastmcp'
-          nix develop .#gui --command python3 -c 'import angrmanagement' 
+          nix develop .#gui --command python3 -c 'import angrmanagement'
+          # pysoot and tracer need more than an import: both reach outside the
+          # Python environment -- pysoot starts a JVM through jpype, tracer
+          # runs a 32-bit ELF under qemu -- on JAVA_HOME and QEMU_LD_PREFIX
+          # from the test shell. Importing them proves nothing about either.
+          # Losing JAVA_HOME surfaces as fifty JVMNotFoundException tracebacks
+          # in two unrelated-looking files; losing QEMU_LD_PREFIX is worse,
+          # because tracer does not fail, it hangs in the solver until the
+          # per-test timeout. Prove both here, where the message can name the
+          # cause.
+          nix develop .#test --command python3 -c '
+          import os, subprocess, sys
+          import shellphish_qemu
+          from pysoot.lifter import _get_java_home
+
+          java = _get_java_home()
+          print("java home:", java)
+
+          prefix = os.environ.get("QEMU_LD_PREFIX", "")
+          loader = os.path.join(prefix, "lib", "ld-linux.so.2")
+          if not os.path.exists(loader):
+              sys.exit(f"no 32-bit loader at {loader!r}; tracer would hang")
+          print("qemu loader:", loader)
+          ' 
 
       # A no-op when this revision's asset already exists, and skipped
       # entirely for a fork's pull request, whose token cannot write releases.
