@@ -105,6 +105,12 @@ def install(
     install_one(
         "pytest", "pytest-xdist", "pytest-timeout", "pytest-split",
         "pytest-forked", "sortedcontainers-stubs>=2.4.3", "types-pefile",
+        # cle's test_cclemory compiles a CFFI module at run time, and cffi
+        # imports setuptools to do it. A uv venv has no setuptools; this
+        # suite only passed because angr-management's dependencies happened
+        # to pull one in, so trimming the install to what a job needs is what
+        # made it visible.
+        "setuptools",
     )
 
     core = CORE if ecosystem else needed_core(only or [])

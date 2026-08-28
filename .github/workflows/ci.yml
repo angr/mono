@@ -14,6 +14,16 @@ on:
   pull_request:
   workflow_dispatch:
 
+# bash everywhere, as upstream's own release workflow sets it. The Windows
+# runner defaults to PowerShell, where `$SUITES` is an undefined PowerShell
+# variable rather than the environment variable the step set -- so every
+# Windows native job ran `python ci/run-native.py` with no suites at all,
+# produced no junit XML, and passed. `if-no-files-found: error` on the
+# results upload is what finally made it say so.
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   # Not on main, as upstream guards it too. A superseded pull-request run is
