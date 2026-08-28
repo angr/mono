@@ -63,8 +63,18 @@ def c_percent(suite: str, results: Path) -> float | None:
         )
         return None
     summary = results / f"c-{suite}.json"
-    out = run("gcovr", "-r", str(source), "--json-summary-pretty",
-              "--json-summary", str(summary))
+    out = run(
+        "gcovr", "-r", str(source),
+        # pypcode's objects are built by CMake in a directory gcovr cannot
+        # infer from the source root, and it stops with "could not infer a
+        # working directory" after failing to write .gcov files for system
+        # headers it should not be reading in the first place. The filter
+        # keeps it to the component's own sources; the ignore is the flag
+        # gcovr's own error message recommends.
+        "--filter", str(source),
+        "--gcov-ignore-errors=no_working_dir_found",
+        "--json-summary-pretty", "--json-summary", str(summary),
+    )
     if out.returncode != 0 or not summary.exists():
         print(out.stderr[-1000:], file=sys.stderr)
         return None
