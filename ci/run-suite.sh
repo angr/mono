@@ -138,6 +138,17 @@ mkdir -p -- "$RTDB_BASE"
 # the guard would have caught.
 export CI=true
 
+# No core files. angr's tests/utils/test_mp_stdio.py is a regression test for
+# CPython aborting at interpreter shutdown when a forked child inherits a
+# held stdin lock -- the abort is the behaviour under test -- and it drops
+# three cores of about 250 MB every run of the suite. They were investigated
+# on the suspicion that a forked child was crashing after reporting its
+# result, which pytest-forked cannot see; bisecting the test directories put
+# all three in that one file, and removing it removes them. So they are
+# deliberate, and what they cost is disk on a runner that has ~20 GB for a
+# store several of those wide.
+ulimit -c 0 || true
+
 if (( qt )); then
     export QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-minimal:enable_fonts}
 fi
@@ -254,24 +265,5 @@ if (( pipe[1] != 0 )); then
     echo "tee failed writing $log (exit ${pipe[1]})" >&2
     (( rc == 0 )) && rc=${pipe[1]}
 fi
-# A forked child that dies after reporting its result is invisible to
-# pytest-forked, which reads the report off a pipe before the child exits --
-# so a segfault during interpreter teardown leaves core files behind and a
-# green suite. The full angr suite drops three of them every run. Say so
-# rather than fail on it: nothing here has shown a wrong test result yet, and
-# a warning that names the count is what makes it findable. (On a runner
-# whose core_pattern pipes to a handler, no file appears and this is silent.)
-cores=("$run_dir"/core.* "$run_dir"/core)
-existing=()
-for core in "${cores[@]}"; do
-    [[ -f $core ]] && existing+=("$core")
-done
-if (( ${#existing[@]} )); then
-    {
-        echo "::warning::$suite: ${#existing[@]} process(es) dumped core"
-        printf '  %s\n' "${existing[@]}"
-    } | tee -a "$log"
-fi
-
 echo "=== $suite ${shard}/${of} done: exit=$rc wall=$(( SECONDS - start ))s" | tee -a "$log"
 exit "$rc"
