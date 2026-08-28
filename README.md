@@ -100,11 +100,13 @@ gate thirty-nine of angr's own tests, which reported as skips for as long as
 the components sat in the tree unpackaged. What the counts are now is a
 question for the last run's summary, for the reason the cost section gives.
 
-Four of the five dependents now run their own suites too -- `pysoot`,
-`tracer`, `angr-platforms` and `angrop` -- which is what upstream's
-`ga-build.sh` does, driven by `ci-settings/ci-image/conf/repo-list.txt`:
-without them a claripy change is tried against angr and angr-management and
-nothing else. `phuzzer` is the one left out, and deliberately; see below.
+Four of the five now run their own suites too -- `pysoot`, `tracer`,
+`angr-platforms` and `angrop` -- which is the shape of what upstream's
+`ga-build.sh` does: without them a claripy change is tried against angr and
+angr-management and nothing else. It is not the whole of it. Upstream's
+`repo-list.txt` names twenty-one repositories and tests everything
+transitively downstream of the one being changed; five of them are here. See
+the table below for what that leaves out.
 
 A component's own `.github/` does not come in: only the workflow at the root
 of this repository runs, and seven dead copies of upstream's workflows would
@@ -173,7 +175,10 @@ is a thing upstream CI does today and this repository does not.
 
 | | what is missing | why it is not here yet |
 | --- | --- | --- |
-| `phuzzer`'s suite | The other four dependents run; `phuzzer` does not. | It needs `shellphish-afl`, a prebuilt AFL binary distribution that nixpkgs does not carry, and its `_check_environment()` refuses to start until it can write `/proc/sys/kernel/core_pattern` and the cpufreq governor. Upstream gets that from a privileged container; an unprivileged runner cannot. |
+| The rest of the dependency graph | `ci-settings/ci-image/conf/repo-list.txt` names twenty-one repositories, and `test.py` runs the suite of everything transitively downstream of the one under test. Five are imported here. `rex`, `patcherex`, `heaphopper`, `shellphish/driller` and the three `mechaphish` packages are not, nor is `archr`, which `rex` builds against. | Each is another repository to snapshot and another dependency set to package. The five here were chosen because two of them gate tests inside angr's own suite; the rest are a straightforward extension of the same work, not a different problem. |
+| `phuzzer`'s suite | The other four imported dependents run; `phuzzer` does not. | `shellphish-afl` is a prebuilt AFL binary distribution and nixpkgs does not carry it. `phuzzer/phuzzers/afl.py` also refuses to start unless `/proc/sys/kernel/core_pattern` reads `core`; upstream writes it through a `/hostproc` bind mount in a privileged container, which an unprivileged runner cannot do. (It checks the cpufreq governor too, but only where `/sys/.../scaling_governor` exists, which on a virtualised runner it does not -- upstream sets `core_pattern` and nothing else.) |
+| Freeze coverage | `angr-management`'s `pyinstaller-build.yml` freezes on `ubuntu-22.04`, `ubuntu-24.04`, `ubuntu-24.04-arm`, `windows-2022` and `macos-15`. | Fixed below: this ran on three of the five, so ARM64 Linux and the older Ubuntu upstream uses as its AppImage baseline were never built at all. |
+| Runner images | angr's `installation` job gates on `windows-2025`, `macos-26` and `ubuntu-24.04` py3.14. | The native matrix here uses `windows-2022` and `macos-15` -- two generations behind what upstream currently gates on. Bumping them is a one-line change per entry in `ci/suites.json` and has not been tried. |
 | Coverage | `angr/coverage.yml` and `angr-management/coverage.yml` re-run the whole sharded suite under `pytest --cov` and `cargo llvm-cov` and upload to Codecov on every pull request. | Deliberate, for now. It is a second full matrix -- ten more angr shards, three more angr-management -- to catch untested lines, which is not a failure this repository has had. The one it has had twice is a suite quietly skipping, and coverage would not have caught either instance: a test that skips still executes every line up to the `skip()` call. That is what `ci/skips.json` is for. Revisit once a Codecov project exists. |
 | Decompiler snapshots | `ci-settings`' `corpus-test` job diffs decompiler output against `angr/dec-snapshots` and uploads the diff. | The corpus job is not ported. It is the decompiler's only regression detector, so this is the largest single omission. |
 | Nightly | Ten repositories run a nightly that widens the matrix -- angr's runs the full suite on Windows and macOS, which is `--collect` only here. | A nightly on an experiment is recurring cost on somebody else's account. Deliberate. |

@@ -12,6 +12,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # As angr's own ci.yml has it. Without this a merge queue would run no
+  # checks at all on the thing it is about to merge.
+  merge_group:
   workflow_dispatch:
 
 # bash everywhere, as upstream's own release workflow sets it. The Windows
@@ -430,7 +433,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2022, macos-15]
+        # The five upstream's pyinstaller-build.yml freezes on. Three of
+        # them were here, which left ARM64 Linux -- and the older Ubuntu
+        # upstream uses as its AppImage baseline -- never built at all.
+        os:
+          [ubuntu-22.04, ubuntu-24.04, ubuntu-24.04-arm, windows-2022, macos-15]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
