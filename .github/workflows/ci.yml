@@ -328,9 +328,94 @@ jobs:
           name: wheels-pypcode-${{ matrix.os }}
           path: wheelhouse/*.whl
 
+  # angr-management's frozen app. Upstream calls pyinstaller-build.yml from
+  # its own ci.yml, so this gates on every pull request there: it catches an
+  # import PyInstaller's analysis cannot see, a resource missing from the
+  # spec's datas, an unbundled Qt platform plugin -- none of which the test
+  # suite can observe, because the suite runs in a venv where everything is
+  # importable by construction.
+  pyinstaller:
+    name: pyinstaller · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022, macos-15]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - name: Qt and X11
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 xvfb x11-utils
+      - name: Keystone and flatbuffers
+        if: runner.os == 'macOS'
+        run: brew install flatcc flatbuffers keystone
+      - run: python ci/run-native.py --install --python 3.12
+      - run: uv pip install --python .venv-native/bin/python "pyinstaller~=6.19"
+      - name: Freeze
+        working-directory: angr-management
+        run: ../.venv-native/bin/pyinstaller angr-management.spec
+      # Upstream's test_ubuntu: start the thing and look for its window.
+      - name: Start it
+        if: runner.os == 'Linux'
+        working-directory: angr-management
+        run: |
+          xvfb-run bash -c '
+            ./dist/angr-management/angr-management &
+            sleep 45
+            xwininfo -tree -root | grep -i "angr management"
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: angr-management-${{ matrix.os }}
+          path: angr-management/dist
+          if-no-files-found: error
+
+  # pyvex and cle both gate on a Pyodide build upstream, and cle is pinned
+  # here at the commit titled "Test CLE under Pyodide (#704)". The emscripten
+  # markers in cle's pyproject and the sys.platform guards in its tests are
+  # otherwise dead weight in this tree.
+  pyodide:
+    name: pyodide · ${{ matrix.component }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [pyvex, cle]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch the pinned VEX sources
+        run: python ci/fetch-external.py vex
+      - uses: pypa/cibuildwheel@v4.1.0
+        with:
+          package-dir: ${{ matrix.component == 'cle' && 'pyvex' || matrix.component }}
+        env:
+          CIBW_PLATFORM: pyodide
+          CIBW_PYODIDE_VERSION: "314.0.0"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pyodide-${{ matrix.component }}
+          path: wheelhouse/*.whl
+          if-no-files-found: ignore
+
   summary:
     name: Summary
-    needs: [test, native, rust, ratchets, wheels, checks, pre-commit]
+    needs: [test, native, rust, ratchets, wheels, checks, pre-commit, pyinstaller, pyodide]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
