@@ -32,10 +32,35 @@ def run(*args, check: bool = False) -> subprocess.CompletedProcess:
 
 
 def c_percent(suite: str, results: Path) -> float | None:
+    """gcovr over the component's native sources, or a reason it could not.
+
+    Every `return None` here used to be silent, and "nothing measured" is
+    indistinguishable from "measured zero" in a report. Each one says which
+    precondition failed, because that is the difference between a component
+    with no C and a build that was never instrumented.
+    """
     source = C_SOURCES.get(suite)
-    if source is None or not source.exists() or shutil.which("gcovr") is None:
+    if source is None:
+        print(f"{suite}: no C sources recorded", file=sys.stderr)
         return None
-    if not any(source.rglob("*.gcda")):
+    if not source.exists():
+        print(f"{suite}: {source} does not exist", file=sys.stderr)
+        return None
+    if shutil.which("gcovr") is None:
+        print(f"{suite}: gcovr is not on PATH", file=sys.stderr)
+        return None
+    notes = len(list(source.rglob("*.gcno")))
+    data = len(list(source.rglob("*.gcda")))
+    print(f"{suite}: {notes} .gcno and {data} .gcda under {source}", file=sys.stderr)
+    if not data:
+        # .gcno without .gcda means it was compiled instrumented and never
+        # run; neither means the build ignored CFLAGS altogether.
+        print(
+            f"{suite}: no gcov data -- "
+            + ("the instrumented objects were never executed" if notes
+               else "the build was not instrumented"),
+            file=sys.stderr,
+        )
         return None
     summary = results / f"c-{suite}.json"
     out = run("gcovr", "-r", str(source), "--json-summary-pretty",
@@ -47,11 +72,23 @@ def c_percent(suite: str, results: Path) -> float | None:
 
 
 def rust_percent(results: Path) -> float | None:
+    """Merge this shard's profiles, or say which piece was missing."""
     profraw = sorted(results.glob("*.profraw"))
     objects = sorted(RUST_OBJECT.glob("rustylib*.so"))
     profdata = shutil.which("llvm-profdata")
     cov = shutil.which("llvm-cov")
-    if not (profraw and objects and profdata and cov):
+    missing = [
+        name
+        for name, present in (
+            (".profraw files", profraw),
+            ("rustylib*.so", objects),
+            ("llvm-profdata", profdata),
+            ("llvm-cov", cov),
+        )
+        if not present
+    ]
+    if missing:
+        print(f"rust: missing {', '.join(missing)}", file=sys.stderr)
         return None
     merged = results / "rust.profdata"
     if run(profdata, "merge", "-sparse", "-o", merged, *profraw).returncode != 0:
