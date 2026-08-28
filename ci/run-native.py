@@ -45,7 +45,7 @@ def venv_python() -> Path:
     )
 
 
-def run(*args: str, cwd: Path | None = None, env: dict | None = None) -> None:
+def run(*args: str | Path, cwd: Path | None = None, env: dict | None = None) -> None:
     printable = " ".join(str(a) for a in args)
     print(f"+ {printable}", flush=True)
     subprocess.run([str(a) for a in args], cwd=cwd, env=env, check=True)

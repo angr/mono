@@ -333,6 +333,16 @@ jobs:
           CIBW_SKIP: "*musllinux*"
           CIBW_TEST_COMMAND: python -m unittest discover -v -s {package}/tests
           CIBW_BUILD_VERBOSITY: 1
+          # cibuildwheel keeps one build directory per package and reuses it
+          # for every Python, so cp312's CMakeCache is still sitting there
+          # when cp313 configures: cmake reports `found version "3.12.13"`
+          # and fails on the include dirs that go with an interpreter it is
+          # not building for. Unpacking the sdist did not fix this -- the
+          # sdist is unpacked once and built from three times.
+          CIBW_BEFORE_BUILD: >-
+            python -c "import shutil, sys;
+            shutil.rmtree(sys.argv[1] + '/build', ignore_errors=True)"
+            {package}
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-pypcode-${{ matrix.os }}
@@ -377,6 +387,17 @@ jobs:
       - run: |
           uv pip install --python .venv-native/bin/python \
             "pyinstaller~=6.19" keystone-engine
+      # ci/import.py drops these two submodules -- 195 MB of FLIRT
+      # signatures and 7 MB of library docs, runtime data rather than code
+      # under test -- but the spec names both in its `datas` and PyInstaller
+      # refuses a path that is not there. Upstream gets them from
+      # `submodules: recursive` on its checkout; cloning them at freeze time
+      # keeps the bundle equal to upstream's without the tree carrying 200 MB.
+      - name: Resource submodules
+        working-directory: angr-management/angrmanagement/resources
+        run: |
+          git clone --depth 1 https://github.com/angr/flirt_signatures
+          git clone --depth 1 https://github.com/angr/library_docs
       - name: Freeze
         working-directory: angr-management
         run: ../.venv-native/bin/pyinstaller angr-management.spec
