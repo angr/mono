@@ -69,7 +69,10 @@ def install(python_version: str, ecosystem: bool = False) -> None:
     # both are pinned in flake.lock rather than tracked here.
     run(sys.executable, ROOT / "ci" / "fetch-external.py")
 
-    run("uv", "venv", "--python", python_version, str(VENV))
+    # --clear so a second install replaces the environment rather than
+    # refusing; the components install non-editable here, as upstream
+    # installs them, so a stale one silently tests yesterday's source.
+    run("uv", "venv", "--clear", "--python", python_version, str(VENV))
     env = {**os.environ, "VIRTUAL_ENV": str(VENV)}
     python = str(venv_python())
 
@@ -117,6 +120,25 @@ def suite_config(name: str) -> dict:
     if suite is None:
         raise SystemExit(f"unknown suite: {name}")
     return suite
+
+
+def link_dir(target: Path, link: Path) -> None:
+    """Point `link` at `target` without copying it.
+
+    Windows has no symlink for an unprivileged process, but it does have
+    directory junctions, and `mklink /J` needs no privilege at all.
+    """
+    if link.exists():
+        return
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=True,
+            capture_output=True,
+        )
+    else:
+        link.symlink_to(target, target_is_directory=True)
 
 
 def stage(name: str) -> Path:
