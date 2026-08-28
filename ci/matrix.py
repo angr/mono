@@ -74,6 +74,12 @@ def validate(config: dict) -> None:
 
     for job in config["native"]:
         named = job.get("suites", []) + job.get("collect", [])
+        # `with` is installed but not run: angr's twenty-one
+        # skipUnless(pysoot) tests need pysoot importable wherever angr's
+        # suite runs, and pysoot's own suite is a separate matter.
+        for extra in job.get("with", []):
+            if extra not in known:
+                raise SystemExit(f"native {job['os']}: no such component: {extra}")
         if not named:
             raise SystemExit(f"native entry for {job['os']} names no suites")
         unknown = sorted(set(named) - known)
@@ -85,6 +91,13 @@ def validate(config: dict) -> None:
         # the wrong thing should not skip the fields that choose what runs.
         if job["os"] not in RUNNERS:
             raise SystemExit(f"native {job['os']}: not a known runner label")
+        # The same two checks the Nix jobs get. A native entry could set
+        # shards: 0 and delete its own suite, or shard two suites at once and
+        # run each of them twice.
+        if job.get("shards", 1) < 1:
+            raise SystemExit(f"native {job['os']}: shards must be at least 1")
+        if job.get("shards", 1) > 1 and len(named) != 1:
+            raise SystemExit(f"native {job['os']}: a sharded job runs exactly one suite")
         if not PYTHON.match(str(job["python"])):
             raise SystemExit(f"native {job['os']}: bad python {job['python']!r}")
         for suite in named:
@@ -130,18 +143,33 @@ def main() -> int:
         for job in config["native"]:
             suites = job.get("suites", [])
             collect = job.get("collect", [])
-            native.append(
-                {
-                    **job,
-                    "suites": " ".join(suites),
-                    "collect": " ".join(collect),
-                    # What the environment has to serve, so a job need not
-                    # build components no suite of its own will import.
-                    "components": " ".join(dict.fromkeys(suites + collect)),
-                    "label": f"{'+'.join(suites + collect)} · {job['os']} py{job['python']}",
-                    "id": f"{'-'.join(suites + collect)}-{job['os']}-py{job['python']}",
-                }
-            )
+            # Sharded, like the Nix jobs. This branch had no shard expansion
+            # at all, so `--shard/--of` never reached run-native.py and
+            # pytest-split never engaged off Nix -- which is fine while every
+            # native entry is one shard and wrong the moment one is not. Two
+            # shards would also have collided on `results-<id>`, and the
+            # second upload would have failed the job.
+            shards = job.get("shards", 1)
+            name = "+".join(suites + collect)
+            base = f"{'-'.join(suites + collect)}-{job['os']}-py{job['python']}"
+            for shard in range(1, shards + 1):
+                native.append(
+                    {
+                        **job,
+                        "suites": " ".join(suites),
+                        "collect": " ".join(collect),
+                        # What the environment has to serve, so a job need not
+                        # build components no suite of its own will import.
+                        "components": " ".join(
+                            dict.fromkeys(suites + collect + job.get("with", []))
+                        ),
+                        "shard": shard,
+                        "shards": shards,
+                        "label": f"{name} · {job['os']} py{job['python']}"
+                        + (f" {shard}/{shards}" if shards > 1 else ""),
+                        "id": base + (f"-{shard}-of-{shards}" if shards > 1 else ""),
+                    }
+                )
         print(json.dumps(native))
         return 0
 

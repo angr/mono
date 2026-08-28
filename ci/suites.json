@@ -210,6 +210,28 @@
       "suites": [
         "claripy"
       ]
+    },
+    {
+      "os": "windows-2022",
+      "python": "3.12",
+      "suites": [
+        "angr"
+      ],
+      "shards": 5,
+      "with": [
+        "pysoot"
+      ]
+    },
+    {
+      "os": "macos-15",
+      "python": "3.12",
+      "suites": [
+        "angr"
+      ],
+      "shards": 3,
+      "with": [
+        "pysoot"
+      ]
     }
   ]
 }

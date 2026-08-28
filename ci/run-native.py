@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -157,8 +158,15 @@ def tag() -> str:
     Every lane wrote `<suite>-<shard>.xml`, and the summary job merges all of
     them into one directory -- so claripy's five runs across five platforms
     became one row, whichever landed last.
+
+    The architecture is part of it, not just the platform. macos-15 and
+    macos-15-intel are both `darwin`, both run pyvex, and both wrote
+    `pyvex-darwin-py3.12-1.xml`; `merge-multiple: true` put the two on top of
+    each other, and the summary job died parsing the result. Before it died
+    it was quietly reporting one of those platforms twice.
     """
-    return f"{sys.platform}-py{sys.version_info.major}.{sys.version_info.minor}"
+    version = f"py{sys.version_info.major}.{sys.version_info.minor}"
+    return f"{sys.platform}-{platform.machine().lower()}-{version}"
 
 
 def suite_config(name: str) -> dict:

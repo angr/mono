@@ -219,6 +219,14 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - uses: astral-sh/setup-uv@v5
+      # As upstream pysoot's own test job does. jpype finds the JVM through
+      # JAVA_HOME, which this action sets; the Nix lane gets the same thing
+      # from pkgs.jdk in the test shell.
+      - uses: actions/setup-java@v5
+        if: contains(matrix.components, 'pysoot')
+        with:
+          distribution: zulu
+          java-version: "21"
       # angr's rustylib and pyvex's libvex are compiled here, not substituted.
       - uses: dtolnay/rust-toolchain@stable
       - uses: ilammy/msvc-dev-cmd@v1
@@ -252,10 +260,12 @@ jobs:
         if: matrix.suites != ''
         env:
           SUITES: ${{ matrix.suites }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ matrix.shards }}
         # Word splitting is the point: SUITES is a space-separated list.
         run: |
           # shellcheck disable=SC2086
-          python ci/run-native.py $SUITES
+          python ci/run-native.py $SUITES --shard "$SHARD" --of "$SHARDS"
 
       # Upstream's `installation` job, verbatim in effect: collect the suite
       # without running it. That imports every test module and every symbol

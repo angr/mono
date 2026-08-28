@@ -47,7 +47,7 @@ NIX_LANE = "-nix"
 
 # `<suite>-<sys.platform>-py<x.y>` for the native lanes. sys.platform is
 # `win32`, not `windows`, which two of these three used to omit.
-NATIVE_TAG = re.compile(r"-(?:linux|darwin|win32)-py\d+\.\d+$")
+NATIVE_TAG = re.compile(r"-(?:linux|darwin|win32)-[a-z0-9_]+-py\d+\.\d+$")
 
 
 def base_suite(name: str) -> str:
@@ -155,7 +155,15 @@ def main() -> int:
     for xml in sorted(args.results.rglob("*.xml")):
         # <suite>-<shard>.xml
         suite = xml.stem.rsplit("-", 1)[0]
-        tests, failures, errors, skipped, time = counts(xml)
+        try:
+            tests, failures, errors, skipped, time = counts(xml)
+        except ET.ParseError as exc:
+            # Say which file. Two lanes that write the same junit name land on
+            # top of each other when the summary job downloads with
+            # `merge-multiple: true`, and the bare traceback this used to
+            # raise -- "junk after document element" with no path -- cost a
+            # whole run to place.
+            raise SystemExit(f"{xml}: malformed junit XML: {exc}") from exc
         row = per_suite[suite]
         row[0] += tests
         row[1] += failures
