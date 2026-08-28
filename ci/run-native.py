@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import platform
+import tomllib
 import shutil
 import subprocess
 import sys
@@ -328,12 +329,37 @@ def coverage_rcfile(name: str, module: str, results: Path) -> Path:
     Written beside the results so the artifact carries it, and generated
     rather than committed into the component, which stays as upstream has it.
     """
+    with (ROOT / name / "pyproject.toml").open("rb") as handle:
+        declared = tomllib.load(handle).get("tool", {}).get("coverage", {})
+
+    def section(title: str, extra: dict) -> str:
+        merged = {**declared.get(title, {}), **extra}
+        lines = [f"[{title}]"]
+        for key, value in merged.items():
+            if isinstance(value, list):
+                lines.append(f"{key} =")
+                lines += [f"    {item}" for item in value]
+            elif isinstance(value, bool):
+                lines.append(f"{key} = {'True' if value else 'False'}")
+            else:
+                lines.append(f"{key} = {value}")
+        return "\n".join(lines) + "\n"
+
+    # The component's own settings are carried over, not replaced. angr's
+    # `patch = ["_exit"]` is what keeps a forked child's coverage from being
+    # thrown away, and its exclude_lines are what upstream reports against;
+    # writing a config from scratch quietly dropped both.
+    #
+    # `omit` on top: the protobuf stubs are generated at build time and
+    # gitignored, so they exist in this job and not in the one that combines,
+    # where coverage stops on "No source for code".
+    omit = [*declared.get("run", {}).get("omit", []), "*/protos/*_pb2.py"]
     rcfile = results / f"coveragerc-{name}.ini"
     rcfile.write_text(
-        "[run]\n"
-        "relative_files = True\n"
-        "branch = True\n"
-        "\n"
+        section("run", {"relative_files": True, "omit": omit})
+        + "\n"
+        + section("report", {"omit": omit})
+        + "\n"
         "[paths]\n"
         f"source =\n"
         f"    {name}/{module}/\n"
