@@ -175,7 +175,12 @@ def run_suite(name: str, shard: int, of: int, workers: str) -> int:
 
     env = {**os.environ, "CI": "true", "PYTHONDONTWRITEBYTECODE": "1",
            "RTDB_BASE": str(results / "rtdb")}
-    if config.get("qt"):
+    if config.get("qt") and sys.platform.startswith("linux"):
+        # Only on Linux, where a CI runner genuinely has no display. Upstream
+        # sets this nowhere in its own test job, and forcing the minimal
+        # platform on macOS changes Qt's focus handling: test_combo_prop
+        # double-clicks a property and asks for focusWidget(), which comes
+        # back None there and a QComboBox on the real platform.
         env.setdefault("QT_QPA_PLATFORM", "minimal:enable_fonts")
 
     print(f"+ {' '.join(args)}", flush=True)
