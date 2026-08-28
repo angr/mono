@@ -16,7 +16,10 @@
         "pyvex",
         "pypcode",
         "claripy",
-        "cle"
+        "cle",
+        "pysoot",
+        "tracer",
+        "angr-platforms"
       ]
     },
     {
@@ -32,6 +35,12 @@
         "angr"
       ],
       "shards": 10
+    },
+    {
+      "label": "angrop",
+      "suites": [
+        "angrop"
+      ]
     }
   ],
   "suites": {
@@ -66,6 +75,26 @@
       "env": "gui",
       "qt": true,
       "forked": false
+    },
+    "pysoot": {
+      "env": "test",
+      "forked": true
+    },
+    "tracer": {
+      "env": "test",
+      "forked": true
+    },
+    "angr-platforms": {
+      "env": "test",
+      "forked": true,
+      "fixtures": [
+        "test_programs"
+      ],
+      "module": "angr_platforms"
+    },
+    "angrop": {
+      "env": "test",
+      "forked": true
     }
   },
   "native": [

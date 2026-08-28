@@ -108,6 +108,24 @@ ln -sfn -- "$root/$suite/tests" "$run_dir/tests"
 # ci/run-native.py already links this for its own run directory.
 ln -sfn -- "$root/binaries" "$run_dir/../binaries"
 
+# Some suites resolve checked-in fixtures relative to their own directory --
+# angr-platforms reads `<tests>/../test_programs` for its precompiled eBPF,
+# BF and msp430 objects. A run directory holding only `tests` makes those
+# tests fail with "Not a valid binary file", which reads as a real break and
+# is not one. Named per suite in ci/suites.json rather than guessed.
+while read -r fixture; do
+    [[ -z $fixture ]] && continue
+    [[ -e $root/$suite/$fixture ]] || {
+        echo "$suite: no such fixture directory: $suite/$fixture" >&2
+        exit 1
+    }
+    ln -sfn -- "$root/$suite/$fixture" "$run_dir/$fixture"
+done < <(python3 -c "
+import json
+suite = json.load(open('$root/ci/suites.json'))['suites']['$suite']
+print('\n'.join(suite.get('fixtures') or []))
+")
+
 # angr writes LMDB stores for its type and function database; keep them out
 # of the checkout so a test run never dirties the tree.
 export RTDB_BASE=$results/rtdb
@@ -127,8 +145,14 @@ fi
 in_env() { nix develop "$root#$env" --command "$@"; }
 
 # The package under test must come from the Nix store, not from this tree.
-# Every component's import name is its directory name without the dash.
-module=${suite//-/}
+# Every component's import name is its directory name without the dash --
+# except angr-platforms, which is `angr_platforms`, so ci/suites.json can say
+# so rather than have the rule grow a special case.
+module=$(python3 -c "
+import json
+suite = json.load(open('$root/ci/suites.json'))['suites']['$suite']
+print(suite.get('module') or '$suite'.replace('-', ''))
+")
 if ! origin=$(cd -- "$run_dir" && in_env python3 -c "
 import importlib, os
 print(os.path.realpath(os.path.dirname(importlib.import_module('$module').__file__)))

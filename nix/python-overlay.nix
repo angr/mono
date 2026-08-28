@@ -293,6 +293,21 @@ in
     disabledTests = (old.disabledTests or [ ]) ++ [ "test_shared_processes" ];
   });
 
+  # The third of these, and they share an origin: backrefs, portalocker and
+  # python-ulid all arrive through the pydantic-ai / fastmcp stack that angr's
+  # `llm` extra pulls in, and all three fail their own nixpkgs test suites on
+  # a loaded runner for reasons that are about the clock rather than the code.
+  # test_same_millisecond_overflow sets the randomness counter to its maximum
+  # under @freeze_time() and expects the next ULID in the same millisecond to
+  # raise; it reports DID NOT RAISE when the frozen clock and the provider
+  # disagree about which millisecond it is. It killed four of ten angr shards
+  # while the other six built the same derivation successfully, which is the
+  # signature. These packages' own test suites are not this repository's gate,
+  # and they sit under `warm`, which gates everything.
+  python-ulid = python-prev.python-ulid.overridePythonAttrs (old: {
+    disabledTests = (old.disabledTests or [ ]) ++ [ "test_same_millisecond_overflow" ];
+  });
+
   # py-key-value-aio is a transitive dependency of fastmcp -- a key-value
   # abstraction with a backend per store. fastmcp asks for it with no extras
   # and only ever uses the in-memory backend, but the package's own test suite
@@ -631,6 +646,56 @@ in
     pythonImportsCheck = [ "tracer" ];
     meta = {
       description = "Symbolically trace concrete inputs";
+      homepage = "https://angr.io/";
+      license = lib.licenses.bsd2;
+    };
+  };
+
+  # angr-platforms and angrop keep their metadata in setup.py / setup.cfg
+  # rather than a pyproject `[project]` table, so mkComponent -- which reads
+  # that table -- cannot describe them and they get a stanza each. They are in
+  # the tree because upstream's ga-build.sh runs every transitive dependent's
+  # suite on a core change; without them a claripy edit is tried against angr
+  # and angr-management and nothing else.
+  angr-platforms = buildPythonPackage {
+    pname = "angr-platforms";
+    version = "0.1";
+    format = "setuptools";
+    src = builtins.path {
+      path = src + "/angr-platforms";
+      name = "angr-platforms-source";
+    };
+    dependencies = [
+      python-final.angr
+      python-final.cle
+      python-final.archinfo
+      python-final.pyvex
+    ];
+    doCheck = false;
+    pythonImportsCheck = [ "angr_platforms" ];
+    meta = {
+      description = "Extra architectures and loaders for angr";
+      homepage = "https://angr.io/";
+      license = lib.licenses.bsd2;
+    };
+  };
+
+  angrop = buildPythonPackage {
+    pname = "angrop";
+    version = versionFrom (src + "/angrop/angrop/__init__.py");
+    format = "setuptools";
+    src = builtins.path {
+      path = src + "/angrop";
+      name = "angrop-source";
+    };
+    dependencies = [
+      python-final.angr
+      python-final.tqdm
+    ];
+    doCheck = false;
+    pythonImportsCheck = [ "angrop" ];
+    meta = {
+      description = "ROP chain builder built on angr";
       homepage = "https://angr.io/";
       license = lib.licenses.bsd2;
     };

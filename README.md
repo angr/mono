@@ -68,7 +68,7 @@ most tests still pass.
 
 ## What is in the tree, and what is not
 
-Imported, one directory each. The seven components with suites of their own:
+Imported, one directory each. The seven core components:
 `archinfo`, `pyvex`, `pypcode`, `claripy`, `cle`, `angr`, `angr-management`.
 Then five of the dependents upstream tests every core change against --
 `pysoot`, `tracer`, `angr-platforms`, `angrop`, `phuzzer` -- which are here
@@ -100,10 +100,11 @@ gate thirty-nine of angr's own tests, which reported as skips for as long as
 the components sat in the tree unpackaged. What the counts are now is a
 question for the last run's summary, for the reason the cost section gives.
 
-Their *own* suites, and those of `angr-platforms`, `angrop` and `phuzzer`,
-still run in no job. Upstream's `ga-build.sh` runs them, driven by
-`ci-settings/ci-image/conf/repo-list.txt`, so that part is a gap and not a
-decision -- see below.
+Four of the five dependents now run their own suites too -- `pysoot`,
+`tracer`, `angr-platforms` and `angrop` -- which is what upstream's
+`ga-build.sh` does, driven by `ci-settings/ci-image/conf/repo-list.txt`:
+without them a claripy change is tried against angr and angr-management and
+nothing else. `phuzzer` is the one left out, and deliberately; see below.
 
 A component's own `.github/` does not come in: only the workflow at the root
 of this repository runs, and seven dead copies of upstream's workflows would
@@ -172,7 +173,7 @@ is a thing upstream CI does today and this repository does not.
 
 | | what is missing | why it is not here yet |
 | --- | --- | --- |
-| Dependent suites | All five dependents are imported and no job runs *their* tests. (`pysoot` and `tracer` are now packaged and in the test environment, which is what un-skipped thirty-nine of angr's.) | `angr-platforms`, `angrop` and `phuzzer` need suites of their own; `phuzzer` also needs AFL, which is not packaged here. |
+| `phuzzer`'s suite | The other four dependents run; `phuzzer` does not. | It needs `shellphish-afl`, a prebuilt AFL binary distribution that nixpkgs does not carry, and its `_check_environment()` refuses to start until it can write `/proc/sys/kernel/core_pattern` and the cpufreq governor. Upstream gets that from a privileged container; an unprivileged runner cannot. |
 | Coverage | `angr/coverage.yml` and `angr-management/coverage.yml` measure Python, C and Rust coverage and upload to Codecov on every pull request. | Nothing here measures coverage. Codecov also needs a project and a token this repository does not have. |
 | Decompiler snapshots | `ci-settings`' `corpus-test` job diffs decompiler output against `angr/dec-snapshots` and uploads the diff. | The corpus job is not ported. It is the decompiler's only regression detector, so this is the largest single omission. |
 | Nightly | Ten repositories run a nightly that widens the matrix -- angr's runs the full suite on Windows and macOS, which is `--collect` only here. | A nightly on an experiment is recurring cost on somebody else's account. Deliberate. |

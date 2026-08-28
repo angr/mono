@@ -107,6 +107,11 @@
         # they skipped here while pysoot sat in the tree unpackaged, which
         # is the failure mode importing it was meant to remove.
         p.pysoot
+        # The dependents whose own suites run here. Upstream tests every
+        # transitive dependent of a changed component; without these, a
+        # claripy change is tried against angr and angr-management only.
+        p.angr-platforms
+        p.angrop
         p.pytest
         p.pytest-xdist
         p.pytest-timeout
@@ -238,7 +243,19 @@
               pkgs.jdk
             ]
             ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.gcc ];
-            env.JAVA_HOME = pkgs.jdk.home;
+            env = {
+              JAVA_HOME = pkgs.jdk.home;
+            }
+            // lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
+              # tracer runs 32-bit ELFs under shellphish-qemu, and they are
+              # dynamically linked: without a 32-bit loader qemu stops at
+              # `Could not open '/lib/ld-linux.so.2'`, the trace comes back
+              # empty, and test_runner fails its `len(r.trace) > 100`. On a
+              # distribution that is `libc6:i386`; upstream's CI image has it
+              # already. Here it is a store path, named the way qemu-user
+              # expects to be told.
+              QEMU_LD_PREFIX = "${pkgs.pkgsi686Linux.glibc}";
+            };
           };
 
           # Everything needed to hack on the tree itself.
