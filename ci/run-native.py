@@ -312,6 +312,40 @@ def stage(name: str) -> Path:
     return run_dir
 
 
+def coverage_rcfile(name: str, module: str, results: Path) -> Path:
+    """A config that records paths `coverage combine` can reconcile later.
+
+    Two things the component's own pyproject cannot say. `relative_files`,
+    because the suite runs from `.ci-run-native/<suite>/` and the absolute
+    paths recorded there exist on no other machine -- combining the shards in
+    the summary job failed with "No source for code". And a `[paths]` section
+    mapping the run directory's `tests/` and the installed package back onto
+    the component, so ten shards and an editable install are recognised as
+    one tree.
+
+    Written beside the results so the artifact carries it, and generated
+    rather than committed into the component, which stays as upstream has it.
+    """
+    rcfile = results / f"coveragerc-{name}.ini"
+    rcfile.write_text(
+        "[run]\n"
+        "relative_files = True\n"
+        "branch = True\n"
+        "\n"
+        "[paths]\n"
+        f"source =\n"
+        f"    {name}/{module}/\n"
+        f"    */{name}/{module}/\n"
+        f"    */site-packages/{module}/\n"
+        f"    {module}/\n"
+        "tests =\n"
+        f"    {name}/tests/\n"
+        f"    */{name}/tests/\n"
+        "    tests/\n"
+    )
+    return rcfile
+
+
 def run_suite(
     name: str, shard: int, of: int, workers: str, coverage: bool = False
 ) -> int:
@@ -372,7 +406,7 @@ def run_suite(
         args += [
             f"--cov={module}",
             "--cov=tests",
-            f"--cov-config={ROOT / name / 'pyproject.toml'}",
+            f"--cov-config={coverage_rcfile(name, module, results)}",
             "--cov-report=",
         ]
     if of > 1:

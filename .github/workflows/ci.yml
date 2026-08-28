@@ -394,6 +394,23 @@ jobs:
         run: |
           python ci/run-native.py "$SUITE" --coverage \
             --shard "$SHARD" --of "$SHARDS"
+      # C and Rust are measured here, not in `summary`. Their inputs -- the
+      # .gcda gcov writes beside each object, and the instrumented
+      # rustylib .so llvm-cov reads the profiles against -- live in this
+      # job's workspace and are not what gets uploaded. Computing them in
+      # `summary` from the artifacts alone silently produced nothing, which
+      # the "expected but not measured" check would then have reported
+      # forever.
+      - name: Native coverage for this shard
+        if: always()
+        env:
+          SUITE: ${{ matrix.suite }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          python -m pip install --quiet gcovr
+          ci/native-coverage.py "$SUITE" \
+            --out "test-results/native-$SUITE-$SHARD.json"
+
       # A coverage job that produced no coverage is the failure this lane
       # exists to prevent, and the upload's own check cannot see it: the
       # junit file is always there.
@@ -413,6 +430,8 @@ jobs:
           include-hidden-files: true
           path: |
             test-results/.coverage.*
+            test-results/coveragerc-*.ini
+            test-results/native-*.json
             test-results/*.profraw
             test-results/*.xml
             test-results/*.log

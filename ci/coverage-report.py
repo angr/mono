@@ -43,8 +43,6 @@ C_SOURCES = {
 }
 
 # The instrumented extension llvm-cov attributes the .profraw files to.
-RUST_OBJECT = ROOT / "angr" / "angr"
-
 def run(*args: str | Path, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         [str(a) for a in args], capture_output=True, text=True, check=check
@@ -96,7 +94,11 @@ def python_percent(results: Path, suite: str, coverage: Sequence[str]) -> float 
     shards = sorted(results.glob(f".coverage.{suite}.*"))
     if not shards:
         return None
-    rcfile = ROOT / suite / "pyproject.toml"
+    # The generated config, not the component's pyproject: it carries the
+    # [paths] section that makes ten shards and an editable install one tree.
+    rcfile = results / f"coveragerc-{suite}.ini"
+    if not rcfile.exists():
+        rcfile = ROOT / suite / "pyproject.toml"
     combined = results / f".combined.{suite}"
     combined.unlink(missing_ok=True)
     # --keep, so a rerun of this script over the same artifacts is not
@@ -119,44 +121,20 @@ def python_percent(results: Path, suite: str, coverage: Sequence[str]) -> float 
     return round(data["totals"]["percent_covered"], 2)
 
 
-def c_percent(results: Path, suite: str) -> float | None:
-    """gcovr over the component's native sources, if any object was built."""
-    source = C_SOURCES.get(suite)
-    if source is None or not source.exists() or shutil.which("gcovr") is None:
-        return None
-    out = results / f"coverage-{suite}-native.xml"
-    result = run(
-        "gcovr", "-r", str(source), "--xml-pretty", "-o", str(out),
-        "--json-summary-pretty", "--json-summary", str(results / f"c-{suite}.json"),
-        check=False,
-    )
-    if result.returncode != 0 or not (results / f"c-{suite}.json").exists():
-        print(result.stderr[-1000:], file=sys.stderr)
-        return None
-    summary = json.loads((results / f"c-{suite}.json").read_text())
-    return round(summary.get("line_percent", 0.0), 2)
+def native(results: Path) -> dict[str, float]:
+    """C and Rust, as ci/native-coverage.py measured them in each shard.
 
-
-def rust_percent(results: Path) -> float | None:
-    """Merge the .profraw the forked test processes wrote, and export."""
-    profraw = sorted(results.glob("*.profraw"))
-    objects = sorted(RUST_OBJECT.glob("rustylib*.so"))
-    profdata = shutil.which("llvm-profdata") or shutil.which("cargo-profdata")
-    cov = shutil.which("llvm-cov")
-    if not profraw or not objects or not profdata or not cov:
-        return None
-    merged = results / "rust.profdata"
-    if run(profdata, "merge", "-sparse", "-o", str(merged), *profraw,
-           check=False).returncode != 0:
-        return None
-    export = run(cov, "export", str(objects[0]), f"--instr-profile={merged}",
-                 "--format=text", "--summary-only", check=False)
-    if export.returncode != 0:
-        print(export.stderr[-1000:], file=sys.stderr)
-        return None
-    (results / "coverage-rust.json").write_text(export.stdout)
-    totals = json.loads(export.stdout)["data"][0]["totals"]
-    return round(totals["lines"]["percent"], 2)
+    They cannot be measured here: gcov's .gcda and the instrumented
+    rustylib .so live in the coverage job's workspace and are not uploaded.
+    Each shard writes its own numbers instead, and the highest is the one
+    kept -- a floor check wants the best evidence that a line was reached,
+    and no shard runs the whole suite.
+    """
+    best: dict[str, float] = {}
+    for path in sorted(results.glob("native-*.json")):
+        for name, value in json.loads(path.read_text()).items():
+            best[name] = max(best.get(name, 0.0), float(value))
+    return best
 
 
 def main() -> int:
@@ -177,12 +155,7 @@ def main() -> int:
         py = python_percent(args.results, suite, coverage)
         if py is not None:
             observed[f"{suite}:python"] = py
-        c = c_percent(args.results, suite)
-        if c is not None:
-            observed[f"{suite}:c"] = c
-    rust = rust_percent(args.results)
-    if rust is not None:
-        observed["angr:rust"] = rust
+    observed.update(native(args.results))
 
     missing = sorted(set(expected()) - set(observed))
 
