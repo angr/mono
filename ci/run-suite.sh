@@ -99,6 +99,15 @@ rm -rf -- "$run_dir"
 mkdir -p -- "$run_dir" "$results"
 ln -sfn -- "$root/$suite/tests" "$run_dir/tests"
 
+# And the fixtures beside them. Most suites resolve `binaries` by walking up
+# from a path they realpath first, which lands in the checkout and is fine --
+# but angr/tests is a package, so pytest imports it through the symlink and
+# `__file__` stays inside the run directory. `test_irsb.py` walks that
+# lexically, looks for `.ci-run/binaries/tests/...`, and finding nothing
+# sub-skips all six architectures inside a test that then reports PASSED.
+# ci/run-native.py already links this for its own run directory.
+ln -sfn -- "$root/binaries" "$run_dir/../binaries"
+
 # angr writes LMDB stores for its type and function database; keep them out
 # of the checkout so a test run never dirties the tree.
 export RTDB_BASE=$results/rtdb
@@ -106,7 +115,9 @@ export PYTHONDONTWRITEBYTECODE=1
 mkdir -p -- "$RTDB_BASE"
 
 # angr's tests skip their "is angr/binaries beside me" check when in CI. The
-# fixtures are linked above, so the check would pass anyway.
+# fixtures are linked above, so the check would pass anyway -- which was true
+# of `bin_location` and not of the run-dir-relative path above, the one case
+# the guard would have caught.
 export CI=true
 
 if (( qt )); then
