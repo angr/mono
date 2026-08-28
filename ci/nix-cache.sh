@@ -62,8 +62,12 @@ print('\n'.join(json.load(open('$root/mono.json'))['components']))
     # without this the second system to run finds the first one's asset,
     # concludes it is already published, and its consumers unpack gigabytes
     # containing nothing they can use.
+    #
+    # From uname, not from `nix eval builtins.currentSystem`: this runs in
+    # the composite action's first step, before the Nix installer, so asking
+    # Nix returned the fallback every time and the component was a no-op.
     local system
-    system=$(nix eval --raw --impure --expr builtins.currentSystem 2>/dev/null || echo unknown)
+    system="$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]')"
     printf '%s-%s\n' "$system" \
         "$(git -C "$root" rev-parse "${paths[@]/#/HEAD:}" | sha256sum | cut -c1-32)"
 }
