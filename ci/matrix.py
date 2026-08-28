@@ -113,6 +113,9 @@ def main() -> int:
                     **job,
                     "suites": " ".join(suites),
                     "collect": " ".join(collect),
+                    # What the environment has to serve, so a job need not
+                    # build components no suite of its own will import.
+                    "components": " ".join(dict.fromkeys(suites + collect)),
                     "label": f"{'+'.join(suites + collect)} · {job['os']} py{job['python']}",
                     "id": f"{'-'.join(suites + collect)}-{job['os']}-py{job['python']}",
                 }

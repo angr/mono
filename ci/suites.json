@@ -62,7 +62,7 @@
     "angr-management": {
       "env": "gui",
       "qt": true,
-      "forked": true
+      "forked": false
     }
   },
   "native": [
@@ -99,9 +99,6 @@
       "python": "3.12",
       "suites": [
         "pyvex"
-      ],
-      "collect": [
-        "angr"
       ]
     },
     {

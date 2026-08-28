@@ -196,7 +196,8 @@ jobs:
       - name: Install the workspace
         env:
           PYVER: ${{ matrix.python }}
-        run: python ci/run-native.py --install --python "$PYVER"
+          COMPONENTS: ${{ matrix.components }}
+        run: python ci/run-native.py --install --python "$PYVER" --for "$COMPONENTS"
 
       - name: Run ${{ matrix.label }}
         if: matrix.suites != ''

@@ -51,7 +51,27 @@ def run(*args: str | Path, cwd: Path | None = None, env: dict | None = None) -> 
     subprocess.run([str(a) for a in args], cwd=cwd, env=env, check=True)
 
 
-def install(python_version: str, ecosystem: bool = False) -> None:
+def needed_core(names: list[str]) -> list[str]:
+    """The prefix of CORE an install has to cover for these suites.
+
+    Install order is dependency order, so covering a component means covering
+    everything under it -- the answer is always a prefix. Stopping at the
+    deepest suite actually asked for is what makes x86_64 macOS possible:
+    `core_affinity2` 0.16.1, a Rust dependency of angr, passes `&mut bool`
+    where the Mach `thread_policy_get` binding wants `*mut u32`, so angr does
+    not compile there at all. Upstream tests pyvex on macos-15-intel and does
+    not test angr on any x86_64 macOS, and a job that wants pyvex should not
+    have to build angr to get it.
+    """
+    named = [n for n in names if n in CORE]
+    if not named:
+        return CORE
+    return CORE[: max(CORE.index(n) for n in named) + 1]
+
+
+def install(
+    python_version: str, ecosystem: bool = False, only: list[str] | None = None
+) -> None:
     """Build the environment the way ci-settings' ga-build.sh builds it.
 
     Component by component, in dependency order, each with `--no-sources` so
@@ -87,21 +107,32 @@ def install(python_version: str, ecosystem: bool = False) -> None:
         "pytest-forked", "sortedcontainers-stubs>=2.4.3", "types-pefile",
     )
 
-    install_one(str(ROOT / "archinfo"))
-    run("uv", "build", "--out-dir", str(ROOT / "pyvex" / "dist"), str(ROOT / "pyvex"), env=env)
-    install_one(str(ROOT / "pyvex"))
-    install_one(str(ROOT / "pypcode"))
-    install_one(str(ROOT / "claripy"))
-    install_one(str(ROOT / "cle"))
-    install_one("-f", str(ROOT / "pyvex" / "dist"), str(ROOT / "angr") + ANGR_EXTRAS)
+    core = CORE if ecosystem else needed_core(only or [])
+    print(f"+ installing: {' '.join(core)}", flush=True)
+    dist = str(ROOT / "pyvex" / "dist")
+
+    if "archinfo" in core:
+        install_one(str(ROOT / "archinfo"))
+    if "pyvex" in core:
+        run("uv", "build", "--out-dir", dist, str(ROOT / "pyvex"), env=env)
+        install_one(str(ROOT / "pyvex"))
+    if "pypcode" in core:
+        install_one(str(ROOT / "pypcode"))
+    if "claripy" in core:
+        install_one(str(ROOT / "claripy"))
+    if "cle" in core:
+        install_one(str(ROOT / "cle"))
+    if "angr" in core:
+        install_one("-f", dist, str(ROOT / "angr") + ANGR_EXTRAS)
 
     if ecosystem:
         for name in ECOSYSTEM:
-            install_one("-f", str(ROOT / "pyvex" / "dist"), str(ROOT / name))
+            install_one("-f", dist, str(ROOT / name))
 
     # After angr, as upstream does, and with its llm extra: angr-management's
     # MCP suite skips itself unless fastmcp and uvicorn are importable.
-    install_one("-f", str(ROOT / "pyvex" / "dist"), str(ROOT / "angr-management") + "[llm]")
+    if "angr-management" in core:
+        install_one("-f", dist, str(ROOT / "angr-management") + "[llm]")
 
 
 def tag() -> str:
@@ -251,10 +282,17 @@ def main() -> int:
     parser.add_argument("--shard", type=int, default=1)
     parser.add_argument("--of", type=int, default=1)
     parser.add_argument("--workers", default="auto")
+    parser.add_argument(
+        "--for",
+        dest="wanted",
+        default="",
+        help="space-separated suites this environment has to serve "
+        "(default: every component)",
+    )
     args = parser.parse_args()
 
     if args.install:
-        install(args.python, ecosystem=args.ecosystem)
+        install(args.python, ecosystem=args.ecosystem, only=args.wanted.split())
 
     failed = []
     for name in args.suites:
