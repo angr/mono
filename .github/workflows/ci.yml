@@ -738,8 +738,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Fetch the pinned VEX sources
-        run: python ci/fetch-external.py vex
+      # vex for the pyvex wheel, binaries for cle's suite -- this job only
+      # fetched the first, and the cle step then failed on
+      # `cp: cannot stat 'binaries'`.
+      - name: Fetch the pinned externals
+        run: python ci/fetch-external.py vex binaries
       - uses: pypa/cibuildwheel@v4.1.0
         with:
           package-dir: pyvex
