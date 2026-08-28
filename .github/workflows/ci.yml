@@ -710,7 +710,10 @@ jobs:
       # for. Its emscripten markers and sys.platform guards were dead weight
       # in this tree while nothing ran them; the pyodide-testing group is in
       # the snapshot already.
-      - uses: astral-sh/setup-uv@v5
+      # v8, as upstream's cle job pins: uv's Pyodide resolution is
+      # version-sensitive, and v5 could not find a cffi wheel for
+      # pyodide@3.14 with the same flags upstream uses.
+      - uses: astral-sh/setup-uv@v8
       - name: cle under Pyodide
         working-directory: cle
         run: |

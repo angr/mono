@@ -30,6 +30,7 @@ import json
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -44,13 +45,13 @@ C_SOURCES = {
 # The instrumented extension llvm-cov attributes the .profraw files to.
 RUST_OBJECT = ROOT / "angr" / "angr"
 
-def run(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+def run(*args: str | Path, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         [str(a) for a in args], capture_output=True, text=True, check=check
     )
 
 
-def coverage_cmd() -> list[str]:
+def coverage_cmd() -> Sequence[str]:
     """However `coverage` can be invoked here, or a refusal saying it cannot.
 
     The summary job is not the coverage job and has no .venv-native, so this
@@ -58,11 +59,13 @@ def coverage_cmd() -> list[str]:
     and typecheck ratchets: a gate that cannot run its tool must say so, not
     report nothing and pass.
     """
-    for candidate in ([shutil.which("coverage")], [sys.executable, "-m", "coverage"]):
-        if candidate[0] is None:
-            continue
+    on_path = shutil.which("coverage")
+    candidates: list[list[str]] = [[sys.executable, "-m", "coverage"]]
+    if on_path is not None:
+        candidates.insert(0, [on_path])
+    for candidate in candidates:
         if run(*candidate, "--version", check=False).returncode == 0:
-            return list(candidate)
+            return candidate
     raise SystemExit("coverage does not run; the coverage gate cannot mean anything")
 
 
@@ -88,7 +91,7 @@ def expected() -> list[str]:
     return names
 
 
-def python_percent(results: Path, suite: str, coverage: list[str]) -> float | None:
+def python_percent(results: Path, suite: str, coverage: Sequence[str]) -> float | None:
     """Combine one component's shards and return its line percentage."""
     shards = sorted(results.glob(f".coverage.{suite}.*"))
     if not shards:

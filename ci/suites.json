@@ -87,7 +87,7 @@
     },
     "pysoot": {
       "env": "test",
-      "forked": true
+      "forked": false
     },
     "tracer": {
       "env": "test",
