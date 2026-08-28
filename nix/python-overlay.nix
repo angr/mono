@@ -283,6 +283,16 @@ in
     disabledTests = (old.disabledTests or [ ]) ++ [ "test_timeout" ];
   });
 
+  # portalocker arrives through azure-identity -> msal-extensions, which
+  # fastmcp pulls in. Its test_shared_processes starts a multiprocessing pool
+  # and waits for both workers to take a file lock; on a loaded CI runner the
+  # wait expires and the test fails with TimeoutError. It passed here and
+  # failed in Actions, which is the signature of a timing assertion rather
+  # than a defect -- the same reason backrefs' test_timeout is off above.
+  portalocker = python-prev.portalocker.overridePythonAttrs (old: {
+    disabledTests = (old.disabledTests or [ ]) ++ [ "test_shared_processes" ];
+  });
+
   # py-key-value-aio is a transitive dependency of fastmcp -- a key-value
   # abstraction with a backend per store. fastmcp asks for it with no extras
   # and only ever uses the in-memory backend, but the package's own test suite
@@ -572,6 +582,60 @@ in
   # `tracer` is the other half of that and is not here: it install_requires
   # `shellphish-qemu`, a binary distribution of a patched QEMU that nixpkgs
   # does not carry.
+  # The other half of the dependent story, and the reason eighteen of angr's
+  # tests report `tracer is not installed`. tracer install_requires
+  # shellphish-qemu, which is a prebuilt QEMU published as a wheel and only
+  # for x86_64 Linux -- so both are packaged here and both are added to the
+  # test environment only on that system, where the Nix lane runs. Upstream
+  # tests tracer nowhere else either.
+  shellphish-qemu = buildPythonPackage {
+    pname = "shellphish-qemu";
+    version = "0.12.4";
+    format = "wheel";
+    src = pkgs.fetchurl {
+      url = "https://files.pythonhosted.org/packages/53/9a/382b5114da9a2967e5be6c5689f75bb89c4957e73ff1468653c633e77000/shellphish_qemu-0.12.4-py3-none-manylinux2010_x86_64.whl";
+      hash = "sha256-X9CqsQrA5CS+2Qfh7zptby4GiojpGzqKGesv96Pu4gI=";
+    };
+    nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+    buildInputs = [
+      pkgs.stdenv.cc.cc.lib
+      pkgs.glib
+    ];
+    # The wheel declares ninja, which is its *build* tool -- it ships the
+    # QEMU binaries already compiled and nothing at run time invokes it.
+    # Providing it is worse than dropping it: the nixpkgs python ninja
+    # carries a setup hook that then tries to build this wheel with ninja.
+    pythonRemoveDeps = [ "ninja" ];
+    doCheck = false;
+    pythonImportsCheck = [ "shellphish_qemu" ];
+    meta = {
+      description = "Prebuilt QEMU tracers used by tracer";
+      homepage = "https://pypi.org/project/shellphish-qemu/";
+      license = lib.licenses.gpl2Plus;
+    };
+  };
+
+  tracer = buildPythonPackage {
+    pname = "tracer";
+    version = "0.1";
+    format = "setuptools";
+    src = builtins.path {
+      path = src + "/tracer";
+      name = "tracer-source";
+    };
+    dependencies = [
+      python-final.shellphish-qemu
+      python-final.angr
+    ];
+    doCheck = false;
+    pythonImportsCheck = [ "tracer" ];
+    meta = {
+      description = "Symbolically trace concrete inputs";
+      homepage = "https://angr.io/";
+      license = lib.licenses.bsd2;
+    };
+  };
+
   pysoot = mkComponent {
     pname = "pysoot";
     pythonImportsCheck = [ "pysoot" ];

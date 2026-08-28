@@ -174,6 +174,24 @@ elif (( of > 1 )); then
         args+=(--durations-path "$durations")
     fi
 fi
+# Named exclusions, out loud. A suite here runs everything a component
+# ships, so the one test that cannot pass is enumerated in ci/suites.json
+# with its reason, printed on every run, and counted in the summary -- not
+# dropped by a `-k` nobody reads, and not left to report as a skip, which is
+# the failure mode this repository exists to avoid.
+while read -r excluded; do
+    [[ -z $excluded ]] && continue
+    echo "$suite: EXCLUDED $excluded"
+    python3 -c "
+import json, sys
+print(json.load(open('$root/ci/suites.json'))['suites']['$suite']['excluded'][sys.argv[1]])
+" "$excluded" | sed 's/^/    /'
+    args+=(--deselect "$excluded")
+done < <(python3 -c "
+import json
+print('\n'.join(json.load(open('$root/ci/suites.json'))['suites']['$suite'].get('excluded', {})))
+")
+
 if [[ -n $pytest_args ]]; then
     read -ra extra <<<"$pytest_args"
     args+=("${extra[@]}")

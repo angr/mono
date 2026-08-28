@@ -89,14 +89,20 @@ Three things are pinned in `flake.lock` instead of vendored:
 | `angr/binaries` | 450 MB of test fixtures. `ci/link-external.sh` puts it at `./binaries`, where every suite already looks. |
 | `angr/angr-data` | 200 MB of generated JSON. |
 
-Nothing is deselected in the seven suites that run. That includes the suites
+One test is deselected, in `ci/suites.json`, with its reason beside it and
+printed on every run of that suite. Nothing else is. That includes the suites
 for angr's optional `llm` extra: `pydantic-ai`, `mcp` and `fastmcp` are
 packaged in `nix/python-overlay.nix` rather than skipped, because a suite that
-is skipped for want of a dependency is a suite that tells you nothing.
+is skipped for want of a dependency is a suite that tells you nothing. The
+same reasoning packaged `pysoot` -- with a JDK, since jpype needs one -- and
+`tracer`, with the prebuilt `shellphish-qemu` wheel it requires: those two
+gate thirty-nine of angr's own tests, which reported as skips for as long as
+the components sat in the tree unpackaged. angr's suite went from 2491 passed
+/ 67 skipped to 2529 passed / 28 skipped.
 
-The five dependents are a different matter: they are in the tree, and no job
-runs their suites yet. Upstream's `ga-build.sh` does, driven by
-`ci-settings/ci-image/conf/repo-list.txt`, so this is a gap and not a
+Their *own* suites, and those of `angr-platforms`, `angrop` and `phuzzer`,
+still run in no job. Upstream's `ga-build.sh` runs them, driven by
+`ci-settings/ci-image/conf/repo-list.txt`, so that part is a gap and not a
 decision -- see below.
 
 A component's own `.github/` does not come in: only the workflow at the root
@@ -145,7 +151,7 @@ is a thing upstream CI does today and this repository does not.
 
 | | what is missing | why it is not here yet |
 | --- | --- | --- |
-| Dependent suites | `pysoot`, `tracer`, `angr-platforms`, `angrop`, `phuzzer` are imported; no job runs their tests. | Each needs machinery of its own -- a JVM, `shellphish-qemu`, AFL -- and none of it is packaged here yet. |
+| Dependent suites | All five dependents are imported and no job runs *their* tests. (`pysoot` and `tracer` are now packaged and in the test environment, which is what un-skipped thirty-nine of angr's.) | `angr-platforms`, `angrop` and `phuzzer` need suites of their own; `phuzzer` also needs AFL, which is not packaged here. |
 | Coverage | `angr/coverage.yml` and `angr-management/coverage.yml` measure Python, C and Rust coverage and upload to Codecov on every pull request. | Nothing here measures coverage. Codecov also needs a project and a token this repository does not have. |
 | Decompiler snapshots | `ci-settings`' `corpus-test` job diffs decompiler output against `angr/dec-snapshots` and uploads the diff. | The corpus job is not ported. It is the decompiler's only regression detector, so this is the largest single omission. |
 | Nightly | Ten repositories run a nightly that widens the matrix -- angr's runs the full suite on Windows and macOS, which is `--collect` only here. | A nightly on an experiment is recurring cost on somebody else's account. Deliberate. |

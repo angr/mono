@@ -91,7 +91,11 @@
 
       # What CI runs the component suites in. Kept apart from the runtime
       # environment so the default closure stays lean.
-      testPackages = p: [
+      # `pkgs` as well as the package set: tracer's shellphish-qemu is a
+      # prebuilt wheel published only for x86_64 Linux, so the eighteen angr
+      # tests it gates run on the system the Nix lane uses and report as
+      # skips elsewhere -- which is what upstream does too.
+      testPackagesFor = pkgs: p: [
         p.angr
         p.unicorn
         # angr's `llm` extra: tests/llm and tests/mcp are part of the suite,
@@ -111,7 +115,8 @@
         p.keystone-engine
         p.sqlalchemy
         p.pydantic
-      ];
+      ]
+      ++ lib.optionals (pkgs.stdenv.hostPlatform.system == "x86_64-linux") [ p.tracer ];
 
       # angr-management and its suite. Apart again: pulling Qt into the core
       # test environment would grow the closure the other six suites carry for
@@ -152,12 +157,12 @@
       # six components are fine everywhere the flake claims.
       hasGui = pkgs: pkgs.stdenv.hostPlatform.isLinux;
 
-      testEnvFor = pkgs: (pythonFor pkgs).withPackages testPackages;
+      testEnvFor = pkgs: (pythonFor pkgs).withPackages (testPackagesFor pkgs);
       guiEnvFor = pkgs: named "angr-management" ((pythonFor pkgs).withPackages guiPackages);
       devEnvFor =
         pkgs:
         (pythonFor pkgs).withPackages (
-          p: testPackages p ++ lib.optionals (hasGui pkgs) (guiPackages p) ++ buildPackages p
+          p: testPackagesFor pkgs p ++ lib.optionals (hasGui pkgs) (guiPackages p) ++ buildPackages p
         );
     in
     {
