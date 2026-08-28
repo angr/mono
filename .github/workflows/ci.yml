@@ -288,8 +288,16 @@ jobs:
         with:
           python-version: "3.12"
       - run: pipx install pre-commit
-      - run: pre-commit run --all-files --show-diff-on-failure
+      # --all-files means the whole git repository, not the working
+      # directory: archinfo's hooks went looking at angr-platforms and found
+      # a Python 2 print statement. The file list is scoped with git ls-files
+      # instead, and the hooks still run from the component directory so its
+      # own exclude patterns keep matching.
+      - name: Run ${{ matrix.component }}'s own hooks
         working-directory: ${{ matrix.component }}
+        run: |
+          git ls-files -z -- . > /tmp/files.z
+          xargs -0 -a /tmp/files.z pre-commit run --show-diff-on-failure --files
 
   # pypcode is the one component upstream keeps out of the ecosystem sweep:
   # it ships wheels across five platforms and tests them with unittest, not
@@ -306,7 +314,7 @@ jobs:
       - uses: actions/checkout@v5
       - name: Fetch the pinned VEX sources
         run: python ci/fetch-external.py vex
-      - uses: pypa/cibuildwheel@v2.21.3
+      - uses: pypa/cibuildwheel@v4.1.0
         with:
           package-dir: pypcode
         env:
