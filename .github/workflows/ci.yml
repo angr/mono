@@ -326,6 +326,10 @@ jobs:
           python -m pip install --upgrade build
           python -m build --sdist --outdir dist pypcode
       - name: Unpack it
+        # bash, because the default shell on the Windows runner is PowerShell
+        # and PowerShell does not expand a glob for an external command:
+        # tar.exe is handed the literal `dist/*.tar.gz` and cannot open it.
+        shell: bash
         run: |
           mkdir sdist
           tar --strip-components 1 -xf dist/*.tar.gz -C sdist
@@ -337,6 +341,12 @@ jobs:
           CIBW_BUILD: cp312-* cp313-* cp314-*
           CIBW_ARCHS: native
           CIBW_SKIP: "*musllinux*"
+          # As upstream pypcode sets it, per architecture. Without it,
+          # delocate refuses the x86_64 wheel -- `Library dependencies do not
+          # satisfy target MacOS version 10.13` -- because the SDK's default
+          # is older than what the C++ the SLEIGH decompiler needs was built
+          # against. Ignored off macOS.
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.os == 'macos-15' && '11' || '10.14' }}
           CIBW_TEST_COMMAND: python -m unittest discover -v -s {package}/tests
           CIBW_BUILD_VERBOSITY: 1
           # cibuildwheel keeps one build directory per package and reuses it
