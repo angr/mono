@@ -74,7 +74,8 @@
     "angr-management": {
       "env": "gui",
       "qt": true,
-      "forked": false
+      "forked": false,
+      "module": "angrmanagement"
     },
     "pysoot": {
       "env": "test",
@@ -232,6 +233,23 @@
       "with": [
         "pysoot"
       ]
+    }
+  ],
+  "coverage": [
+    {
+      "suite": "angr",
+      "shards": 10,
+      "with": [
+        "pysoot"
+      ]
+    },
+    {
+      "suite": "angr-management",
+      "shards": 2
+    },
+    {
+      "suite": "pypcode",
+      "shards": 1
     }
   ]
 }

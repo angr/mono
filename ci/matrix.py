@@ -72,6 +72,12 @@ def validate(config: dict) -> None:
     if missing:
         raise SystemExit(f"no job runs: {', '.join(missing)}")
 
+    for job in config.get("coverage", []):
+        if job["suite"] not in known:
+            raise SystemExit(f"coverage: no such suite: {job['suite']}")
+        if job.get("shards", 1) < 1:
+            raise SystemExit(f"coverage {job['suite']}: shards must be at least 1")
+
     for job in config["native"]:
         named = job.get("suites", []) + job.get("collect", [])
         # `with` is installed but not run: angr's twenty-one
@@ -134,7 +140,29 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="plain text, one job per line")
     parser.add_argument("--native", action="store_true", help="the non-Nix matrix instead")
+    parser.add_argument("--coverage", action="store_true", help="the coverage matrix")
     args = parser.parse_args()
+
+    if args.coverage:
+        config = json.loads((ROOT / "ci" / "suites.json").read_text())
+        validate(config)
+        out = []
+        for job in config.get("coverage", []):
+            suite = job["suite"]
+            shards = job.get("shards", 1)
+            for shard in range(1, shards + 1):
+                out.append(
+                    {
+                        "suite": suite,
+                        "components": " ".join([suite, *job.get("with", [])]),
+                        "shard": shard,
+                        "shards": shards,
+                        "label": suite + (f" {shard}/{shards}" if shards > 1 else ""),
+                        "id": f"{suite}-{shard}-of-{shards}",
+                    }
+                )
+        print(json.dumps(out))
+        return 0
 
     if args.native:
         config = json.loads((ROOT / "ci" / "suites.json").read_text())

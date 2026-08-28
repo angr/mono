@@ -77,7 +77,10 @@ def needed_core(names: list[str]) -> list[str]:
 
 
 def install(
-    python_version: str, ecosystem: bool = False, only: list[str] | None = None
+    python_version: str,
+    ecosystem: bool = False,
+    only: list[str] | None = None,
+    coverage: bool = False,
 ) -> None:
     """Build the environment the way ci-settings' ga-build.sh builds it.
 
@@ -103,14 +106,31 @@ def install(
     env = {**os.environ, "VIRTUAL_ENV": str(VENV)}
     python = str(venv_python())
 
+    # Editable under --coverage. gcov writes its .gcno beside the object it
+    # compiled and its .gcda beside that at run time, and the instrumented
+    # rustylib .so has to be the one still on disk when llvm-cov reads the
+    # .profraw -- all of which a non-editable install throws away with the
+    # temporary build directory. Non-editable stays the default, because that
+    # is how upstream installs and a coverage build is not the build under
+    # test.
+    editable = ["--editable"] if coverage else []
+
     def install_one(*args: str) -> None:
         run("uv", "pip", "install", "--python", python, "--no-sources", *args, env=env)
+
+    def install_component(*args: str) -> None:
+        # Build isolation stays on: it only decides where the build backend
+        # comes from, not where the compiled objects land, and turning it off
+        # would mean pinning scikit-build-core, setuptools-rust and cmake into
+        # this venv by hand.
+        install_one(*editable, *args)
 
     # The test tooling first, so a component build cannot pick a different one.
     # The stubs are upstream's: pyright sees them there, and a ratchet that
     # does not is a ratchet that disagrees with the one it ports.
     install_one(
         "pytest", "pytest-xdist", "pytest-timeout", "pytest-split",
+        *(["pytest-cov", "coverage[toml]"] if coverage else []),
         "pytest-forked", "sortedcontainers-stubs>=2.4.3", "types-pefile",
         # cle's test_cclemory compiles a CFFI module at run time, and cffi
         # imports setuptools to do it. A uv venv has no setuptools; this
@@ -125,18 +145,18 @@ def install(
     dist = str(ROOT / "pyvex" / "dist")
 
     if "archinfo" in core:
-        install_one(str(ROOT / "archinfo"))
+        install_component(str(ROOT / "archinfo"))
     if "pyvex" in core:
         run("uv", "build", "--out-dir", dist, str(ROOT / "pyvex"), env=env)
-        install_one(str(ROOT / "pyvex"))
+        install_component(str(ROOT / "pyvex"))
     if "pypcode" in core:
-        install_one(str(ROOT / "pypcode"))
+        install_component(str(ROOT / "pypcode"))
     if "claripy" in core:
-        install_one(str(ROOT / "claripy"))
+        install_component(str(ROOT / "claripy"))
     if "cle" in core:
-        install_one(str(ROOT / "cle"))
+        install_component(str(ROOT / "cle"))
     if "angr" in core:
-        install_one("-f", dist, str(ROOT / "angr") + ANGR_EXTRAS)
+        install_component("-f", dist, str(ROOT / "angr") + ANGR_EXTRAS)
 
     # `--ecosystem` installs all of them; `--for` installs the ones a job
     # actually names. Without the second, a native entry naming angrop
@@ -149,7 +169,7 @@ def install(
     # After angr, as upstream does, and with its llm extra: angr-management's
     # MCP suite skips itself unless fastmcp and uvicorn are importable.
     if "angr-management" in core:
-        install_one("-f", dist, str(ROOT / "angr-management") + "[llm]")
+        install_component("-f", dist, str(ROOT / "angr-management") + "[llm]")
 
 
 def tag() -> str:
@@ -233,7 +253,9 @@ def stage(name: str) -> Path:
     return run_dir
 
 
-def run_suite(name: str, shard: int, of: int, workers: str) -> int:
+def run_suite(
+    name: str, shard: int, of: int, workers: str, coverage: bool = False
+) -> int:
     """Run one suite from a directory that holds only its tests.
 
     The component's source sits next to its tests in this tree, and pytest
@@ -277,6 +299,19 @@ def run_suite(name: str, shard: int, of: int, workers: str) -> int:
     for test, reason in (excluded or {}).items():
         print(f"{name}: EXCLUDED {test}\n    {reason}", flush=True)
         args += ["--deselect", test]
+
+    if coverage:
+        # Explicitly, not through the component's addopts: `-o addopts=` above
+        # wipes those, which is deliberate (pypcode's name pytest-cov flags
+        # that the ordinary lane has no plugin for) and means coverage has to
+        # be asked for here.
+        module = config.get("module") or name.replace("-", "")
+        args += [
+            f"--cov={module}",
+            "--cov=tests",
+            f"--cov-config={ROOT / name / 'pyproject.toml'}",
+            "--cov-report=",
+        ]
     if of > 1:
         args += ["--splits", str(of), "--group", str(shard)]
         durations = ROOT / "ci" / "durations" / f"{name}.json"
@@ -285,6 +320,11 @@ def run_suite(name: str, shard: int, of: int, workers: str) -> int:
 
     env = {**os.environ, "CI": "true", "PYTHONDONTWRITEBYTECODE": "1",
            "RTDB_BASE": str(results / "rtdb")}
+    if coverage:
+        # One database per suite per lane per shard, all under test-results so
+        # the artifact carries them. coverage's default lands in the run
+        # directory, which the next stage() removes.
+        env["COVERAGE_FILE"] = str(results / f".coverage.{name}.{tag()}.{shard}")
     if config.get("qt") and sys.platform.startswith("linux"):
         # Only on Linux, where a CI runner genuinely has no display. Upstream
         # sets this nowhere in its own test job, and forcing the minimal
@@ -336,6 +376,11 @@ def main() -> int:
     parser.add_argument("--of", type=int, default=1)
     parser.add_argument("--workers", default="auto")
     parser.add_argument(
+        "--coverage",
+        action="store_true",
+        help="install editable and measure coverage, as upstream's coverage.yml does",
+    )
+    parser.add_argument(
         "--print-python",
         action="store_true",
         help="print the environment's interpreter and exit; a caller in a "
@@ -355,14 +400,19 @@ def main() -> int:
         return 0
 
     if args.install:
-        install(args.python, ecosystem=args.ecosystem, only=args.wanted.split())
+        install(
+            args.python,
+            ecosystem=args.ecosystem,
+            only=args.wanted.split(),
+            coverage=args.coverage,
+        )
 
     failed = []
     for name in args.suites:
         rc = (
             collect(name)
             if args.collect
-            else run_suite(name, args.shard, args.of, args.workers)
+            else run_suite(name, args.shard, args.of, args.workers, args.coverage)
         )
         print(f"=== {name}: exit={rc}", flush=True)
         if rc != 0:

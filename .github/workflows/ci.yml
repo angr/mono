@@ -48,6 +48,7 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       native: ${{ steps.matrix.outputs.native }}
+      coverage: ${{ steps.matrix.outputs.coverage }}
     steps:
       - uses: actions/checkout@v5
       # Two statements, not one: `echo "x=$(cmd)"` reports echo's exit status,
@@ -59,6 +60,8 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           native=$(ci/matrix.py --native)
           echo "native=$native" >> "$GITHUB_OUTPUT"
+          coverage=$(ci/matrix.py --coverage)
+          echo "coverage=$coverage" >> "$GITHUB_OUTPUT"
 
   warm:
     name: Warm the store
@@ -292,6 +295,79 @@ jobs:
           # A pytest that dies during collection writes no XML. With `ignore`
           # the lane contributes no row to the summary table and nothing
           # anywhere says a suite went missing.
+          if-no-files-found: error
+
+  # Coverage, in the shape of upstream's coverage.yml: Python, C and Rust
+  # measured from one instrumented build, because three builds cannot be
+  # combined. It lives in the native lane and not the Nix one for the same
+  # reason -- CFLAGS and RUSTFLAGS apply when the runner compiles, and Nix
+  # would need a whole second instrumented closure to say the same thing.
+  #
+  # No Codecov: this repository has no project and no token, so the summary
+  # job does the merging and rendering that Codecov would have done, and
+  # ci/coverage.json is the ratchet that makes it a gate rather than an
+  # artifact nobody reads.
+  coverage:
+    name: coverage · ${{ matrix.label }}
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.coverage) }}
+    env:
+      # As upstream's coverage.yml sets them. `%p-%m` keeps one profile per
+      # process, which matters because the suites run forked.
+      RUSTFLAGS: "-C instrument-coverage -C codegen-units=1"
+      CFLAGS: "--coverage -O0 -g"
+      LDFLAGS: "--coverage"
+      COVERAGE: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: actions/setup-java@v5
+        if: contains(matrix.components, 'pysoot')
+        with:
+          distribution: zulu
+          java-version: "21"
+      - name: Qt and X11 for angr-management
+        if: contains(matrix.components, 'angr-management')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0
+      - name: Profile output path
+        run: echo "LLVM_PROFILE_FILE=$PWD/test-results/%p-%m.profraw" >> "$GITHUB_ENV"
+      - name: Install instrumented
+        env:
+          COMPONENTS: ${{ matrix.components }}
+        run: python ci/run-native.py --install --python 3.12 --coverage --for "$COMPONENTS"
+      - name: Measure ${{ matrix.label }}
+        env:
+          SUITE: ${{ matrix.suite }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ matrix.shards }}
+        run: |
+          python ci/run-native.py "$SUITE" --coverage \
+            --shard "$SHARD" --of "$SHARDS"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-${{ matrix.id }}
+          include-hidden-files: true
+          path: |
+            test-results/.coverage.*
+            test-results/*.profraw
+            test-results/*.xml
+            test-results/*.log
           if-no-files-found: error
 
   # angr's Rust extension. The Nix lane compiles it; nothing there runs its
@@ -653,6 +729,7 @@ jobs:
         warm,
         test,
         native,
+        coverage,
         rust,
         ratchets,
         wheels,
@@ -672,11 +749,31 @@ jobs:
           path: test-results
           pattern: results-*
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          path: test-results
+          pattern: coverage-*
+          merge-multiple: true
       # The baseline check writes to the step summary as well, so a run that
       # fails on it says which suite and by how much where the reader is
       # already looking.
       - run: |
           ci/summarize.py test-results --baseline ci/skips.json \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # What Codecov would have done: merge the shards, render the result,
+      # and hold it to a floor. llvm-tools for the Rust half, gcovr for the C
+      # half; both come from the same instrumented build the coverage lane
+      # made.
+      - name: Coverage tooling
+        run: |
+          python -m pip install --quiet "coverage[toml]" gcovr
+          sudo apt-get update
+          sudo apt-get install -y llvm
+      - name: Coverage report
+        run: |
+          echo '### Coverage' >> "$GITHUB_STEP_SUMMARY"
+          ci/coverage-report.py test-results --baseline ci/coverage.json \
             >> "$GITHUB_STEP_SUMMARY"
       # `needs.*` over the whole dependency list rather than a hand-written
       # enumeration: the enumeration named six of the ten lanes, so
