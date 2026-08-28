@@ -128,7 +128,11 @@ jobs:
           token: ${{ github.token }}
 
       - name: Run ${{ matrix.label }}
-        run: ci/run-job.sh "${{ matrix.suites }}" --shard "${{ matrix.shard }}" --of "${{ matrix.shards }}"
+        env:
+          SUITES: ${{ matrix.suites }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ matrix.shards }}
+        run: ci/run-job.sh "$SUITES" --shard "$SHARD" --of "$SHARDS"
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -176,7 +180,12 @@ jobs:
 
       - name: Run ${{ matrix.label }}
         if: matrix.suites != ''
-        run: python ci/run-native.py ${{ matrix.suites }}
+        env:
+          SUITES: ${{ matrix.suites }}
+        # Word splitting is the point: SUITES is a space-separated list.
+        run: |
+          # shellcheck disable=SC2086
+          python ci/run-native.py $SUITES
 
       # Upstream's `installation` job, verbatim in effect: collect the suite
       # without running it. That imports every test module and every symbol
@@ -184,7 +193,11 @@ jobs:
       # survive the platform. Running the suite itself is the Nix lane's job.
       - name: Collect ${{ matrix.collect }}
         if: matrix.collect != ''
-        run: python ci/run-native.py ${{ matrix.collect }} --collect
+        env:
+          COLLECT: ${{ matrix.collect }}
+        run: |
+          # shellcheck disable=SC2086
+          python ci/run-native.py $COLLECT --collect
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -248,6 +261,36 @@ jobs:
           PATH="$PWD/.venv-native/bin:$PATH" .venv-native/bin/python ci/typecheck.py \
             --base origin/${{ github.base_ref || 'main' }}
 
+  # Every component ships a .pre-commit-config.yaml, three of the commits
+  # this tree imported are literally "[pre-commit.ci] pre-commit autoupdate",
+  # and nothing here ran any of it. It is the ecosystem's only gate on
+  # formatting, import order, modernisation, RST, symlinks and stray large
+  # files -- pylint checks none of that. One job per component, because the
+  # configs differ and a component's hooks are its own.
+  pre-commit:
+    name: pre-commit · ${{ matrix.component }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        component:
+          - angr
+          - angr-management
+          - archinfo
+          - claripy
+          - cle
+          - pypcode
+          - pyvex
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pipx install pre-commit
+      - run: pre-commit run --all-files --show-diff-on-failure
+        working-directory: ${{ matrix.component }}
+
   # pypcode is the one component upstream keeps out of the ecosystem sweep:
   # it ships wheels across five platforms and tests them with unittest, not
   # pytest. This is that job, for the platforms actions can reach.
@@ -258,7 +301,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2022, macos-15, macos-13]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2022, macos-15, macos-15-intel]
     steps:
       - uses: actions/checkout@v5
       - name: Fetch the pinned VEX sources
@@ -279,7 +322,7 @@ jobs:
 
   summary:
     name: Summary
-    needs: [test, native, rust, ratchets, wheels, checks]
+    needs: [test, native, rust, ratchets, wheels, checks, pre-commit]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10

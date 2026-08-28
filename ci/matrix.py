@@ -14,19 +14,48 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def validate(config: dict) -> None:
+    """Refuse a matrix that quietly drops a suite.
+
+    Every one of these was accepted before, and each produced a green run
+    over less than it looked like: `"shards": 0` deleted the entire angr
+    suite, removing a suite from every job left it untested with nothing to
+    say so, and a typo in a native entry passed here and failed much later.
+    """
+    known = set(config["suites"])
+
+    covered: set[str] = set()
+    for job in config["jobs"]:
+        unknown = sorted(set(job["suites"]) - known)
+        if unknown:
+            raise SystemExit(f"{job['label']}: no such suite: {', '.join(unknown)}")
+        if job.get("shards", 1) < 1:
+            raise SystemExit(f"{job['label']}: shards must be at least 1")
+        if job.get("shards", 1) > 1 and len(job["suites"]) != 1:
+            raise SystemExit(f"{job['label']}: a sharded job runs exactly one suite")
+        covered.update(job["suites"])
+
+    missing = sorted(known - covered)
+    if missing:
+        raise SystemExit(f"no job runs: {', '.join(missing)}")
+
+    for job in config["native"]:
+        named = job.get("suites", []) + job.get("collect", [])
+        if not named:
+            raise SystemExit(f"native entry for {job['os']} names no suites")
+        unknown = sorted(set(named) - known)
+        if unknown:
+            raise SystemExit(f"native {job['os']}: no such suite: {', '.join(unknown)}")
+
+
 def entries() -> list[dict]:
     config = json.loads((ROOT / "ci" / "suites.json").read_text())
-    known = set(config["suites"])
+    validate(config)
 
     out = []
     for job in config["jobs"]:
         suites = job["suites"]
-        unknown = [s for s in suites if s not in known]
-        if unknown:
-            raise SystemExit(f"{job['label']}: no such suite: {', '.join(unknown)}")
         shards = job.get("shards", 1)
-        if shards > 1 and len(suites) != 1:
-            raise SystemExit(f"{job['label']}: a sharded job runs exactly one suite")
         for shard in range(1, shards + 1):
             out.append(
                 {
@@ -50,6 +79,7 @@ def main() -> int:
 
     if args.native:
         config = json.loads((ROOT / "ci" / "suites.json").read_text())
+        validate(config)
         native = []
         for job in config["native"]:
             suites = job.get("suites", [])
