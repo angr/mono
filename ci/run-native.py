@@ -63,10 +63,16 @@ def needed_core(names: list[str]) -> list[str]:
     not test angr on any x86_64 macOS, and a job that wants pyvex should not
     have to build angr to get it.
     """
-    named = [n for n in names if n in CORE]
-    if not named:
+    if not names:
         return CORE
-    return CORE[: max(CORE.index(n) for n in named) + 1]
+    # Every dependent needs angr, so naming one pulls the prefix out to angr
+    # however shallow the CORE names beside it are. Getting that wrong is
+    # quiet: the install succeeds and the suite fails on an import.
+    deepest = CORE.index("angr") if any(n in ECOSYSTEM for n in names) else -1
+    for n in names:
+        if n in CORE:
+            deepest = max(deepest, CORE.index(n))
+    return CORE if deepest < 0 else CORE[: deepest + 1]
 
 
 def install(
@@ -131,9 +137,13 @@ def install(
     if "angr" in core:
         install_one("-f", dist, str(ROOT / "angr") + ANGR_EXTRAS)
 
-    if ecosystem:
-        for name in ECOSYSTEM:
-            install_one("-f", dist, str(ROOT / name))
+    # `--ecosystem` installs all of them; `--for` installs the ones a job
+    # actually names. Without the second, a native entry naming angrop
+    # installed the whole of CORE and then failed to import angrop, because
+    # needed_core() only knows about CORE and everything else fell through to
+    # "install everything".
+    for name in ECOSYSTEM if ecosystem else [n for n in ECOSYSTEM if n in (only or [])]:
+        install_one("-f", dist, str(ROOT / name))
 
     # After angr, as upstream does, and with its llm extra: angr-management's
     # MCP suite skips itself unless fastmcp and uvicorn are importable.
@@ -197,6 +207,21 @@ def stage(name: str) -> Path:
     # path now points beside the run directories, and the fixtures have to be
     # reachable from there too.
     link_dir(ROOT / "binaries", ROOT / ".ci-run-native" / "binaries")
+
+    # And whatever else the suite names, as ci/run-suite.sh does. Only
+    # angr-platforms uses this today -- its precompiled objects live at
+    # `<tests>/../test_programs` -- but the two lanes reading the same
+    # ci/suites.json and acting on different parts of it is how a suite comes
+    # to pass in one and fail in the other for no reason anybody can see.
+    for fixture in suite_config(name).get("fixtures") or []:
+        if fixture.startswith("/") or ".." in Path(fixture).parts:
+            raise SystemExit(
+                f"{name}: fixture must be a path inside the component: {fixture}"
+            )
+        source = ROOT / name / fixture
+        if not source.exists():
+            raise SystemExit(f"{name}: no such fixture directory: {name}/{fixture}")
+        link_dir(source, run_dir / fixture)
     return run_dir
 
 
@@ -214,6 +239,11 @@ def run_suite(name: str, shard: int, of: int, workers: str) -> int:
     results.mkdir(exist_ok=True)
 
     config = suite_config(name)
+    # Named exclusions, as ci/run-suite.sh applies them. Dormant while no
+    # native entry runs angr for real, and wrong the moment one does.
+    excluded = config.get("excluded")
+    if excluded is not None and not isinstance(excluded, dict):
+        raise SystemExit(f"suites.json: {name}.excluded is not an object")
     args = [
         str(venv_python()), "-m", "pytest", "tests",
         "-p", "no:cacheprovider", "-q", "-rfEs", "-o", "addopts=",
@@ -223,6 +253,12 @@ def run_suite(name: str, shard: int, of: int, workers: str) -> int:
         # the legacy family, not pytest's xunit2 default.
         "-o",
         "junit_family=legacy",
+        # As the Nix lane sets it. pytest-timeout is installed here and was
+        # never used, so a wedged test had nothing between it and the job's
+        # ninety-minute ceiling -- which kills the runner and leaves no junit
+        # to say which test it was.
+        "--timeout=1800",
+        "--timeout-method=thread",
         "--durations=25",
     ]
     if workers not in ("0", "1"):
@@ -230,6 +266,9 @@ def run_suite(name: str, shard: int, of: int, workers: str) -> int:
     if config.get("forked") and os.name != "nt":
         # pytest-forked needs fork(2); Windows has none.
         args += ["--forked"]
+    for test, reason in (excluded or {}).items():
+        print(f"{name}: EXCLUDED {test}\n    {reason}", flush=True)
+        args += ["--deselect", test]
     if of > 1:
         args += ["--splits", str(of), "--group", str(shard)]
         durations = ROOT / "ci" / "durations" / f"{name}.json"

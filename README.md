@@ -170,6 +170,32 @@ ci/summarize.py test-results --baseline ci/skips.json
 ci/summarize.py test-results --baseline ci/skips.json --update-baseline
 ```
 
+## When it goes wrong
+
+Two things are worth knowing before they happen.
+
+**A bad cache asset.** The key is a hash of git tree hashes, so it cannot be
+busted by editing a file that is not in it, and `ci/nix-cache.sh push` treats
+a key it finds published as done. If a closure that should not exist gets
+uploaded, recovery is by hand and needs repository write access:
+
+```shell
+key=$(ci/nix-cache.sh key)
+gh release delete-asset nix-cache "$key.tar.zst" --repo angr/mono
+gh cache delete "nix-store-$key" --repo angr/mono   # the fast path in front
+```
+
+Both, in that order: an Actions cache entry is immutable per key, so deleting
+the release asset alone leaves every job restoring the same bad copy.
+
+**Serialized runs on main.** `cancel-in-progress` is off for `main`, because
+the run being cancelled may be the one uploading that asset. So main's runs
+queue, the worst case for one of them is around three and a half hours if
+`warm` and the test matrix both reach their ceilings, and GitHub keeps only
+one run pending behind the one in flight -- a third push during a busy window
+supersedes the queued one, and that middle commit gets no CI result at all,
+not even a red one.
+
 ## What upstream does that this does not
 
 An experiment is only useful if it is honest about its edges. Each of these

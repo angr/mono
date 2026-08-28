@@ -162,7 +162,9 @@
         "archinfo",
         "pyvex",
         "cle",
-        "pypcode"
+        "pypcode",
+        "angr-platforms",
+        "angrop"
       ],
       "collect": [
         "angr"

@@ -31,6 +31,16 @@ RUNNERS = {
 # digits only -- `\d` is Unicode by default, so "3.\uff11\uff12" passed.
 PYTHON = re.compile(r"^3\.\d{1,2}\Z", re.ASCII)
 
+# Suites the native lane cannot serve, and why. Both need something the Nix
+# test shell provides and a uv venv does not: pysoot needs a JVM on PATH and
+# JAVA_HOME, tracer needs a 32-bit loader for the ELFs it runs under qemu.
+# Naming one in a `native` entry would install, run, and fail a long way from
+# the cause, so it is refused here instead.
+NIX_ONLY = {
+    "pysoot": "needs a JVM; the native lane sets no JAVA_HOME",
+    "tracer": "needs a 32-bit loader; the native lane sets no QEMU_LD_PREFIX",
+}
+
 
 def validate(config: dict) -> None:
     """Refuse a matrix that quietly drops a suite.
@@ -72,6 +82,11 @@ def validate(config: dict) -> None:
             raise SystemExit(f"native {job['os']}: not a known runner label")
         if not PYTHON.match(str(job["python"])):
             raise SystemExit(f"native {job['os']}: bad python {job['python']!r}")
+        for suite in named:
+            if suite in NIX_ONLY:
+                raise SystemExit(
+                    f"native {job['os']}: {suite} is Nix-lane only: {NIX_ONLY[suite]}"
+                )
 
 
 def entries() -> list[dict]:
