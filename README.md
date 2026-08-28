@@ -72,9 +72,9 @@ Imported, one directory each. The seven components with suites of their own:
 `archinfo`, `pyvex`, `pypcode`, `claripy`, `cle`, `angr`, `angr-management`.
 Then five of the dependents upstream tests every core change against --
 `pysoot`, `tracer`, `angr-platforms`, `angrop`, `phuzzer` -- which are here
-because two of them gate tests inside angr's own suite: nineteen tests in
+because two of them gate tests inside angr's own suite: twenty-one tests in
 `tests/engines/test_java.py` and `test_cfgfast_soot.py` are behind
-`skipUnless(pysoot)`, and the CGC trace helpers in `tests/common.py` are
+`skipUnless(pysoot)`, and eighteen more in `tests/exploration_techniques/`
 behind `skipUnless(tracer)`. Without them in the tree those tests do not
 fail, which would be honest -- they report as skips.
 
@@ -97,8 +97,8 @@ is skipped for want of a dependency is a suite that tells you nothing. The
 same reasoning packaged `pysoot` -- with a JDK, since jpype needs one -- and
 `tracer`, with the prebuilt `shellphish-qemu` wheel it requires: those two
 gate thirty-nine of angr's own tests, which reported as skips for as long as
-the components sat in the tree unpackaged. angr's suite went from 2491 passed
-/ 67 skipped to 2529 passed / 28 skipped.
+the components sat in the tree unpackaged. What the counts are now is a
+question for the last run's summary, for the reason the cost section gives.
 
 Their *own* suites, and those of `angr-platforms`, `angrop` and `phuzzer`,
 still run in no job. Upstream's `ga-build.sh` runs them, driven by
@@ -141,8 +141,29 @@ shard there means.
 Whatever the last CI run says. The workflow's summary is a table of tests and
 wall time per suite; that is the measurement, and quoting a second one here
 would only go stale. angr is the only suite big enough for the shape of the
-matrix to matter — it is what the ten shards are dividing, and the other six
-put together finish in under a minute.
+matrix to matter — it is what the ten shards are dividing. angr-management is
+the only other suite that takes minutes rather than seconds.
+
+## The skip ratchet
+
+A skip is not a failure to pytest, so a dependency that stops being importable
+turns tests off and leaves the run green. That happened twice here: six
+architectures inside a test that reported PASSED, once the fixture symlink was
+missing, and thirty-nine tests for as long as `pysoot` and `tracer` sat in the
+tree unpackaged. Neither was caught by CI. Both were caught by a person
+noticing a count had moved.
+
+So the counts are written down. `ci/skips.json` records what each suite is
+allowed to skip in the Nix lane -- the one lane that runs every suite in full,
+on one platform, against a pinned closure -- and the summary job fails when a
+suite skips more than that. Raising a budget is an edit with a diff on it,
+which is the point. It is the same shape as the pylint and pyright ratchets,
+and it is there for the same reason.
+
+```shell
+ci/summarize.py test-results --baseline ci/skips.json
+ci/summarize.py test-results --baseline ci/skips.json --update-baseline
+```
 
 ## What upstream does that this does not
 

@@ -125,7 +125,8 @@
         p.angr-management
         p.unicorn
         # angr-management's MCP suite skips itself unless fastmcp and uvicorn
-        # are importable -- 29 tests that looked like they ran and did not.
+        # are importable -- the 29 in tests/test_mcp_server.py plus one in
+        # test_main_window.py, which looked like they ran and did not.
         p.pydantic-ai
         p.mcp
         p.fastmcp
@@ -225,8 +226,19 @@
             packages = [
               (testEnvFor pkgs)
               pkgs.binutils
+              # pysoot starts a JVM through jpype. Both halves are needed and
+              # neither belongs in the package: pysoot runs `java` off PATH,
+              # and jpype ignores that lookup entirely -- it has its own
+              # finder that reads JAVA_HOME and otherwise cannot find
+              # libjvm.so. Patching the two lookups into the derivation was
+              # the first attempt and it broke pysoot's own
+              # test_no_java_on_path, which clears the environment and
+              # expects the lookup to fail. Upstream supplies both the same
+              # way, with actions/setup-java.
+              pkgs.jdk
             ]
             ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.gcc ];
+            env.JAVA_HOME = pkgs.jdk.home;
           };
 
           # Everything needed to hack on the tree itself.

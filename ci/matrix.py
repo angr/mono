@@ -27,7 +27,9 @@ RUNNERS = {
     "macos-15-intel",
     "macos-latest",
 }
-PYTHON = re.compile(r"^3\.\d{1,2}$")
+# `\Z` not `$`, which also matches before a trailing newline, and ASCII
+# digits only -- `\d` is Unicode by default, so "3.\uff11\uff12" passed.
+PYTHON = re.compile(r"^3\.\d{1,2}\Z", re.ASCII)
 
 
 def validate(config: dict) -> None:

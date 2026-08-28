@@ -639,29 +639,6 @@ in
   pysoot = mkComponent {
     pname = "pysoot";
     pythonImportsCheck = [ "pysoot" ];
-
-    # pysoot reads $JAVA_HOME and otherwise runs `java` off PATH; a Nix
-    # environment guarantees neither, and angr's Java tests failed with
-    # JavaNotFoundError once pysoot was importable enough to reach them.
-    # The JDK it was built against becomes the fallback -- which also makes
-    # it a runtime dependency of this derivation rather than something the
-    # caller has to remember -- and an explicit $JAVA_HOME still wins,
-    # because pysoot checks that first.
-    #
-    # JAVA_HOME on top of that, because jpype does not go through pysoot's
-    # lookup at all -- it has its own finder, which reads only JAVA_HOME and
-    # otherwise raises JVMNotFoundException for want of libjvm.so.
-    # `setdefault`, so a caller who sets it still chooses.
-    postPatch = ''
-      substituteInPlace pysoot/lifter.py \
-        --replace-fail 'command = ["java",' 'command = ["${pkgs.jdk}/bin/java",'
-      cat >> pysoot/__init__.py <<'EOF'
-
-      import os as _os
-
-      _os.environ.setdefault("JAVA_HOME", "${pkgs.jdk.home}")
-      EOF
-    '';
   };
 
   angr-management = mkComponent {

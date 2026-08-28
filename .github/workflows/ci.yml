@@ -163,7 +163,12 @@ jobs:
         if: always()
         with:
           name: results-${{ matrix.id }}
-          path: test-results/*.xml
+          # The log as well as the XML. The XML says a test failed; the log
+          # says why, and it is the only place the deselect announcement and
+          # the skip reasons appear.
+          path: |
+            test-results/*.xml
+            test-results/*.log
           # A pytest that dies during collection writes no XML. With `ignore`
           # the lane contributes no row to the summary table and nothing
           # anywhere says a suite went missing.
@@ -242,7 +247,12 @@ jobs:
         if: always()
         with:
           name: results-${{ matrix.id }}
-          path: test-results/*.xml
+          # The log as well as the XML. The XML says a test failed; the log
+          # says why, and it is the only place the deselect announcement and
+          # the skip reasons appear.
+          path: |
+            test-results/*.xml
+            test-results/*.log
           # A pytest that dies during collection writes no XML. With `ignore`
           # the lane contributes no row to the summary table and nothing
           # anywhere says a suite went missing.
@@ -475,9 +485,26 @@ jobs:
       # keeps the bundle equal to upstream's without the tree carrying 200 MB.
       - name: Resource submodules
         working-directory: angr-management/angrmanagement/resources
+        # Pinned and retried. Unpinned, the frozen bundle's contents changed
+        # whenever either repository's default branch moved, so a build that
+        # passed on Monday was not the build that runs on Thursday; unretried,
+        # a slow GitHub failed the lane outright.
+        env:
+          FLIRT: eaf9234448ced5800497d8ec2c565b186c9f65e4
+          DOCS: d3ed48c58a871d7d2fdc8ea560209afb8718d72e
         run: |
-          git clone --depth 1 https://github.com/angr/flirt_signatures
-          git clone --depth 1 https://github.com/angr/library_docs
+          clone() {
+              for attempt in 1 2 3; do
+                  git clone --filter=blob:none "https://github.com/angr/$1" "$1" &&
+                      git -C "$1" checkout --detach --quiet "$2" && return 0
+                  echo "clone of $1 failed (attempt $attempt); retrying" >&2
+                  rm -rf -- "$1"
+                  sleep $((attempt * 10))
+              done
+              return 1
+          }
+          clone flirt_signatures "$FLIRT"
+          clone library_docs "$DOCS"
       # `-m PyInstaller`, not the console script: resolving
       # `Scripts/pyinstaller` by hand is the same platform guess again.
       - name: Freeze
@@ -574,7 +601,27 @@ jobs:
 
   summary:
     name: Summary
-    needs: [test, native, rust, ratchets, wheels, checks, pre-commit, pyinstaller, pyodide, docs]
+    # plan and warm included, and 'skipped' gated alongside 'failure'. A
+    # `needs:` is an implicit `if: success()`, so when warm dies its
+    # dependents report `skipped`, not `failure` -- and with neither job in
+    # this list, a warm failure left Summary green with the entire Nix lane
+    # never having run. No job here is conditional, so a skip always means
+    # something upstream of it broke.
+    needs:
+      [
+        plan,
+        warm,
+        test,
+        native,
+        rust,
+        ratchets,
+        wheels,
+        checks,
+        pre-commit,
+        pyinstaller,
+        pyodide,
+        docs,
+      ]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -585,7 +632,12 @@ jobs:
           path: test-results
           pattern: results-*
           merge-multiple: true
-      - run: ci/summarize.py test-results >> "$GITHUB_STEP_SUMMARY"
+      # The baseline check writes to the step summary as well, so a run that
+      # fails on it says which suite and by how much where the reader is
+      # already looking.
+      - run: |
+          ci/summarize.py test-results --baseline ci/skips.json \
+            >> "$GITHUB_STEP_SUMMARY"
       # `needs.*` over the whole dependency list rather than a hand-written
       # enumeration: the enumeration named six of the ten lanes, so
       # pre-commit, pyinstaller, pyodide and docs could each go red with this
@@ -595,4 +647,5 @@ jobs:
         if: >-
           contains(needs.*.result, 'failure')
           || contains(needs.*.result, 'cancelled')
+          || contains(needs.*.result, 'skipped')
         run: exit 1

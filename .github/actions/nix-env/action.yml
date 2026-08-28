@@ -50,7 +50,11 @@ runs:
             exit 1
         fi
 
-    - uses: DeterminateSystems/nix-installer-action@v22
+    # SHA-pinned, as upstream angr pins its actions. This one installs
+    # the Nix that `warm` builds the whole closure with, and warm gates
+    # every other job -- a patch release changing the default Nix
+    # version would break the entire matrix on a day nothing changed.
+    - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
       with:
         # The cache is an ordinary file:// binary cache, so a job substitutes
         # only the paths it actually asks for instead of importing 4 GB to run

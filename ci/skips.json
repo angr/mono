@@ -1,0 +1,9 @@
+{
+  "angr": 30,
+  "angr-management": 0,
+  "archinfo": 0,
+  "claripy": 1,
+  "cle": 9,
+  "pypcode": 0,
+  "pyvex": 0
+}

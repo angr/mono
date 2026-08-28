@@ -179,18 +179,29 @@ fi
 # with its reason, printed on every run, and counted in the summary -- not
 # dropped by a `-k` nobody reads, and not left to report as a skip, which is
 # the failure mode this repository exists to avoid.
-while read -r excluded; do
-    [[ -z $excluded ]] && continue
-    echo "$suite: EXCLUDED $excluded"
-    python3 -c "
+# Into a variable first, not `while read < <(python3 ...)`: a crash inside a
+# process substitution is invisible to `set -e`, so a malformed `excluded`
+# would have been read as EOF and applied zero exclusions silently -- the
+# same shape of bug as the tee pipe above.
+if ! exclusions=$(python3 -c "
 import json, sys
-print(json.load(open('$root/ci/suites.json'))['suites']['$suite']['excluded'][sys.argv[1]])
-" "$excluded" | sed 's/^/    /'
-    args+=(--deselect "$excluded")
-done < <(python3 -c "
-import json
-print('\n'.join(json.load(open('$root/ci/suites.json'))['suites']['$suite'].get('excluded', {})))
-")
+suite = json.load(open('$root/ci/suites.json'))['suites']['$suite']
+excluded = suite.get('excluded', {})
+if not isinstance(excluded, dict):
+    sys.exit(f'suites.json: {\"$suite\"}.excluded is not an object')
+for test, reason in excluded.items():
+    print(test)
+    print(reason)
+"); then
+    echo "$suite: could not read the exclusion list; refusing to run a suite" \
+         "whose exclusions are unknown." >&2
+    exit 1
+fi
+exclusion_report=()
+while read -r test && read -r reason; do
+    exclusion_report+=("$suite: EXCLUDED $test" "    $reason")
+    args+=(--deselect "$test")
+done <<<"$exclusions"
 
 if [[ -n $pytest_args ]]; then
     read -ra extra <<<"$pytest_args"
@@ -199,6 +210,12 @@ fi
 
 log=$results/$suite-nix-$shard.log
 echo "=== $suite ${shard}/${of}: python3 ${args[*]}" | tee "$log"
+# After the log exists, not before: printed earlier, the one thing that says
+# a test was deliberately not run went only to the console, and the console
+# is not what the run uploads.
+for line in "${exclusion_report[@]}"; do
+    echo "$line" | tee -a "$log"
+done
 start=$SECONDS
 # `|| rc=${PIPESTATUS[0]}` looks like it reports the suite, and does when
 # pytest is what failed -- but when only `tee` fails the pipeline is non-zero,
@@ -213,5 +230,24 @@ if (( pipe[1] != 0 )); then
     echo "tee failed writing $log (exit ${pipe[1]})" >&2
     (( rc == 0 )) && rc=${pipe[1]}
 fi
+# A forked child that dies after reporting its result is invisible to
+# pytest-forked, which reads the report off a pipe before the child exits --
+# so a segfault during interpreter teardown leaves core files behind and a
+# green suite. The full angr suite drops three of them every run. Say so
+# rather than fail on it: nothing here has shown a wrong test result yet, and
+# a warning that names the count is what makes it findable. (On a runner
+# whose core_pattern pipes to a handler, no file appears and this is silent.)
+cores=("$run_dir"/core.* "$run_dir"/core)
+existing=()
+for core in "${cores[@]}"; do
+    [[ -f $core ]] && existing+=("$core")
+done
+if (( ${#existing[@]} )); then
+    {
+        echo "::warning::$suite: ${#existing[@]} process(es) dumped core"
+        printf '  %s\n' "${existing[@]}"
+    } | tee -a "$log"
+fi
+
 echo "=== $suite ${shard}/${of} done: exit=$rc wall=$(( SECONDS - start ))s" | tee -a "$log"
 exit "$rc"
