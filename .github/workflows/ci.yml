@@ -776,6 +776,10 @@ jobs:
           git archive HEAD cle | tar -x -C "$work"
           ln -s "$PWD/binaries" "$work/binaries"
           cp -r wheelhouse "$work/wheels"
+          # The extracted copy still says `archinfo = { workspace = true }`,
+          # which uv refuses outside a workspace. Put upstream's git sources
+          # back so it resolves the way upstream's own repository does.
+          ci/unworkspace.py "$work/cle"
           cd "$work/cle"
           uv sync --python pyodide@3.14 --group pyodide-testing \
             --find-links ../wheels --no-sources-package pyvex \
