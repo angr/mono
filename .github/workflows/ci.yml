@@ -706,6 +706,53 @@ jobs:
             --no-build-package pycryptodome
           uv run --no-sync pytest tests
 
+  # The decompiler's only regression detector, and the largest thing this
+  # repository was missing. Upstream's ci-settings runs it as `corpus-test`
+  # on every pull request: snapshot the decompilation of a corpus of
+  # binaries, then publish the diff against angr/dec-snapshots. It is
+  # `--insta=update`, so it does not fail on a change -- the diff is the
+  # output, and a human reads it.
+  corpus:
+    name: decompiler corpus
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: python ci/run-native.py --install --python 3.12 --for angr
+      - name: Snapshot tooling
+        run: uv pip install --python .venv-native/bin/python pytest-insta
+      - name: Check out the snapshots
+        run: |
+          git clone --depth 1 https://github.com/angr/dec-snapshots \
+            angr/corpus_tests/snapshots
+      # `-xtype f`, as upstream enumerates it: the corpus entries are
+      # symlinks, and `-type f` finds none of them.
+      - name: Enumerate the corpus
+        run: (cd binaries && find decompiler_corpus -xtype f | sort -u) > corpus.txt
+      - name: Decompile it
+        run: |
+          # shellcheck disable=SC2046
+          .venv-native/bin/python -m pytest --insta=update \
+            angr/corpus_tests/test_corpus.py --binaries $(cat corpus.txt) -q
+      - name: The diff is the result
+        if: always()
+        run: |
+          mkdir -p test-results
+          git -C angr/corpus_tests/snapshots add -A
+          git -C angr/corpus_tests/snapshots diff --cached > test-results/corpus.diff
+          wc -l test-results/corpus.diff
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: corpus-diff
+          path: test-results/corpus.diff
+          if-no-files-found: error
+
   # Sphinx. Every component reports a readthedocs status on its pull
   # requests, and pypcode builds its docs inside Actions on top of that.
   # autodoc imports the package to document it, so this also catches a
@@ -765,6 +812,7 @@ jobs:
         checks,
         pre-commit,
         pyinstaller,
+        corpus,
         pyodide,
         docs,
       ]

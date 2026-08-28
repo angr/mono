@@ -23,10 +23,12 @@ RUNNERS = {
     "ubuntu-24.04-arm",
     "ubuntu-latest",
     "windows-2022",
+    "windows-2025",
     "windows-latest",
     "macos-14",
     "macos-15",
     "macos-15-intel",
+    "macos-26",
     "macos-latest",
 }
 # `\Z` not `$`, which also matches before a trailing newline, and ASCII

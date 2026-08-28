@@ -5,8 +5,16 @@
     "finish in seconds -- their cost is job setup, not testing -- and shard",
     "the ones that do not, so the stage costs what its slowest shard costs.",
     "`native` is the second lane: the platforms Nix cannot reach, which is",
-    "where upstream gates. `suites` is how each component's suite is invoked.",
-    "`forked` is on for every suite because upstream's test.py passes --forked to all of them, not just angr; running a suite in shared workers when upstream runs it one process per test is a different test."
+    "where upstream gates. `coverage` is the instrumented lane. `suites` is",
+    "how each component's suite is invoked.",
+    "`forked` follows upstream, and upstream is not of one mind: ci-settings'",
+    "test.py runs every suite one process per test in the container lane,",
+    "while angr-management's own ci.yml and coverage.yml run it under",
+    "`-n auto` with no --forked at all. This follows each component's own",
+    "CI, which is why angr-management is the one suite here that is not",
+    "forked -- and forking it is not merely a preference: on macOS a fork",
+    "with CoreFoundation already initialised segfaults, which is what it did",
+    "here before the setting was corrected."
   ],
   "jobs": [
     {
@@ -104,7 +112,7 @@
   },
   "native": [
     {
-      "os": "windows-2022",
+      "os": "windows-2025",
       "python": "3.12",
       "suites": [
         "archinfo",
@@ -118,7 +126,7 @@
       ]
     },
     {
-      "os": "macos-15",
+      "os": "macos-26",
       "python": "3.12",
       "suites": [
         "archinfo",

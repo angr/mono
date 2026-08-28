@@ -101,13 +101,17 @@ gate thirty-nine of angr's own tests, which reported as skips for as long as
 the components sat in the tree unpackaged. What the counts are now is a
 question for the last run's summary, for the reason the cost section gives.
 
-Four of the five now run their own suites too -- `pysoot`, `tracer`,
-`angr-platforms` and `angrop` -- which is the shape of what upstream's
+All five now run their own suites, which is the shape of what upstream's
 `ga-build.sh` does: without them a claripy change is tried against angr and
 angr-management and nothing else. It is not the whole of it. Upstream's
 `repo-list.txt` names twenty-two repositories and tests everything
 transitively downstream of the one being changed; five of them are here. See
 the table below for what that leaves out.
+
+`pysoot` additionally runs its own twelve-cell matrix -- Python 3.10 through
+3.13 across ubuntu-22.04, macos-14 and windows-2022 -- because that is what
+its own CI does, and `phuzzer` runs on a Linux runner with the kernel tuned
+for AFL the way upstream tunes it.
 
 A component's own `.github/` does not come in: only the workflow at the root
 of this repository runs, and seven dead copies of upstream's workflows would
@@ -203,12 +207,9 @@ is a thing upstream CI does today and this repository does not.
 
 | | what is missing | why it is not here yet |
 | --- | --- | --- |
+| Coverage gating | Upstream uploads to Codecov, which comments on the pull request and enforces a project threshold. | Measured here -- Python, C and Rust -- and merged, rendered and ratcheted by `ci/coverage-report.py` against `ci/coverage.json`. What is missing is only the Codecov project itself: no PR comment, no hosted history. |
 | The rest of the dependency graph | `ci-settings/ci-image/conf/repo-list.txt` names twenty-two repositories, and `test.py` runs the suite of everything transitively downstream of the one under test. Five are imported here. `rex`, `patcherex`, `heaphopper`, `shellphish/driller` and the three `mechaphish` packages are not, nor is `archr`, which `rex` builds against. | Each is another repository to snapshot and another dependency set to package. The five here were chosen because two of them gate tests inside angr's own suite; the rest are a straightforward extension of the same work, not a different problem. |
-| `phuzzer`'s suite | The other four imported dependents run; `phuzzer` does not. | `shellphish-afl` is a prebuilt AFL binary distribution and nixpkgs does not carry it. `phuzzer/phuzzers/afl.py` also refuses to start unless `/proc/sys/kernel/core_pattern` reads `core`; upstream writes it, along with `sched_child_runs_first`, through a `/hostproc` bind mount in a privileged container, which an unprivileged runner cannot do. (It checks the cpufreq governor too, but only where `/sys/.../scaling_governor` exists, which on a virtualised runner it does not.) |
-| Runner images | angr's `installation` job gates on `windows-2025`, `macos-26` and `ubuntu-24.04` py3.14. | The native matrix here uses `windows-2022` and `macos-15` -- two generations behind what upstream currently gates on. Bumping them is a one-line change per entry in `ci/suites.json` and has not been tried. |
-| Coverage | `angr/coverage.yml` and `angr-management/coverage.yml` re-run the whole sharded suite under `pytest --cov` and `cargo llvm-cov` and upload to Codecov on every pull request. | Deliberate, for now. It is a second full matrix -- ten more angr shards, three more angr-management -- to catch untested lines, which is not a failure this repository has had. The one it has had twice is a suite quietly skipping, and coverage would not have caught either instance: a test that skips still executes every line up to the `skip()` call. That is what `ci/skips.json` is for. Revisit once a Codecov project exists. |
-| Decompiler snapshots | `ci-settings`' `corpus-test` job diffs decompiler output against `angr/dec-snapshots` and uploads the diff. | The corpus job is not ported. It is the decompiler's only regression detector, so this is the largest single omission. |
-| Nightly | Ten repositories run a nightly that widens the matrix -- angr's runs the full suite on Windows and macOS, which is `--collect` only here. | A nightly on an experiment is recurring cost on somebody else's account. Deliberate. |
+| Nightly | Ten repositories run a nightly. Its distinctive content was angr's full suite on Windows and macOS, which now runs here on every push instead. What is left is the `NIGHTLY=1` slow-test tier in `ga-test.sh` and the Mailgun failure mail. | No `schedule:` trigger: a nightly on an experiment is recurring cost on somebody else's account, and the part that mattered is no longer nightly-only. |
 | Release | `angr-release.yml` bumps versions, builds sdists and wheels for six components, verifies them with `--only-binary`, tags and publishes to PyPI. | Only `pypcode` wheels are built here, and nothing is published. Publishing from an experiment is not something to do by accident. |
 | Bundles | `angr-management`'s nightly build produces an NSIS installer, an AppImage and a macOS `.app`, and tests each by launching it. | Only the raw PyInstaller freeze is built, and only the Linux one is launched. |
 | Cross-repo fixtures | `ci-settings/actions/binaries-ref` reads `angr/binaries#N` out of a pull-request body so a fixture and the code that needs it go green together. | `binaries` is pinned in `flake.lock` with no override. A new fixture therefore needs two rounds here. |
