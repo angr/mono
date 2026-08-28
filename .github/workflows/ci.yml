@@ -774,7 +774,12 @@ jobs:
         run: |
           work=$(mktemp -d)
           git archive HEAD cle | tar -x -C "$work"
-          ln -s "$PWD/binaries" "$work/binaries"
+          # Copied, not symlinked. The suite runs inside Pyodide, whose
+          # filesystem does not follow a host symlink out of the tree it
+          # mounted: cle's fixtures resolved to
+          # `<work>/cle/tests/../../binaries/...` and came back ENOENT.
+          # Upstream checks binaries out as a real directory beside cle.
+          cp -r binaries "$work/binaries"
           cp -r wheelhouse "$work/wheels"
           # The extracted copy still says `archinfo = { workspace = true }`,
           # which uv refuses outside a workspace. Put upstream's git sources
