@@ -430,6 +430,44 @@ jobs:
           path: wheelhouse/*.whl
           if-no-files-found: ignore
 
+  # Sphinx. Every component reports a readthedocs status on its pull
+  # requests, and pypcode builds its docs inside Actions on top of that.
+  # autodoc imports the package to document it, so this also catches a
+  # docstring that crashes sphinx-autodoc-typehints and a broken
+  # cross-reference -- neither of which any test suite touches.
+  docs:
+    name: docs · ${{ matrix.component }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [angr, angr-management, archinfo, claripy, cle, pypcode, pyvex]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Qt for angr-management's autodoc
+        if: matrix.component == 'angr-management'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0
+      - run: python ci/run-native.py --install --python 3.12
+      - name: Documentation tooling
+        run: |
+          uv pip install --python .venv-native/bin/python \
+            furo myst-parser sphinx sphinx-autodoc-typehints ipython
+      - name: Build ${{ matrix.component }}'s docs
+        working-directory: ${{ matrix.component }}/docs
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ../../.venv-native/bin/python -m sphinx -b html . _build/html
+
   summary:
     name: Summary
     needs: [test, native, rust, ratchets, wheels, checks, pre-commit, pyinstaller, pyodide, docs]
