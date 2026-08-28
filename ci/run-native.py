@@ -330,7 +330,7 @@ def run_suite(
     config = suite_config(name)
     # Named exclusions, as ci/run-suite.sh applies them. Dormant while no
     # native entry runs angr for real, and wrong the moment one does.
-    excluded = for_platform(config, name)
+    excluded = for_platform(config, name, lane="coverage" if coverage else "test")
     args = [
         str(venv_python()), "-m", "pytest", "tests",
         "-p", "no:cacheprovider", "-q", "-rfEs", "-o", "addopts=",

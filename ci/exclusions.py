@@ -20,8 +20,15 @@ from __future__ import annotations
 import sys
 
 
-def for_platform(suite: dict, name: str, platform: str | None = None) -> list[tuple[str, str]]:
-    """The (test, reason) pairs to deselect for this suite here."""
+def for_platform(
+    suite: dict, name: str, platform: str | None = None, lane: str = "test"
+) -> list[tuple[str, str]]:
+    """The (test, reason) pairs to deselect for this suite here.
+
+    `lanes` narrows the same way `platforms` does -- a test that only fails
+    under coverage instrumentation should not be deselected from the lane
+    that measures nothing.
+    """
     platform = platform or sys.platform
     excluded = suite.get("excluded", {})
     if not isinstance(excluded, dict):
@@ -38,7 +45,12 @@ def for_platform(suite: dict, name: str, platform: str | None = None) -> list[tu
                 "nor an object with one"
             )
         platforms = value.get("platforms")
-        if platforms is None or platform in platforms:
-            where = "" if platforms is None else f" [{', '.join(platforms)}]"
-            out.append((test, value["reason"] + where))
+        lanes = value.get("lanes")
+        if platforms is not None and platform not in platforms:
+            continue
+        if lanes is not None and lane not in lanes:
+            continue
+        scope = [*(platforms or []), *(lanes or [])]
+        where = f" [{', '.join(scope)}]" if scope else ""
+        out.append((test, value["reason"] + where))
     return out

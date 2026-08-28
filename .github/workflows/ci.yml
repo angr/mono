@@ -260,6 +260,13 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install keystone
+          # The Python binding loads libkeystone.dylib from a fixed list of
+          # paths -- /usr/local/lib among them -- and Homebrew on Apple
+          # silicon installs to /opt/homebrew, which is not on it. Installing
+          # the bottle alone left `import keystone` still failing.
+          sudo mkdir -p /usr/local/lib
+          sudo ln -sf "$(brew --prefix keystone)/lib/libkeystone.dylib" /usr/local/lib/
+          echo "DYLD_LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"
           if [[ "${{ contains(matrix.suites, 'angr-management') }}" == true ]]; then
               brew install flatcc flatbuffers
           fi
@@ -726,11 +733,21 @@ jobs:
       # with the same flags upstream uses -- and `@v8` is not a tag that
       # exists, which is how the previous attempt at this failed.
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      # Out of the workspace first. `uv sync` inside cle/ resolves this
+      # repository's root pyproject.toml as a uv workspace -- upstream's cle
+      # is a standalone repository with no such thing -- and the resolution
+      # that produces cannot satisfy pyvex's cffi requirement under Pyodide.
+      # Same trick as ci/pre-commit.sh: give the component a tree where it is
+      # the root, with the fixtures where its tests look for them.
       - name: cle under Pyodide
-        working-directory: cle
         run: |
+          work=$(mktemp -d)
+          git archive HEAD cle | tar -x -C "$work"
+          ln -s "$PWD/binaries" "$work/binaries"
+          cp -r wheelhouse "$work/wheels"
+          cd "$work/cle"
           uv sync --python pyodide@3.14 --group pyodide-testing \
-            --find-links ../wheelhouse --no-sources-package pyvex \
+            --find-links ../../wheels --no-sources-package pyvex \
             --no-build-package bitarray --no-build-package cffi \
             --no-build-package pycryptodome
           uv run --no-sync pytest tests
