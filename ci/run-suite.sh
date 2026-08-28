@@ -240,11 +240,10 @@ fi
 # same shape of bug as the tee pipe above.
 if ! exclusions=$(python3 -c "
 import json, sys
+sys.path.insert(0, '$root/ci')
+from exclusions import for_platform
 suite = json.load(open('$root/ci/suites.json'))['suites']['$suite']
-excluded = suite.get('excluded', {})
-if not isinstance(excluded, dict):
-    sys.exit(f'suites.json: {\"$suite\"}.excluded is not an object')
-for test, reason in excluded.items():
+for test, reason in for_platform(suite, '$suite'):
     print(test)
     print(reason)
 "); then

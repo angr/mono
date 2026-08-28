@@ -25,6 +25,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from exclusions import for_platform  # noqa: E402  pylint: disable=wrong-import-position
+
 ROOT = Path(__file__).resolve().parent.parent
 VENV = ROOT / ".venv-native"
 
@@ -327,9 +330,7 @@ def run_suite(
     config = suite_config(name)
     # Named exclusions, as ci/run-suite.sh applies them. Dormant while no
     # native entry runs angr for real, and wrong the moment one does.
-    excluded = config.get("excluded")
-    if excluded is not None and not isinstance(excluded, dict):
-        raise SystemExit(f"suites.json: {name}.excluded is not an object")
+    excluded = for_platform(config, name)
     args = [
         str(venv_python()), "-m", "pytest", "tests",
         "-p", "no:cacheprovider", "-q", "-rfEs", "-o", "addopts=",
@@ -358,7 +359,7 @@ def run_suite(
         # `pytest -n auto --splits N --group M` with no --forked at all, and
         # only the Linux container lane forks.
         args += ["--forked"]
-    for test, reason in (excluded or {}).items():
+    for test, reason in excluded:
         print(f"{name}: EXCLUDED {test}\n    {reason}", flush=True)
         args += ["--deselect", test]
 
