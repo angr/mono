@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "a9ca247a5bcadf0ad8ecccb61be5f76dc4cd5050",
-      "committed_at": "2026-08-28T11:42:38-07:00",
-      "subject": "Remove concrete_target leftovers (#7027)",
+      "commit": "df4f8ba7281a76bdb212f3ca89e7e2f3a30f569b",
+      "committed_at": "2026-08-29T12:02:57+09:00",
+      "subject": "RuntimeDb: Read RTDB_BASE when the database is created (#7008)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -121,7 +121,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-08-29T02:47:32+00:00",
+  "imported_at": "2026-08-29T04:28:34+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
