@@ -149,6 +149,65 @@ def entries() -> list[dict]:
     return out
 
 
+def coverage_entries() -> list[dict]:
+    config = json.loads((ROOT / "ci" / "suites.json").read_text())
+    validate(config)
+    out = []
+    for job in config.get("coverage", []):
+        suite = job["suite"]
+        shards = job.get("shards", 1)
+        for shard in range(1, shards + 1):
+            out.append(
+                {
+                    "suite": suite,
+                    "python": job.get("python", "3.12"),
+                    "components": " ".join([suite, *job.get("with", [])]),
+                    "shard": shard,
+                    "shards": shards,
+                    "label": suite + (f" {shard}/{shards}" if shards > 1 else ""),
+                    "id": f"{suite}-{shard}-of-{shards}",
+                }
+            )
+    return out
+
+
+def native_entries() -> list[dict]:
+    config = json.loads((ROOT / "ci" / "suites.json").read_text())
+    validate(config)
+    native = []
+    for job in config["native"]:
+        suites = job.get("suites", [])
+        collect = job.get("collect", [])
+        # Sharded, like the Nix jobs. This branch had no shard expansion
+        # at all, so `--shard/--of` never reached run-native.py and
+        # pytest-split never engaged off Nix -- which is fine while every
+        # native entry is one shard and wrong the moment one is not. Two
+        # shards would also have collided on `results-<id>`, and the
+        # second upload would have failed the job.
+        shards = job.get("shards", 1)
+        name = "+".join(suites + collect)
+        base = f"{'-'.join(suites + collect)}-{job['os']}-py{job['python']}"
+        for shard in range(1, shards + 1):
+            native.append(
+                {
+                    **job,
+                    "suites": " ".join(suites),
+                    "collect": " ".join(collect),
+                    # What the environment has to serve, so a job need not
+                    # build components no suite of its own will import.
+                    "components": " ".join(
+                        dict.fromkeys(suites + collect + job.get("with", []))
+                    ),
+                    "shard": shard,
+                    "shards": shards,
+                    "label": f"{name} · {job['os']} py{job['python']}"
+                    + (f" {shard}/{shards}" if shards > 1 else ""),
+                    "id": base + (f"-{shard}-of-{shards}" if shards > 1 else ""),
+                }
+            )
+    return native
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="plain text, one job per line")
@@ -157,62 +216,11 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.coverage:
-        config = json.loads((ROOT / "ci" / "suites.json").read_text())
-        validate(config)
-        out = []
-        for job in config.get("coverage", []):
-            suite = job["suite"]
-            shards = job.get("shards", 1)
-            for shard in range(1, shards + 1):
-                out.append(
-                    {
-                        "suite": suite,
-                        "python": job.get("python", "3.12"),
-                        "components": " ".join([suite, *job.get("with", [])]),
-                        "shard": shard,
-                        "shards": shards,
-                        "label": suite + (f" {shard}/{shards}" if shards > 1 else ""),
-                        "id": f"{suite}-{shard}-of-{shards}",
-                    }
-                )
-        print(json.dumps(out))
+        print(json.dumps(coverage_entries()))
         return 0
 
     if args.native:
-        config = json.loads((ROOT / "ci" / "suites.json").read_text())
-        validate(config)
-        native = []
-        for job in config["native"]:
-            suites = job.get("suites", [])
-            collect = job.get("collect", [])
-            # Sharded, like the Nix jobs. This branch had no shard expansion
-            # at all, so `--shard/--of` never reached run-native.py and
-            # pytest-split never engaged off Nix -- which is fine while every
-            # native entry is one shard and wrong the moment one is not. Two
-            # shards would also have collided on `results-<id>`, and the
-            # second upload would have failed the job.
-            shards = job.get("shards", 1)
-            name = "+".join(suites + collect)
-            base = f"{'-'.join(suites + collect)}-{job['os']}-py{job['python']}"
-            for shard in range(1, shards + 1):
-                native.append(
-                    {
-                        **job,
-                        "suites": " ".join(suites),
-                        "collect": " ".join(collect),
-                        # What the environment has to serve, so a job need not
-                        # build components no suite of its own will import.
-                        "components": " ".join(
-                            dict.fromkeys(suites + collect + job.get("with", []))
-                        ),
-                        "shard": shard,
-                        "shards": shards,
-                        "label": f"{name} · {job['os']} py{job['python']}"
-                        + (f" {shard}/{shards}" if shards > 1 else ""),
-                        "id": base + (f"-{shard}-of-{shards}" if shards > 1 else ""),
-                    }
-                )
-        print(json.dumps(native))
+        print(json.dumps(native_entries()))
         return 0
 
     if args.list:

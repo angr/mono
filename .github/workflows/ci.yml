@@ -921,8 +921,29 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # `actions: read` for the jobs listing the shape check below reads. The
+    # top-level grant is `contents: read` and this is the only job that needs
+    # more than that.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v5
+      # A matrix job's cells are not created until its `needs:` resolve, so a
+      # failed `warm` does not turn the fifteen Nix test cells red -- it
+      # deletes them. The run then shows 82 jobs where the workflow means 96,
+      # every one of them green, and `needs.test.result` says `skipped`
+      # exactly as it would for a plain job. Two rollups were read as complete
+      # results that way before anyone counted (angr/mono#10). Compare the
+      # names the run actually has against the labels the matrices emit, so an
+      # absent lane reads as a failure that names it.
+      - name: Every lane the matrices name was created
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate \
+            "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100" \
+            --jq '.jobs[].name' | ci/run-shape.py
       - uses: actions/download-artifact@v4
         with:
           path: test-results
