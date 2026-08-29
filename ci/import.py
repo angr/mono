@@ -222,6 +222,37 @@ def snapshot(name: str, src: Path, dest: Path) -> None:
     shutil.copytree(src, dest, ignore=ignore, symlinks=True)
 
 
+def vendored_from_tree(name: str, entry: dict, source: Path) -> dict[str, str]:
+    """The submodule paths an assembled tree carries, and where they came from.
+
+    An ordinary import reads a gitlink out of the component's checkout. There
+    is no gitlink to read here: whoever assembled the tree resolved every
+    submodule to ordinary files before exporting it, which is the only form a
+    merge of several pull requests' VEX branches can take -- that commit lives
+    in the assembler's mirror and nowhere a monorepo can pin. So the tree's
+    own record of what it resolved them to is the provenance, and the paths
+    are checked against `SUBMODULES` so a tree that simply forgot to say
+    still gets its `vex` recorded.
+
+    Recording them is not bookkeeping. `ci/vendored.py` reads this key, and
+    everything that has to tell a vendored drop from code somebody wrote
+    reads `ci/vendored.py`: without it `ci/pre-commit.sh` hands pyvex's own
+    hooks the whole VEX tree, and the ratchets score it as new code that has
+    to be perfect.
+    """
+    recorded = entry.get("submodules", {})
+    vendored = {}
+    for path in sorted(set(SUBMODULES.get(name, [])) | set(recorded)):
+        if not (source / path).is_dir():
+            raise SystemExit(
+                f"{name}/{path} is a submodule of {name} and is not in the "
+                "assembled tree; the component would be imported without the "
+                "sources it compiles."
+            )
+        vendored[path] = recorded.get(path, "")
+    return vendored
+
+
 def from_trees(
     trees: Path, components: list[str], manifest: dict, manifest_path: Path
 ) -> int:
@@ -250,7 +281,10 @@ def from_trees(
         prs = [p["number"] for p in entry.get("applied", [])]
         print(f"{name}: {len(prs)} pull request(s) merged onto {entry.get('base', '?')[:12]}",
               file=sys.stderr)
-        bucket(manifest, name)[name] = {
+        vendored = vendored_from_tree(name, entry, source)
+        for path, sha in vendored.items():
+            print(f"{name}/{path}: {(sha or '?')[:12]} (vendored)", file=sys.stderr)
+        record = {
             "upstream": f"https://github.com/angr/{name}",
             "commit": entry.get("base", ""),
             "committed_at": "",
@@ -259,6 +293,9 @@ def from_trees(
             "sibling_sources_repointed_at_workspace": workspaced,
             "rolled_up": prs,
         }
+        if vendored:
+            record["vendored_submodules"] = vendored
+        bucket(manifest, name)[name] = record
 
     for key in ("components", "fixtures"):
         if key in manifest:
