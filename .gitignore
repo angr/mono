@@ -6,10 +6,6 @@ __pycache__/
 .pytest_cache/
 .import-cache/
 
-# Fixtures and external sources materialised from flake inputs; both are
-# pinned in flake.lock, neither belongs in this tree.
-/pyvex/vex
-
 # CI scratch.
 /test-results/
 /.nix-cache/

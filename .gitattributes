@@ -3,3 +3,8 @@
 # on Windows, and git would happily rewrite line endings in the 476 fixtures
 # under binaries/ it detects as text -- silently, on one platform only.
 binaries/** -text
+
+# VEX's `orig_*/*.orig` trace dumps are inputs of the same kind, and the
+# whole subtree is a vendored drop nobody edits here, so the same rule
+# applies: git must not rewrite a line ending in it on one platform only.
+pyvex/vex/** -text

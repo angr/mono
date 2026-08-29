@@ -18,6 +18,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import vendored
+
 ROOT = Path(__file__).resolve().parent.parent
 BASE_TREE = ROOT / ".typecheck-base"
 
@@ -110,10 +112,16 @@ def main() -> int:
 
     require_pyright()
     base = merge_base(args.base)
+    # A vendored submodule is source this repository does not write. Its
+    # files arrive in one commit and would score as new code that has to
+    # be perfect, which says nothing about the change under review.
+    vendored_paths = vendored.paths()
     changed = [
         p
         for p in git("diff", "--name-only", base, "HEAD").splitlines()
-        if p.endswith((".py", ".pyi")) and (ROOT / p).exists()
+        if p.endswith((".py", ".pyi"))
+        and (ROOT / p).exists()
+        and not vendored.covers(p, vendored_paths)
     ]
     if not changed:
         print("no Python files changed.")

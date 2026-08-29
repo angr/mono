@@ -14,6 +14,13 @@
 #
 # So the component is extracted into a scratch repository where it *is* the
 # root, and the hooks run there against exactly the files upstream would see.
+#
+# Which is also why the vendored submodules come out again. Upstream pyvex
+# tracks `vex` as a gitlink, so its own `pre-commit run --all-files` never
+# opens a VEX file; here they are ordinary tracked files, and running the
+# hooks over them would fail on eleven sources above `check-added-large-files`
+# and trailing whitespace in 110 more -- reporting a vendored drop nobody
+# edits as if pyvex had a lint problem.
 
 set -euo pipefail
 
@@ -30,6 +37,11 @@ trap 'rm -rf -- "$work"' EXIT
 
 # Tracked files only, and only this component's.
 git -C "$root" archive HEAD "$component" | tar -x -C "$work" --strip-components=1
+
+# The paths `ci/import.py` vendored out of a submodule, back out again.
+while read -r vendored; do
+    [[ -n $vendored ]] && rm -rf -- "${work:?}/$vendored"
+done < <(python3 "$root/ci/vendored.py" --component "$component")
 
 git -C "$work" init --quiet
 git -C "$work" add -A

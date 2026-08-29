@@ -5,14 +5,16 @@ Each component is copied from its upstream default branch into a top-level
 directory of the same name.  The upstream commit is recorded in ``mono.json``
 so a snapshot can always be traced back and re-created.
 
-Two things deliberately do not come in:
+One thing deliberately does not come in: ``.github/`` from a component.
+Only the root workflow runs here, and all twelve components have one
+upstream -- thirty workflow files between them, every one of which would read
+as if it ran.
 
-* ``.github/`` from a component.  Only the root workflow runs here, and all
-  twelve components have one upstream -- thirty workflow files between them,
-  every one of which would read as if it ran.
-* ``pyvex/vex``.  VEX stays an external dependency; the flake's ``vex`` input
-  is repinned to whatever commit pyvex's submodule names, so the pin follows
-  upstream without the sources living here.
+Submodules a component needs to build do come in, as ordinary files.  pyvex's
+``vex`` is the only one: its CMakeLists compiles VEX out of ``./vex``, so a
+pyvex change and the VEX change it needs have to be one commit here or
+neither half can be tested.  ``.gitmodules`` is dropped with them, since the
+paths it names are files in this tree and not gitlinks.
 
 Usage:
     ci/import.py                        # every component, from upstream heads
@@ -83,10 +85,30 @@ IMPORTABLE = [*COMPONENTS, FIXTURES]
 # Paths dropped from every component snapshot.
 COMMON_EXCLUDES = [".git", ".github"]
 
+# Submodules checked out before the snapshot, so their sources are vendored
+# with the component instead of pinned somewhere else.
+#
+# VEX used to be a flake input, repinned to whatever commit pyvex's gitlink
+# named. That pin cannot follow a pull request: the July rollup applied the C
+# half of angr/pyvex#564 while `vex` stayed at the commit pyvex's master
+# names, `pyvex_c/pyvex.c` referenced a `VexControl` field that commit does
+# not have, and 51 of the run's 55 failing checks were that one compile
+# error -- which meant the rollup answered nothing about the other 132 pull
+# requests in it. Vendoring is the same answer commit e2c288b gave for the
+# test fixtures, for the same reason: a change and the thing it needs land in
+# one commit or the pair cannot be tested at all.
+#
+# angr-management's two submodules are excluded rather than vendored; they
+# are a couple of hundred megabytes of runtime data, not code under test.
+SUBMODULES = {
+    "pyvex": ["vex"],
+}
+
 # Extra per-component exclusions.
 EXCLUDES = {
-    # VEX stays external: pinned as a flake input, not vendored here.
-    "pyvex": ["vex"],
+    # The submodule is vendored, so the file that declares it is not: git
+    # would read `vex` as a gitlink that this tree does not have.
+    "pyvex": [".gitmodules"],
     # FLIRT signatures and library docs are submodules of angr-management,
     # a couple of hundred megabytes between them and growing; they are
     # runtime data, not code under test. The pyinstaller lane clones both at
@@ -117,6 +139,10 @@ def fetch(name: str, cache: Path) -> Path:
     else:
         cache.mkdir(parents=True, exist_ok=True)
         run("git", "clone", "--depth", "1", url, str(dest))
+    # Only the vendored ones: `--init` with no path would also pull down
+    # angr-management's few hundred megabytes of FLIRT signatures.
+    for path in SUBMODULES.get(name, []):
+        run("git", "-C", str(dest), "submodule", "update", "--init", "--", path)
     return dest
 
 
@@ -168,27 +194,6 @@ def submodule_commit(repo: Path, path: str) -> str:
     if kind != "commit":
         raise SystemExit(f"{repo}/{path} is a {kind}, not a submodule")
     return rest.split()[0]
-
-
-def repin_vex(commit: str) -> bool:
-    """Point the flake's `vex` input at the commit pyvex's submodule names.
-
-    VEX is the one dependency this repository deliberately does not vendor, so
-    the pin has to be kept honest by hand -- or, since the answer is written
-    down in pyvex's gitlink, here.
-    """
-    flake = ROOT / "flake.nix"
-    text = flake.read_text()
-    updated, count = re.subn(
-        r'(url = "github:angr/vex/)[0-9a-f]{40}(")', rf"\g<1>{commit}\g<2>", text
-    )
-    if count != 1:
-        raise SystemExit("could not find the vex input pin in flake.nix")
-    if updated == text:
-        return False
-    flake.write_text(updated)
-    subprocess.run(["nix", "flake", "lock"], cwd=ROOT, check=True)
-    return True
 
 
 def bucket(manifest: dict, name: str) -> dict:
@@ -298,12 +303,10 @@ def main() -> int:
         print(f"{name}: {commit[:12]} {subject}", file=sys.stderr)
         snapshot(name, src, ROOT / name)
         workspaced = use_workspace_sources(ROOT / name)
-        if name == "pyvex":
-            vex = submodule_commit(src, "vex")
-            manifest["external"] = {"vex": vex}
-            if repin_vex(vex):
-                print(f"vex: repinned to {vex[:12]}", file=sys.stderr)
-        bucket(manifest, name)[name] = {
+        vendored = {path: submodule_commit(src, path) for path in SUBMODULES.get(name, [])}
+        for path, sha in vendored.items():
+            print(f"{name}/{path}: {sha[:12]} (vendored)", file=sys.stderr)
+        entry = {
             "upstream": f"https://github.com/angr/{name}",
             "commit": commit,
             "committed_at": committed,
@@ -311,6 +314,9 @@ def main() -> int:
             "excluded": sorted(set(EXCLUDES.get(name, []))),
             "sibling_sources_repointed_at_workspace": workspaced,
         }
+        if vendored:
+            entry["vendored_submodules"] = vendored
+        bucket(manifest, name)[name] = entry
 
     for key in ("components", "fixtures"):
         if key in manifest:

@@ -205,8 +205,9 @@ jobs:
 
   # The second lane. Nix does not run on Windows, and upstream gates on
   # Windows, macOS and Python versions past 3.12 -- so those get the same
-  # suites through uv, against the same component sources and, because both
-  # lanes read flake.lock, the same external commits.
+  # suites through uv, against the same component sources: every one of them
+  # is tracked here, VEX included, so the two lanes cannot build different
+  # code.
   native:
     name: ${{ matrix.label }}
     needs: plan
@@ -738,8 +739,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Fetch the pinned VEX sources
-        run: python ci/fetch-external.py vex
       - uses: pypa/cibuildwheel@v4.1.0
         with:
           package-dir: pyvex
