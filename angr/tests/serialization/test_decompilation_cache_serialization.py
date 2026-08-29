@@ -28,17 +28,22 @@ from angr.analyses.decompiler.optimization_passes.expr_op_swapper import OpDescr
 from angr.analyses.decompiler.optimization_passes.static_vvar_rewriter import FixedBuffer, FixedBufferPtr
 from angr.analyses.decompiler.peephole_optimizations import EXPR_OPTS
 from angr.analyses.decompiler.structured_codegen import DummyStructuredCodeGenerator
-from angr.analyses.decompiler.structured_codegen.c import CConstruct
+from angr.analyses.decompiler.structured_codegen.base import BaseStructuredCodeGenerator
+from angr.analyses.decompiler.structured_codegen.c import CConstant, CConstruct
 from angr.analyses.decompiler.structured_codegen.c_serialize import (
     _DISPLAY_OPTION_ATTRS,
     _DISPLAY_OPTION_FIELD_FIRST,
     _parse_tags,
     _sanitize_tags,
 )
+from angr.analyses.decompiler.structurer_nodes import IncompleteSwitchCaseHeadStatement
 from angr.knowledge_plugins.structured_code import SpillingDecompilationDict
 from angr.protos import codegen_pb2
+from angr.serializable import Serializable
+from angr.sim_type import SimType
 from angr.sim_variable import SimRegisterVariable, SimStackVariable
 from angr.utils.ail_serialization import (
+    BlockPool,
     pack_arg_vvars,
     pack_graph,
     pack_ite_exprs,
@@ -139,6 +144,71 @@ class TestAilSerializationHelpers(unittest.TestCase):
         assert back[b0][b1] == {"type": "fake_return", "outside": False, "confirmed": True}
         assert back[b0][b2] == {"type": "transition", "stmt_idx": -2}
         assert back[b1][b2] == {}
+
+    def _switch_head_block(self, idx=7):
+        """A block terminated by the one AIL statement that is still written in Python, as LoweredSwitchSimplifier
+        leaves it: the marker replaces the head block's last statement."""
+        cmp_block = AilBlock(0x2000, 4, statements=[Return(9, [], ins_addr=0x2000)])
+        head = IncompleteSwitchCaseHeadStatement(
+            idx,
+            Const(11, 0x40, 32),
+            [
+                (cmp_block, 1, 0x1100, None, 0x1200),
+                (cmp_block, "default", 0x1300, 4, None),
+            ],
+            ins_addr=0x1000,
+        )
+        return AilBlock(0x1000, 4, statements=[Assignment(0, AilTmp(1, 2, 64), Const(2, 1, 64), ins_addr=0x1000), head])
+
+    def test_graph_roundtrip_with_incomplete_switch_case_head(self):
+        # Block.to_bytes() carries only Rust statements, so the marker is encoded beside the block payload and put
+        # back at its original index on parse.
+        blk = self._switch_head_block()
+        _, b1, _ = self._blocks()
+        g = networkx.DiGraph()
+        g.add_edge(blk, b1, type="transition")
+
+        back = parse_graph(pack_graph(g))
+        restored = next(n for n in back.nodes if n.addr == 0x1000)
+        assert len(restored.statements) == 2
+        head = restored.statements[1]
+        assert isinstance(head, IncompleteSwitchCaseHeadStatement)
+        assert head.idx == 7
+        assert head.tags["ins_addr"] == 0x1000
+        assert head.switch_variable == Const(11, 0x40, 32)
+        assert [(v, ta, ti, na) for _, v, ta, ti, na in head.case_addrs] == [
+            (1, 0x1100, None, 0x1200),
+            ("default", 0x1300, 4, None),
+        ]
+        assert [c.addr for c, *_ in head.case_addrs] == [0x2000, 0x2000]
+
+    def test_block_pool_separates_blocks_differing_only_in_python_statements(self):
+        # The pool deduplicates on the payload, and the marker is not in the payload; two blocks whose Rust
+        # statements are identical must not collapse into one entry.
+        pool = BlockPool()
+        g0 = networkx.DiGraph()
+        g0.add_node(self._switch_head_block(idx=7))
+        g1 = networkx.DiGraph()
+        g1.add_node(self._switch_head_block(idx=8))
+        m0 = pack_graph(g0, pool=pool)
+        m1 = pack_graph(g1, pool=pool)
+        assert m0.block_refs[0] != m1.block_refs[0]
+
+        back0 = parse_graph(m0, pool_payloads=pool.payloads)
+        back1 = parse_graph(m1, pool_payloads=pool.payloads)
+        assert next(iter(back0.nodes)).statements[1].idx == 7
+        assert next(iter(back1.nodes)).statements[1].idx == 8
+
+    def test_graph_rejects_unknown_python_statement(self):
+        # The encoder knows one Python-side statement. Anything else must still raise rather than be dropped.
+        class _Bogus:
+            pass
+
+        blk = AilBlock(0x1000, 4, statements=[_Bogus()])
+        g = networkx.DiGraph()
+        g.add_node(blk)
+        with self.assertRaises(TypeError):
+            pack_graph(g)
 
     def test_graph_rejects_unknown_edge_attr(self):
         b0, b1, _ = self._blocks()
@@ -349,6 +419,66 @@ class TestDecompilationCacheEndToEnd(unittest.TestCase):
         assert set(back.parameters.keys()) == set(cache.parameters.keys())
         assert len(back.parameters) == 15
 
+    def test_constant_below_min_data_addr_keeps_reference_values_typed(self):
+        # A Const that resolves to a global variable renders as a reference to that variable, unless its value is
+        # below min_data_addr, in which case it renders as the constant. __do_global_dtors_aux references a global
+        # at 0x600e38, so raising min_data_addr above it puts it on the second branch. min_data_addr became a
+        # codegen parameter in #5199, which is also where that branch came from.
+        func = self.proj.kb.functions.function(name="__do_global_dtors_aux")
+        dec = self.proj.analyses.Decompiler(func, cfg=self.cfg.model, generate_code=True)
+        codegen = self.proj.analyses.CStructuredCodeGenerator(
+            func,
+            dec.seq_node,
+            cfg=self.cfg.model,
+            ail_graph=dec.clinic.graph,
+            func_args=dec.clinic.arg_list,
+            variable_map=dec.clinic.variable_map,
+            externs=dec.clinic.externs,
+            min_data_addr=1 << 62,
+        )
+
+        constants = [elem.obj for _, elem in codegen.map_pos_to_node.items() if isinstance(elem.obj, CConstant)]
+        assert constants
+        for const in constants:
+            for key in const.reference_values or {}:
+                assert isinstance(key, SimType)
+
+        # reference_values is keyed by SimType, and the serializer interns every key as one
+        assert codegen.serialize()
+    def test_cache_with_incomplete_switch_case_head_roundtrips(self):
+        # dirname's main has a lowered switch that LoweredSwitchSimplifier reverts, so cc_graph -- the snapshot taken
+        # before structuring -- keeps the Python-side marker statement it leaves behind.
+        proj = angr.Project(os.path.join(test_location, "x86_64", "decompiler", "dirname"), auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True, data_references=True)
+        proj.analyses.CompleteCallingConventions(cfg=cfg.model, recover_variables=True, analyze_callsites=True)
+        func = proj.kb.functions.function(name="main")
+        dec = proj.analyses.Decompiler(func, cfg=cfg.model)
+
+        def heads(graph):
+            return [
+                stmt
+                for block in graph.nodes
+                for stmt in block.statements
+                if isinstance(stmt, IncompleteSwitchCaseHeadStatement)
+            ]
+
+        original = heads(dec.clinic.cc_graph)
+        assert original, "cc_graph carries no switch-case head; this test would pass without exercising anything"
+
+        back = DecompilationCache.parse(dec.cache.serialize(), project=proj, kb=proj.kb, function=func, cfg=cfg.model)
+        restored = heads(back.clinic.cc_graph)
+        assert len(restored) == len(original)
+        for before, after in zip(original, restored):
+            assert after.idx == before.idx
+            assert after.tags == before.tags
+            assert after.switch_variable == before.switch_variable
+            assert after.peephole_optimized == before.peephole_optimized
+            assert [(v, ta, ti, na) for _, v, ta, ti, na in after.case_addrs] == [
+                (v, ta, ti, na) for _, v, ta, ti, na in before.case_addrs
+            ]
+        assert back.clinic.cc_graph.number_of_nodes() == dec.clinic.cc_graph.number_of_nodes()
+        assert back.clinic.cc_graph.number_of_edges() == dec.clinic.cc_graph.number_of_edges()
+
     def test_cache_hit_on_deserialized_cache(self):
         cache = self.decompiler.cache
         blob = cache.serialize()
@@ -392,6 +522,16 @@ class TestDecompilationCacheEndToEnd(unittest.TestCase):
         d2 = proj.analyses.Decompiler(func, cfg=cfg.model, regen_clinic=True)
         assert d2.codegen is not d1.codegen
         assert d2.codegen.text == d1.codegen.text
+
+
+class FailingCodeGenerator(BaseStructuredCodeGenerator, Serializable):
+    """A code generator that advertises serialization support and then raises, as a buggy serializer would."""
+
+    def __init__(self):
+        super().__init__("pseudocode")
+
+    def serialize_to_cmessage(self):
+        raise ValueError("synthetic serialization failure")
 
 
 class TestSpillingDecompilationDict(unittest.TestCase):
@@ -458,6 +598,23 @@ class TestSpillingDecompilationDict(unittest.TestCase):
         assert dummy_key in d._unspillable
         assert d[dummy_key] is dummy_cache
         assert len(d) == 2
+
+    def test_failing_serializer_does_not_retain_the_cache(self):
+        d = SpillingDecompilationDict(self.proj.kb, cache_limit=1)
+        broken_key = (0xDEAD, "pseudocode")
+        broken_cache = DecompilationCache(0xDEAD)
+        broken_cache.codegen = FailingCodeGenerator()
+        d[broken_key] = broken_cache
+
+        # this code generator claims to support serialization, so a failure is a bug rather than a flavor that has
+        # nowhere to spill to: the entry is dropped instead of being held in memory for the rest of the session
+        main_key = (self.main_func.addr, "pseudocode")
+        d[main_key] = self.main_dec.cache
+        assert not d._unspillable
+        assert broken_key not in d
+        assert len(d) == 1
+        with self.assertRaises(KeyError):
+            _ = d[broken_key]
 
     def test_delete_and_discard(self):
         d = SpillingDecompilationDict(self.proj.kb, cache_limit=1)

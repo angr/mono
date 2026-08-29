@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import uuid
 import weakref
 from collections import defaultdict
@@ -21,8 +22,6 @@ from angr.knowledge_plugins.plugin import KnowledgeBasePlugin
 
 if TYPE_CHECKING:
     from angr.knowledge_base import KnowledgeBase
-
-RTDB_BASEDIR: str | None = os.environ.get("RTDB_BASE")
 
 # Name of the pin file inside each rtdb directory. Every process (and every RuntimeDb instance) that opens the
 # directory holds a shared flock on this file; the process that acquires an exclusive lock during cleanup is the
@@ -107,6 +106,46 @@ def _is_windows_appcontainer() -> bool:
         kernel32.CloseHandle(token)
 
 
+class TrackedTransaction:
+    """
+    An LMDB transaction that keeps the owning :class:`RuntimeDb` informed of how many transactions are open, so that
+    the environment is never remapped underneath one.
+
+    ``mdb_env_set_mapsize()`` unmaps and remaps the whole environment, and it only refuses to run while a write
+    transaction is open. Read transactions are the caller's responsibility: a cursor positioned inside one, and a
+    view handed out by a ``buffers=True`` transaction, both point into the old mapping and dangle after the remap.
+
+    The transaction is opened by ``__enter__`` rather than by :meth:`RuntimeDb.begin_txn`, so that it is counted for
+    exactly as long as it exists.
+    """
+
+    __slots__ = ("_db", "_env", "_rtdb", "_txn", "_write")
+
+    def __init__(self, rtdb: RuntimeDb, env: lmdb.Environment, db: Any, write: bool):
+        self._db = db
+        self._env = env
+        self._rtdb = rtdb
+        self._txn: lmdb.Transaction | None = None
+        self._write = write
+
+    def __enter__(self) -> lmdb.Transaction:
+        self._rtdb._transaction_opened()
+        try:
+            self._txn = self._env.begin(db=self._db, write=self._write)
+        except BaseException:
+            self._rtdb._transaction_closed()
+            raise
+        return self._txn.__enter__()
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool | None:
+        assert self._txn is not None
+        try:
+            return self._txn.__exit__(exc_type, exc_value, traceback)
+        finally:
+            self._txn = None
+            self._rtdb._transaction_closed()
+
+
 class RuntimeDbForkCondom:
     """
     A class that invokes RuntimeDb.reopen_lmdb() upon forking. This is necessary to ensure that lmdb does not raise
@@ -143,6 +182,8 @@ class RuntimeDb(KnowledgeBasePlugin):
         self._dbs: dict[str, Any] = {}
         self._condom = RuntimeDbForkCondom(self)
         self._pin_fd: int | None = None
+        self._open_txns: int = 0
+        self._open_txns_lock = threading.Lock()
         _live_rtdbs[next(_rtdb_counter)] = self
 
     def __del__(self):
@@ -155,11 +196,21 @@ class RuntimeDb(KnowledgeBasePlugin):
         # - _condom, which holds a weakref.proxy and a registered fork callback
         # - _lmdb_path, which is the path for the currently opened LMDB
         # - _pin_fd, which is a process-local file descriptor
+        # - _open_txns and _open_txns_lock, which describe transactions of the environment we are dropping
         #
         # Spilling dicts flush their data to memory before pickling, so dropping the
         # live LMDB state is safe: a fresh environment will be created lazily on next use.
         state = self.__dict__.copy()
-        for key in ("_lmdb_env", "_dbs", "_dbnames", "_condom", "_lmdb_path", "_pin_fd"):
+        for key in (
+            "_lmdb_env",
+            "_dbs",
+            "_dbnames",
+            "_condom",
+            "_lmdb_path",
+            "_pin_fd",
+            "_open_txns",
+            "_open_txns_lock",
+        ):
             state.pop(key, None)
         return state
 
@@ -171,6 +222,8 @@ class RuntimeDb(KnowledgeBasePlugin):
         self._dbnames = defaultdict(int)
         self._condom = RuntimeDbForkCondom(self)
         self._pin_fd = None
+        self._open_txns = 0
+        self._open_txns_lock = threading.Lock()
         _live_rtdbs[next(_rtdb_counter)] = self
 
     def _init_lmdb(self):
@@ -196,9 +249,15 @@ class RuntimeDb(KnowledgeBasePlugin):
         main_binary_path = self._kb._project.loader.main_object.binary
         basename = os.path.basename(main_binary_path) if isinstance(main_binary_path, str) else "angr_proj"
 
-        basedir = None
-        if RTDB_BASEDIR is not None:
-            basedir = RTDB_BASEDIR
+        basedir = os.environ.get("RTDB_BASE")
+        if basedir is not None:
+            try:
+                os.makedirs(basedir, exist_ok=True)
+            except OSError as ex:
+                l.error("The directory %s cannot be created: %s. Falling back.", basedir, ex)
+                basedir = None
+
+        if basedir is not None:
             if not os.access(basedir, os.W_OK):
                 l.error("The directory %s is not writable. Falling back.", basedir)
                 basedir = None
@@ -355,12 +414,24 @@ class RuntimeDb(KnowledgeBasePlugin):
         """
         Increase the LMDB map size.
 
+        Every transaction must be closed first, because ``Environment.set_mapsize()`` unmaps and remaps the
+        environment. Callers therefore have to grow the map from outside the transaction that raised
+        ``lmdb.MapFullError``, and retry, rather than from inside it.
+
         Note that the old database handle *may* no longer be valid after a map size increase. rhelmot could reproduce
         the error "Database handle belongs to another environment." in nix + CPython 3.13.13. Reopening all databases
         after increasing LMDB map size solves this issue.
         """
         if self._lmdb_env is None:
             return
+
+        with self._open_txns_lock:
+            open_txns = self._open_txns
+        if open_txns:
+            raise AngrRuntimeDbError(
+                f"Cannot increase the LMDB map size: {open_txns} transaction(s) are still open. Remapping the "
+                f"environment invalidates everything an open transaction holds into the old mapping."
+            )
 
         delta = min(self._lmdb_mapsize, 1024 * 1024 * 256)
         l.debug("Increasing LMDB map size by %d bytes", delta)
@@ -381,6 +452,12 @@ class RuntimeDb(KnowledgeBasePlugin):
             self._lmdb_env.close()
             self._lmdb_env = None
 
+        # Transactions counted against the closed environment can never be closed against the new one. The most
+        # common way to get here is a fork, where the child inherits the count of every thread that did not come
+        # along with it.
+        with self._open_txns_lock:
+            self._open_txns = 0
+
         self._init_lmdb()
         self.reopen_lmdb_databases()
 
@@ -400,16 +477,28 @@ class RuntimeDb(KnowledgeBasePlugin):
         self._dbs[db_name] = db
         return db_name
 
-    def begin_txn(self, db_name: str, write: bool = False):
+    def begin_txn(self, db_name: str, write: bool = False) -> TrackedTransaction:
+        """
+        Return a context manager that holds a transaction on a sub-database open for the duration of its body. The
+        environment cannot be remapped while it is open.
+        """
         db = self._dbs[db_name]
         assert self._lmdb_env is not None
-        return self._lmdb_env.begin(db=db, write=write)
+        return TrackedTransaction(self, self._lmdb_env, db, write)
+
+    def _transaction_opened(self) -> None:
+        with self._open_txns_lock:
+            self._open_txns += 1
+
+    def _transaction_closed(self) -> None:
+        with self._open_txns_lock:
+            self._open_txns -= 1
 
     def drop_db(self, db_name: str) -> None:
         db = self._dbs[db_name]
         if self._lmdb_env is None:
             return
-        with self._lmdb_env.begin(write=True) as txn:
+        with TrackedTransaction(self, self._lmdb_env, db=None, write=True) as txn:
             txn.drop(db)
         del self._dbs[db_name]
 

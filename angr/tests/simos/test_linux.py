@@ -11,6 +11,7 @@ import archinfo
 
 import angr
 from angr.errors import SimMemoryError
+from angr.simos import SimLinux
 from tests.common import bin_location
 
 test_location = os.path.join(bin_location, "tests")
@@ -54,6 +55,34 @@ class TestSimLinuxStateBlank(unittest.TestCase):
         # pre-allocated stack pages are not backed by the loader, so clamping the pre-grow to the room that does
         # exist would hide the image behind blank pages
         assert state.solver.eval(state.memory.load(0x1000, 4, endness=archinfo.Endness.BE)) == 0x7F454C46
+
+
+class TestSimLinuxMipsN32(unittest.TestCase):
+    """
+    MIPS n32 keeps the 64-bit MIPS register file behind 32-bit pointers, and SimLinux keys several
+    decisions on the architecture name rather than on its class.
+    """
+
+    binaries = os.path.join(test_location, "mipsn32")
+
+    def test_state_call_places_arguments_and_t9(self):
+        # A big-endian n32 target is where a slot width taken from the pointer size shows: the
+        # argument goes into the top half of a0, the half the callee reads as sign extension.
+        for name in ("n32_be_static", "n32_el_dynamic"):
+            project = angr.Project(os.path.join(self.binaries, name), auto_load_libs=False)
+            assert project.arch.name == "MIPSN32", name
+            state = project.factory.call_state(project.entry, 1, 2)
+            assert state.solver.eval(state.regs.a0) == 1, name
+            assert state.solver.eval(state.regs.a1) == 2, name
+            # MIPS PIC calls arrive with the callee address in t9 and read the global pointer out
+            # of it; a symbolic t9 makes every gp-relative load unresolvable.
+            assert state.solver.eval(state.regs.t9) == project.entry, name
+
+    def test_syscall_abi_is_configured(self):
+        project = angr.Project(os.path.join(self.binaries, "n32_be_static"), auto_load_libs=False)
+        simos = project.simos
+        assert isinstance(simos, SimLinux)
+        assert "mips-n32" in simos.syscall_abis
 
 
 if __name__ == "__main__":

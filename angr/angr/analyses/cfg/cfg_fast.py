@@ -7,7 +7,7 @@ import math
 import re
 import string
 import time
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from enum import Enum, unique
 from typing import TYPE_CHECKING, Any
 
@@ -30,6 +30,7 @@ from angr.codenode import FuncNode, HookNode
 from angr.errors import (
     AngrCFGError,
     AngrSkipJobNotice,
+    AngrUnsupportedSyscallError,
     SimEngineError,
     SimIRSBNoDecodeError,
     SimMemoryError,
@@ -47,6 +48,8 @@ from angr.knowledge_plugins.cfg import (
 from angr.knowledge_plugins.cfg.spilling_cfg import block_key_to_addr, block_key_to_size, get_block_key
 from angr.knowledge_plugins.xrefs import XRef, XRefType
 from angr.misc.ux import once
+from angr.procedures.stubs.PathTerminator import PathTerminator
+from angr.procedures.stubs.UnresolvableJumpTarget import UnresolvableJumpTarget
 from angr.rustylib import SegmentList
 from angr.simos import SimWindows
 from angr.utils.constants import DEFAULT_STATEMENT
@@ -79,6 +82,7 @@ if TYPE_CHECKING:
     from angr.engines.pcode.lifter import IRSB as PcodeIRSB
     from angr.knowledge_plugins.cfg.spilling_cfg import SpillingCFG
     from angr.knowledge_plugins.cfg.types import CFGNODE_K
+    from angr.knowledge_plugins.functions.function import Function
 
 
 VEX_IRSB_MAX_SIZE = 400
@@ -646,7 +650,7 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         exceptions=True,
         skip_unmapped_addrs=True,
         nodecode_window_size=2048,
-        nodecode_threshold=0.6,
+        nodecode_threshold=0.3,
         nodecode_step=16483,
         check_funcret_max_job=500,
         indirect_calls_always_return: bool | None = None,
@@ -760,6 +764,8 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
             force_smart_scan = not is_dotnet
             if is_dotnet and once("dotnet_native"):
                 l.warning("You're trying to analyze a .NET binary as native code. Are you sure?")
+
+        self._model_was_provided = model is not None
 
         CFGBase.__init__(
             self,
@@ -1132,11 +1138,13 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
             else:
                 inside_region = addr < region_end
             if not inside_region:
+                is_sz = False
                 break
 
             # l.debug("Searching address %x", addr)
             val = self._load_a_byte_as_int(addr)
             if val is None:
+                is_sz = False
                 break
             if val == 0:
                 break
@@ -1178,14 +1186,17 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
             else:
                 inside_region = addr < region_end
             if not inside_region:
+                is_sz = False
                 break
 
             # l.debug("Searching address %x", addr)
             val0 = self._load_a_byte_as_int(addr)
             if val0 is None:
+                is_sz = False
                 break
             val1 = self._load_a_byte_as_int(addr + 1)
             if val1 is None:
+                is_sz = False
                 break
             if val0 == 0 and val1 == 0:
                 break
@@ -1635,6 +1646,16 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         # Call _initialize_cfg() before self.functions is used.
         self._initialize_cfg()
 
+        # A fresh CFG model must not be recovered into function graphs left over from a different model. In
+        # particular, a normalized graph may contain artificial splits of overlapping instruction streams that a
+        # lifter cannot reproduce. Retain function metadata and known starts, but rebuild all structural data from
+        # this model.
+        if not self._model_was_provided:
+            self.functions.callgraph.clear_edges()
+            for function in self.functions.values():
+                function._clear_transition_graph()  # pylint: disable=protected-access
+                self.functions.set_func_block_count(function.addr, 0)
+
         # Scan for __x86_return_thunk and friends
         self._known_thunks = self._find_thunks()
 
@@ -1922,16 +1943,23 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         elif self.project.arch.name == "X86":
             func_block_count = self.kb.functions.get_func_block_count(func_addr)
 
-            # determine if the function is __alloca_probe
-            if func_block_count == 4:
+            # determine if the function is a known Windows stack probe. Match the complete basic-block byte set,
+            # rather than a symbol name, since these helpers are just as important in stripped binaries.
+            if func_block_count in {3, 4}:
                 func = self.kb.functions.get_by_addr(func_addr)  # must exist
                 block_bytes = {func.get_block(block_addr).bytes for block_addr in func.block_addrs_set}
-                if block_bytes == {
+                is_msvc_alloca_probe = block_bytes == {
                     b"-\x00\x10\x00\x00\x85\x00\xeb\xe9",
                     b";\xc8r\n",
                     b"Q\x8dL$\x04+\xc8\x1b\xc0\xf7\xd0#\xc8\x8b\xc4%\x00\xf0\xff\xff;\xc8r\n",
                     b"\x8b\xc1Y\x94\x8b\x00\x89\x04$\xc3",
-                }:
+                }
+                is_mingw_chkstk_ms = block_bytes == {
+                    b"QP=\x00\x10\x00\x00\x8dL$\x0cr\x15",
+                    b"\x81\xe9\x00\x10\x00\x00\x83\t\x00-\x00\x10\x00\x00=\x00\x10\x00\x00w\xeb",
+                    b")\xc1\x83\t\x00XY\xc3",
+                }
+                if is_msvc_alloca_probe or is_mingw_chkstk_ms:
                     func.info["is_alloca_probe"] = True
                     self.kb.functions.add_key_func_addr("alloca_probe", func_addr)
 
@@ -2602,6 +2630,8 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         self.make_functions()
         self._calculate_progress_and_notify(skip_percentage=True)
 
+        # ahead of the loop below, which reads nonreturning_func_addrs() to strip the fall-through edges
+        self._revise_returning_of_functions_that_cannot_return()
         self._analyze_all_function_features(all_funcs_completed=True)
 
         # Scan all functions, and make sure all fake ret edges are either confirmed or removed
@@ -3052,6 +3082,7 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                 addr_ = new_exit["address"]
                 jumpkind = new_exit["jumpkind"]
                 namehint = new_exit.get("namehint", None)
+                prototype_hint = new_exit.get("prototype_hint", None)
                 if isinstance(addr_, claripy.ast.BV) and not addr_.symbolic:  # pylint:disable=isinstance-second-argument-not-valid-type
                     addr_ = addr_.concrete_value
                 if not isinstance(addr_, int):
@@ -3073,6 +3104,10 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                 if namehint and (addr_ not in self.kb.labels or self.kb.labels[addr_] == "_ftext"):
                     unique_label = self.kb.labels.get_unique_label(namehint)
                     self.kb.labels[addr_] = unique_label
+                if isinstance(prototype_hint, str):
+                    target_func = self.kb.functions.function(addr=addr_, create=True)
+                    assert target_func is not None
+                    target_func.info["prototype_hint"] = prototype_hint
 
         # determine if this procedure returns
         # whether this procedure returns or not depends on the context
@@ -3210,9 +3245,10 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         # default statement
         default_branch_ins_addr = None
         if irsb.instruction_addresses:
-            if self.project.arch.branch_delay_slot:
-                if len(irsb.instruction_addresses) > 1:
-                    default_branch_ins_addr = irsb.instruction_addresses[-2]
+            if self.project.arch.branch_delay_slot and len(irsb.instruction_addresses) > 1:
+                # the last instruction is the delay slot, so the branch is the one before it. a
+                # single-instruction block has no delay slot and is its own branch.
+                default_branch_ins_addr = irsb.instruction_addresses[-2]
             else:
                 default_branch_ins_addr = irsb.instruction_addresses[-1]
 
@@ -3340,7 +3376,7 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
 
         if target_addr is None:
             # The target address is not a concrete value
-            assert irsb is not None and ins_addr is not None and stmt_idx is not None
+            assert irsb is not None and stmt_idx is not None
 
             if jumpkind == "Ijk_Ret":
                 # This block ends with a return instruction.
@@ -3356,6 +3392,7 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                 jumpkind in ("Ijk_Boring", "Ijk_Call", "Ijk_InvalICache") or jumpkind.startswith("Ijk_Sys")
             ):
                 # This is an indirect jump. Try to resolve it.
+                assert ins_addr is not None
                 # fast path: the target may have been constant-folded from a read-only region at lift time
                 # (e.g. an AMD64 PE IAT slot); consuming it here avoids re-lifting the block and running the
                 # indirect jump resolvers
@@ -4765,9 +4802,13 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                 # TODO: Handle Ijk_Privileged in user-space binaries
                 # TODO: Include conditional jumps that jump to data
 
+        shared_block_addrs = self._blocks_owned_by_other_functions(full_funcs_to_remove)
+
         for func_addr in full_funcs_to_remove:
             func = self.kb.functions.get_by_addr(func_addr, meta_only=True)
             for block_addr in list(func.block_addrs_set):
+                if block_addr in shared_block_addrs:
+                    continue
                 cfg_node = self.model.get_any_node(block_addr)
                 if cfg_node is not None:
                     # mark all blocks as data
@@ -4782,6 +4823,35 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                 self.model.remove_node_and_graph_node(cfg_node)
             if self.kb.functions.contains_addr(node_addr):
                 del self.kb.functions[func_addr]
+
+    def _blocks_owned_by_other_functions(self, func_addrs_to_remove: list[int]) -> set[int]:
+        """
+        Collect the blocks of the given functions that a function outside that set also owns.
+
+        :param func_addrs_to_remove: Addresses of the functions that are about to be removed.
+        :return:                     Addresses of those blocks that a function outside the set also owns.
+        """
+
+        if not func_addrs_to_remove:
+            return set()
+
+        removed_func_addrs = set(func_addrs_to_remove)
+        unclaimed_block_addrs: set[int] = set()
+        for func_addr in removed_func_addrs:
+            unclaimed_block_addrs |= self.kb.functions.get_by_addr(func_addr, meta_only=True).block_addrs_set
+
+        shared_block_addrs: set[int] = set()
+        for func_addr in self.kb.functions:
+            if func_addr in removed_func_addrs:
+                continue
+            func = self.kb.functions.get_by_addr(func_addr, meta_only=True)
+            shared = unclaimed_block_addrs & func.block_addrs_set
+            if shared:
+                shared_block_addrs |= shared
+                unclaimed_block_addrs -= shared
+                if not unclaimed_block_addrs:
+                    break
+        return shared_block_addrs
 
     def _analyze_all_function_features(self, all_funcs_completed=False):
         """
@@ -4838,6 +4908,99 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                             self._updated_nonreturning_functions.add(fr.caller_func_addr)
 
                     del self._function_returns[nonreturning_function_addr]
+
+    def _revise_returning_of_functions_that_cannot_return(self):
+        """
+        Correct a returning status that the rebuilt functions no longer support.
+
+        Function.returning is only ever set while the CFG is recovered and never revised, and
+        make_functions() copies a recorded True onto the rebuilt function. That True can come from
+        a block the rebuild has just taken away: the fall-through of a call to a function that does
+        not return carries its blocks, and any ret among them, into another function. What is left
+        owns no return site at all and still claims to return, and _analyze_function_features()
+        skips it from then on because its status is no longer unknown.
+
+        Decide the correction from the procedures that declare NO_RET, not from the returning
+        status of the callee. That status is False both for a callee that cannot come back and for
+        one whose exit was never recovered -- an ARM function that tail-jumps into the unmapped
+        kuser helper page, say -- and a function angr failed to find the exit of is not evidence
+        that its callers do not return.
+        """
+
+        functions = self.functions
+        cannot_return: set[int] = {
+            func_addr for func_addr in functions.function_addrs_set if self._declares_no_ret(func_addr)
+        }
+        worklist: deque[int] = deque(cannot_return)
+
+        while worklist:
+            callee_addr = worklist.popleft()
+            if callee_addr not in functions.callgraph:
+                continue
+            for caller_addr in functions.callgraph.predecessors(callee_addr):
+                if caller_addr in cannot_return or not functions.contains_addr(caller_addr):
+                    continue
+                # most callers of a function that never returns keep a ret of their own; settle those from the
+                # metadata rather than deserializing the whole function and evicting a live one to make room
+                meta = functions.get_by_addr(caller_addr, meta_only=True)
+                if meta.is_simprocedure or meta.has_return or not meta.block_addrs_set:
+                    continue
+                caller = functions.get_by_addr(caller_addr)
+                if not self._all_ways_out_cannot_return(caller, cannot_return):
+                    continue
+                cannot_return.add(caller_addr)
+                worklist.append(caller_addr)
+                if caller.returning is True:
+                    caller.returning = False
+
+    def _declares_no_ret(self, func_addr: int) -> bool:
+        """
+        Does a procedure that stands in for ``func_addr`` declare that it never returns?
+
+        UnresolvableJumpTarget and PathTerminator carry NO_RET to stop exploration and say that
+        angr does not know where control went, not that it cannot come back;
+        _determine_function_returning() leaves UnresolvableJumpTarget out for the same reason.
+        """
+
+        if self.project.is_hooked(func_addr):
+            procedure = self.project.hooked_by(func_addr)
+        else:
+            try:
+                procedure = self.project.simos.syscall_from_addr(func_addr, allow_unsupported=False)
+            except AngrUnsupportedSyscallError:
+                procedure = None
+        if procedure is None or not procedure.NO_RET:
+            return False
+        return not isinstance(procedure, (UnresolvableJumpTarget, PathTerminator))
+
+    def _all_ways_out_cannot_return(self, func: Function, cannot_return: set[int]) -> bool:
+        """
+        Does every way out of ``func`` hand control to a function in ``cannot_return``?
+
+        Read the ways out of the transition graph rather than from Function.endpoints, which does
+        not hold the calls yet: mark_nonreturning_calls_endpoints() adds those only once every
+        returning status is settled, which is what this is deciding. A call is a way out exactly
+        when the rebuild left it without a fall-through, which is how make_functions() records a
+        callee that does not come back; a fall-through the rebuild put in another function is a
+        way out as well, since what happens after it is that function's business.
+        """
+
+        graph = func.transition_graph
+        edges = list(graph.edges(data=True))
+        with_fallthrough = {src for src, _, data in edges if data.get("type") == "fake_return"}
+        ways_out = []
+        for src, dst, data in edges:
+            type_ = data.get("type")
+            if type_ in ("call", "syscall"):
+                if src not in with_fallthrough:
+                    ways_out.append(dst.addr)
+            elif data.get("outside") and type_ in ("transition", "fake_return"):
+                # a tail jump, or a call whose fall-through the rebuild put in another function
+                ways_out.append(dst.addr)
+        if not ways_out:
+            # nothing leaves the function, so angr never found its exit. That is not evidence.
+            return False
+        return all(addr in cannot_return for addr in ways_out)
 
     def _pop_pending_job(self, returning=True) -> CFGJob | None:
         while self._pending_jobs:
@@ -5699,9 +5862,10 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                     except SimTranslationError:
                         nodecode = True
 
-                    irsb_string = lifted_block.bytes[: irsb.size] if irsb is not None else lifted_block.bytes
+                    lifted_block_bytes = lifted_block.bytes if lifted_block.bytes is not None else b""
+                    irsb_string = lifted_block_bytes[: irsb.size] if irsb is not None else lifted_block_bytes
 
-                    if not (nodecode or irsb.size == 0 or irsb.jumpkind == "Ijk_NoDecode"):
+                    if not (nodecode or irsb is None or irsb.size == 0 or irsb.jumpkind == "Ijk_NoDecode"):
                         # it is decodeable
                         if current_function_addr == addr:
                             current_function_addr = addr_0
@@ -5774,18 +5938,11 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                     # VEX supports ud2 and make it part of the block size, only in AMD64.
                     valid_ins = True
                     nodecode_size = 0
-                elif (
-                    lifted_block is not None
-                    and is_x86_x64_arch
-                    and lifted_block.bytes is not None
-                    and len(lifted_block.bytes) - irsb_size > 2
-                    and lifted_block.bytes[irsb_size : irsb_size + 2]
-                    in {
-                        b"\x0f\xff",  # ud0
-                        b"\x0f\xb9",  # ud1
-                        b"\x0f\x0b",  # ud2
-                    }
-                ):
+                elif is_x86_x64_arch and self._fast_memory_load_bytes(real_addr + irsb_size, 2) in {
+                    b"\x0f\xff",  # ud0
+                    b"\x0f\xb9",  # ud1
+                    b"\x0f\x0b",  # ud2
+                }:
                     # ud0, ud1, and ud2 are actually valid instructions.
                     valid_ins = True
                     # VEX does not support ud0 or ud1 or ud2 under AMD64. they are not part of the block size.
@@ -5851,6 +6008,11 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                 self._seg_list.occupy(real_addr, irsb_size, "code")
                 if nodecode_size > 0:
                     self._seg_list.occupy(real_addr + irsb_size, nodecode_size, "nodecode")
+
+                if irsb_size == 0:
+                    # the undefined instruction is the whole block, so there is nothing to turn into a node.
+                    # its extent is recorded above, which is what keeps the scan from restarting inside it.
+                    return None, None, None, None
 
             if (
                 irsb is not None

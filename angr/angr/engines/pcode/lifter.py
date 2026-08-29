@@ -15,11 +15,12 @@ import cle
 import pypcode
 from archinfo import ArchARM, ArchPcode
 from cachetools import LRUCache
+from pyvex.const import vex_int_class
 
 # FIXME: Reusing these errors from pyvex for compatibility. Eventually these
 # should be refactored to use common error classes.
 from pyvex.errors import LiftingException, PyVEXError, SkipStatementsError
-from pyvex.expr import U8, U16, U32, U64, Const, IRExpr
+from pyvex.expr import Const, IRExpr
 
 from angr import sim_options as o
 from angr.block import DisassemblerBlock, DisassemblerInsn
@@ -33,6 +34,8 @@ from .behavior import BehaviorFactory
 
 if TYPE_CHECKING:
     from pypcode import Context, PcodeOp
+
+    from angr.project import Project
 
 
 l = logging.getLogger(__name__)
@@ -113,6 +116,7 @@ class IRSB:
     __slots__ = (
         "_direct_next",
         "_disassembly",
+        "_disassembly_source",
         "_exit_statements",
         "_instruction_addresses",
         "_ops",
@@ -135,6 +139,7 @@ class IRSB:
     _size: int | None
     _statements: Iterable  # Note: currently unused
     _disassembly: PcodeDisassemblerBlock | None
+    _disassembly_source: tuple[PcodeBasicBlockLifter, bytes] | None
     addr: int
     arch: archinfo.Arch
     behaviors: BehaviorFactory | None
@@ -211,6 +216,7 @@ class IRSB:
         self.jumpkind = None
         self.next = None
         self._disassembly = None
+        self._disassembly_source = None
 
         if data is not None:
             # This is the slower path (because we need to call _from_py() to copy the content in the returned IRSB to
@@ -287,6 +293,7 @@ class IRSB:
         )
 
         self._disassembly = None
+        self._disassembly_source = None
         return self
 
     def invalidate_direct_next(self) -> None:
@@ -474,7 +481,7 @@ class IRSB:
         # pylint: disable=unused-argument
         self._statements = statements if statements is not None else []
         if isinstance(nxt, int):
-            const_cls = {8: U8, 16: U16, 32: U32, 64: U64}[self.arch.bits]
+            const_cls = vex_int_class(self.arch.bits)
             self.next = Const(const_cls(nxt))
         else:
             self.next = nxt
@@ -509,7 +516,15 @@ class IRSB:
         # return self._statements
 
     @property
-    def disassembly(self) -> PcodeDisassemblerBlock:
+    def disassembly(self) -> PcodeDisassemblerBlock | None:
+        if self._disassembly is None and self._disassembly_source is not None:
+            block_lifter, data = self._disassembly_source
+            self._disassembly_source = None
+            try:
+                self._disassembly = block_lifter.disassemble(self.addr, data)
+            except (pypcode.BadDataError, pypcode.UnimplError, pypcode.LowlevelError):
+                # A block that will not decode simply has no disassembly. This property does not raise.
+                l.debug("Failed to disassemble block at %#x", self.addr)
         return self._disassembly
 
 
@@ -647,6 +662,7 @@ def lift(
     inner: bool = False,
     skip_stmts: bool = False,
     collect_data_refs: bool = False,
+    block_lifter: PcodeBasicBlockLifter | None = None,
 ) -> IRSB:
     """
     Lift machine code in `data` to a P-code IRSB.
@@ -663,6 +679,8 @@ def lift(
     :param bytes_offset:    The offset into `data` to start lifting at.
     :param opt_level:       Unused by P-Code lifter
     :param traceflags:      Unused by P-Code lifter
+    :param block_lifter:    The basic block lifter, and therefore the Sleigh context, to decode with. A private one is
+                            created when it is not given.
 
     .. note:: Explicitly specifying the number of instructions to lift (`max_inst`) may not always work
               exactly as expected. For example, on MIPS, it is meaningless to lift a branch or jump
@@ -703,9 +721,12 @@ def lift(
         allow_arch_optimizations = False
         opt_level = 0
 
+    if block_lifter is None:
+        block_lifter = PcodeBasicBlockLifter(arch)
+
     u_data = data
     try:
-        final_irsb = PcodeLifter(arch, addr)._lift(
+        final_irsb = PcodeLifter(arch, addr, block_lifter)._lift(
             u_data,
             bytes_offset,
             max_bytes,
@@ -719,7 +740,7 @@ def lift(
         )
     except SkipStatementsError:
         assert skip_stmts is True
-        final_irsb = PcodeLifter(arch, addr)._lift(
+        final_irsb = PcodeLifter(arch, addr, block_lifter)._lift(
             u_data,
             bytes_offset,
             max_bytes,
@@ -778,6 +799,7 @@ def lift(
                 strict_block_end=strict_block_end,
                 skip_stmts=False,
                 collect_data_refs=collect_data_refs,
+                block_lifter=block_lifter,
             )
 
         next_addr = addr + final_irsb.size
@@ -800,6 +822,7 @@ def lift(
                 inner=True,
                 skip_stmts=False,
                 collect_data_refs=collect_data_refs,
+                block_lifter=block_lifter,
             )
             if more_irsb.size:
                 # Successfully decoded more bytes
@@ -808,7 +831,7 @@ def lift(
             # We have no more bytes left. Mark the jumpkind of the IRSB as Ijk_Boring
             if final_irsb.size > 0 and final_irsb.jumpkind == "Ijk_NoDecode":
                 final_irsb.jumpkind = "Ijk_Boring"
-                const_cls = {8: U8, 16: U16, 32: U32, 64: U64}[arch.bits]
+                const_cls = vex_int_class(arch.bits)
                 final_irsb.next = Const(const_cls(final_irsb.addr + final_irsb.size))
 
     return final_irsb
@@ -817,12 +840,17 @@ def lift(
 class PcodeBasicBlockLifter:
     """
     Lifts basic blocks to P-code
+
+    Sleigh records context variables per address, so an instance must stay with one binary. See
+    :func:`get_block_lifter`.
     """
 
+    arch: archinfo.Arch
     context: Context
     behaviors: BehaviorFactory
 
     def __init__(self, arch: archinfo.Arch):
+        self.arch = arch
         if isinstance(arch, ArchPcode):
             langid = arch.name
         else:
@@ -837,8 +865,24 @@ class PcodeBasicBlockLifter:
                 raise NotImplementedError
             langid = archinfo_to_lang_map[arch.name]
 
+        self.arch = arch
         self.context = pypcode.Context(langid)
         self.behaviors = BehaviorFactory()
+
+    def disassemble(self, addr: int, data: bytes) -> PcodeDisassemblerBlock:
+        """
+        Disassemble the instructions of a single block.
+
+        :param addr: The address the block starts at.
+        :param data: The bytes of the block, exactly as they were lifted.
+        """
+        disasm = self.context.disassemble(data, addr, max_instructions=MAX_INSTRUCTIONS, max_bytes=len(data))
+        return PcodeDisassemblerBlock(
+            addr=addr,
+            insns=[PcodeDisassemblerInsn(ins) for ins in disasm.instructions],
+            thumb=False,
+            arch=self.arch,
+        )
 
     def lift(
         self,
@@ -932,19 +976,9 @@ class PcodeBasicBlockLifter:
                 elif op.opcode == pypcode.OpCode.RETURN and next_block is None:
                     next_block = (None, "Ijk_Ret")
 
-            # FIXME: Do this lazily
-            disasm = self.context.disassemble(
-                sliced_data,
-                irsb.addr,
-                max_instructions=max_inst,
-                max_bytes=fallthru_addr - irsb.addr,
-            )
-            irsb._disassembly = PcodeDisassemblerBlock(
-                addr=irsb.addr,
-                insns=[PcodeDisassemblerInsn(ins) for ins in disasm.instructions],
-                thumb=False,
-                arch=irsb.arch,
-            )
+            # Keep what IRSB.disassembly needs to run Sleigh over the block on demand
+            if fallthru_addr > irsb.addr:
+                irsb._disassembly_source = (self, sliced_data[: fallthru_addr - irsb.addr])
 
         except (pypcode.BadDataError, pypcode.UnimplError):
             next_block = (fallthru_addr, "Ijk_NoDecode")
@@ -958,9 +992,20 @@ class PcodeBasicBlockLifter:
             next_block = (fallthru_addr, "Ijk_Boring")
 
         irsb._size = fallthru_addr - irsb.addr
-        const_cls = {8: U8, 16: U16, 32: U32, 64: U64}[irsb.arch.bits]
+        const_cls = vex_int_class(irsb.arch.bits)
         irsb.next = Const(const_cls(next_block[0])) if next_block[0] is not None else None
         irsb.jumpkind = next_block[1]
+
+
+def get_block_lifter(project: Project | None, arch: archinfo.Arch) -> PcodeBasicBlockLifter:
+    """
+    Get the basic block lifter, and therefore the Sleigh context, that `project` decodes `arch` with.
+
+    Lifting with no project at all gets a context of its own. See :meth:`angr.project.Project.pcode_block_lifter`.
+    """
+    if project is None:
+        return PcodeBasicBlockLifter(arch)
+    return project.pcode_block_lifter(arch)
 
 
 class PcodeLifter(Lifter):
@@ -968,16 +1013,16 @@ class PcodeLifter(Lifter):
     Handles calling into pypcode to lift a block
     """
 
-    _lifter_cache = {}
+    __slots__ = ("block_lifter",)
 
-    @classmethod
-    def get_lifter(cls, arch):
-        if arch not in PcodeLifter._lifter_cache:
-            PcodeLifter._lifter_cache[arch] = PcodeBasicBlockLifter(arch)
-        return PcodeLifter._lifter_cache[arch]
+    block_lifter: PcodeBasicBlockLifter
+
+    def __init__(self, arch: archinfo.Arch, addr: int, block_lifter: PcodeBasicBlockLifter):
+        super().__init__(arch, addr)
+        self.block_lifter = block_lifter
 
     def lift(self) -> None:
-        self.get_lifter(self.arch).lift(
+        self.block_lifter.lift(
             self.irsb,
             self.addr,
             self.data,
@@ -1002,7 +1047,7 @@ class PcodeLifterEngineMixin(SimEngine):
         self,
         project=None,
         use_cache: bool | None = None,
-        cache_size: int = 50000,
+        cache_size: int = 5000,
         default_opt_level: int = 1,
         selfmodifying_code: bool | None = None,
         single_step: bool = False,
@@ -1149,6 +1194,7 @@ class PcodeLifterEngineMixin(SimEngine):
             raise ValueError("Must provide state or addr!")
         if arch is None:
             arch = clemory._arch if clemory else state.arch
+        assert arch is not None
         if arch.name.startswith("MIPS") and self._single_step:
             l.error("Cannot specify single-stepping on MIPS.")
             self._single_step = False
@@ -1278,6 +1324,7 @@ class PcodeLifterEngineMixin(SimEngine):
                     strict_block_end=strict_block_end,
                     skip_stmts=skip_stmts,
                     collect_data_refs=collect_data_refs,
+                    block_lifter=get_block_lifter(self.project, arch),
                 )
 
                 if subphase == 0 and irsb.statements is not None:

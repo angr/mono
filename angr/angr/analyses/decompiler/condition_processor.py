@@ -26,6 +26,7 @@ from .structurer_nodes import (
     ConditionNode,
     ContinueNode,
     EmptyBlockNotice,
+    IncompleteSwitchCaseHeadStatement,
     IncompleteSwitchCaseNode,
     LoopNode,
     MultiNode,
@@ -475,7 +476,7 @@ class ConditionProcessor:
                     if not networkx.has_path(_g, succ, the_node):
                         nodes_do_not_reach_the_node.add(succ)
 
-            diverging_conditions = []
+            diverging_path_conditions = []
 
             for node_ in nodes_do_not_reach_the_node:
                 preds_ = list(_g.predecessors(node_))
@@ -486,11 +487,13 @@ class ConditionProcessor:
                     edge_ = pred_, node_
                     edge_condition = edge_conditions.get(edge_, None)
                     if edge_condition is not None:
-                        diverging_conditions.append(edge_condition)
+                        pred_reaching_condition = reaching_conditions.get(pred_, claripy.true())
+                        diverging_path_conditions.append(claripy.And(pred_reaching_condition, edge_condition))
 
-            if diverging_conditions:
-                # the negation of the union of diverging conditions is the guarding condition for this node
-                cond = claripy.Or(*map(claripy.Not, diverging_conditions))  # pylint:disable=bad-builtin
+            if diverging_path_conditions:
+                # the negation of the union of diverging path conditions is the guarding condition for this node
+                cond = claripy.Not(claripy.Or(*diverging_path_conditions))
+                cond = self.simplify_condition(cond) if simplify_conditions else cond
                 guarding_conditions[the_node] = cond
 
         self.reaching_conditions = reaching_conditions
@@ -754,6 +757,38 @@ class ConditionProcessor:
 
     EXC_COUNTER = 1000
 
+    @staticmethod
+    def _is_unconditional_hcl_edge(src_block: ailment.Block, dst_block) -> bool:
+        """
+        Check whether every way out of a head-controlled-loop block reaches ``dst_block``.
+        """
+        terminal_stmt = src_block.statements[-1]
+        dst_is_indexed = isinstance(dst_block, (ailment.Block, MultiNode))
+        if (
+            not isinstance(terminal_stmt, ailment.Stmt.Jump)
+            or not isinstance(terminal_stmt.target, ailment.Expr.Const)
+            or terminal_stmt.target.value != dst_block.addr
+            or (dst_is_indexed and terminal_stmt.target_idx != dst_block.idx)
+        ):
+            return False
+
+        for stmt in src_block.statements[:-1]:
+            if isinstance(stmt, (ailment.Stmt.Jump, ailment.Stmt.Return, IncompleteSwitchCaseHeadStatement)):
+                return False
+            if not isinstance(stmt, ailment.Stmt.ConditionalJump):
+                continue
+            for target, target_idx in (
+                (stmt.true_target, stmt.true_target_idx),
+                (stmt.false_target, stmt.false_target_idx),
+            ):
+                if target is not None and (
+                    not isinstance(target, ailment.Expr.Const)
+                    or target.value != dst_block.addr
+                    or (dst_is_indexed and target_idx != dst_block.idx)
+                ):
+                    return False
+        return True
+
     def _extract_predicate(self, src_block, dst_block, edge_type) -> claripy.ast.Bool:
         if edge_type == "exception":
             # TODO: THIS IS ABSOLUTELY A HACK. AT THIS MOMENT YOU SHOULD NOT ATTEMPT TO MAKE SENSE OF EXCEPTION EDGES.
@@ -783,6 +818,8 @@ class ConditionProcessor:
 
         # sometimes the last statement is the conditional jump. sometimes it's the first statement of the block
         if isinstance(src_block, ailment.Block) and src_block.statements and is_head_controlled_loop_block(src_block):
+            if self._is_unconditional_hcl_edge(src_block, dst_block):
+                return claripy.true()
             last_stmt = next(
                 iter(stmt for stmt in src_block.statements[:-1] if isinstance(stmt, ailment.Stmt.ConditionalJump)), None
             )
