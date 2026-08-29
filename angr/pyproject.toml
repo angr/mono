@@ -123,8 +123,7 @@ archinfo = { workspace = true }
 pyvex = { workspace = true }
 cle = { workspace = true }
 claripy = { workspace = true }
-pysoot = { git = "https://github.com/angr/pysoot.git", branch = "master" }
-
+pysoot = { workspace = true }
 [tool.ruff]
 line-length = 120
 target-version = "py312"

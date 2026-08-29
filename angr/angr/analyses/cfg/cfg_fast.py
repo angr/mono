@@ -885,7 +885,7 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
 
         self._remaining_eh_frame_addrs: list[int] | None = None
         self._remaining_function_prologue_addrs: list[int] | None = None
-        self._used_function_prologue_addrs: set[int] | None = None
+        self._used_function_prologue_addrs: set[int] = set()
         self._ptr_hints: SortedDict | None = None
         self._processed_eh_prolog3_callsites: set[int] = set()
         self._processed_cxx_frame_handler3_callsites: set[int] = set()
@@ -1716,7 +1716,7 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         if self._use_eh_frame:
             self._remaining_eh_frame_addrs = sorted(self._function_addresses_from_eh_frame, reverse=True)
 
-        if self._use_function_prologues and self.project.concrete_target is None:
+        if self._use_function_prologues:
             func_addrs_from_prologs = self._func_addrs_from_prologues()
             if self._ptr_hints:
                 # ensure function addresses from prologs do not overlap with pointer hints
@@ -5554,7 +5554,7 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
 
             # also check the distance between `addr` and the closest function.
             # we don't want to have a basic block that spans across function boundaries
-            next_func_addr_adjustment = None
+            next_func_addr_adjustment = 0
             next_func_addr = self.functions.ceiling_addr(addr + 1)
             if next_func_addr is not None:
                 next_func_addr_adjustment = 0

@@ -3,14 +3,15 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "0e18fa25ef83c3db9813fe5a156da0013052e0e5",
-      "committed_at": "2026-08-26T16:33:23-07:00",
-      "subject": "SootClassHierarchy: Answer the subclass question for an interface (#6949)",
+      "commit": "a9ca247a5bcadf0ad8ecccb61be5f76dc4cd5050",
+      "committed_at": "2026-08-28T11:42:38-07:00",
+      "subject": "Remove concrete_target leftovers (#7027)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
         "claripy",
         "cle",
+        "pysoot",
         "pyvex"
       ]
     },
@@ -49,9 +50,9 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "f92307b32e138de45b6ed4e8ca7794b67fdff6f8",
-      "committed_at": "2026-08-27T11:12:25-07:00",
-      "subject": "Support narrow p-code stack pointers (#363)",
+      "commit": "b8ffe85710b5d4afbff406d9953b258da398fec2",
+      "committed_at": "2026-08-28T08:09:24-07:00",
+      "subject": "Report the nop and ret encodings a big-endian machine holds in memory (#371)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -65,9 +66,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "d2ecea068794d20b1f14d90eecc1bc4bc4cfa431",
-      "committed_at": "2026-08-26T15:51:09-07:00",
-      "subject": "Test CLE under Pyodide (#704)",
+      "commit": "c7e0d4db664a45b59c84967ac42d04f82a97b087",
+      "committed_at": "2026-08-28T08:12:18-07:00",
+      "subject": "Add a backend for bare DEX files (#783)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -100,9 +101,9 @@
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "bdd5441035e02920eaa72c1c3cf9a4f0d572104d",
-      "committed_at": "2026-08-24T12:21:24-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#575)",
+      "commit": "ab18a834ba4a5320c3415eff971092ef2b940779",
+      "committed_at": "2026-08-27T10:58:45-07:00",
+      "subject": "Mark GPL components as GPL-2.0-or-later (#577)",
       "excluded": [
         "vex"
       ],
@@ -117,5 +118,8 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-08-28T01:02:34+00:00"
+  "imported_at": "2026-08-29T00:14:00+00:00",
+  "external": {
+    "vex": "875f7c9a5f6be621b4f000c29c016e15ddf32207"
+  }
 }
