@@ -789,7 +789,14 @@ jobs:
       - name: cle under Pyodide
         run: |
           work=$(mktemp -d)
-          git archive HEAD cle | tar -x -C "$work"
+          # cle and the siblings its [tool.uv.sources] names. Extracting cle
+          # alone is what made this lane resolve archinfo from upstream
+          # master: the tree under test carried ArchMIPSN32 and the archinfo
+          # uv fetched did not, so six cle tests failed on a disagreement the
+          # branch had already fixed (#9). --require-siblings below turns a
+          # component missing from this list into a failure rather than a
+          # quiet fallback.
+          git archive HEAD cle archinfo pyvex | tar -x -C "$work"
           # Copied, not symlinked. The suite runs inside Pyodide, whose
           # filesystem does not follow a host symlink out of the tree it
           # mounted: cle's fixtures resolved to
@@ -798,9 +805,13 @@ jobs:
           cp -r binaries "$work/binaries"
           cp -r wheelhouse "$work/wheels"
           # The extracted copy still says `archinfo = { workspace = true }`,
-          # which uv refuses outside a workspace. Put upstream's git sources
-          # back so it resolves the way upstream's own repository does.
-          ci/unworkspace.py "$work/cle"
+          # which uv refuses outside a workspace. Point it at the copies
+          # extracted beside it instead, so the resolution answers about this
+          # tree. pyvex keeps coming from the wheel built above --
+          # `--no-sources-package pyvex` below overrides its source either
+          # way -- but it is extracted so the rewrite does not have to treat
+          # it as absent.
+          ci/unworkspace.py "$work/cle" --require-siblings
           cd "$work/cle"
           uv sync --python pyodide@3.14 --group pyodide-testing \
             --find-links ../wheels --no-sources-package pyvex \
