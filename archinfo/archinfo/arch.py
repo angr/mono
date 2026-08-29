@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import logging
 import platform as _platform
@@ -11,6 +12,7 @@ from .tls import TLSArchInfo
 from .types import Endness
 
 if TYPE_CHECKING:
+    # Typing only. arch_pcode imports this module, so its runtime import is delayed to each use site.
     from .arch_pcode import ArchPcode
 
 
@@ -36,6 +38,11 @@ try:
     import keystone as _keystone
 except ImportError:
     _keystone = None
+
+try:
+    import pypcode as _pypcode
+except ImportError:
+    _pypcode = None
 
 
 class Register:
@@ -387,6 +394,10 @@ class Arch:
         """
         Produce a format string for use in python's ``struct`` module to decode a single word.
 
+        ``struct`` has integer format characters for 1, 2, 4 and 8 bytes only. Any other size, the
+        3-byte word of a 24-bit architecture included, raises ``ValueError`` and has to be assembled
+        from bytes by the caller.
+
         :param int size:    The size in bytes to pack/unpack. Defaults to wordsize
         :param bool signed: Whether the data should be extracted signed/unsigned. Default unsigned
         :param str endness: The endian to use in packing/unpacking. Defaults to memory endness
@@ -412,12 +423,10 @@ class Arch:
             fmt_size = "I"
         elif size == 2:
             fmt_size = "H"
-        elif size == 3:
-            fmt_size = "Z"  # special case for 24-bit architectures like AVR8
         elif size == 1:
             fmt_size = "B"
         else:
-            raise ValueError("Invalid size: Must be a integer power of 2 less than 16")
+            raise ValueError(f"Invalid size: struct has no format character for a {size}-byte integer")
 
         if signed:
             fmt_size = fmt_size.lower()
@@ -863,12 +872,23 @@ class ArchNotFound(Exception):
     pass
 
 
-def arch_from_id(ident: str, endness=Endness.ANY, bits="") -> Arch:
+def arch_from_id(ident: str, endness: str = Endness.ANY, bits: int | str = "") -> Arch:
     """
     Take our best guess at the arch referred to by the given identifier, and return an instance of its class.
 
     You may optionally provide the ``endness`` and ``bits`` parameters (strings) to help this function out.
+
+    A full sleigh language id, such as ``pa-risc:BE:32:default``, returns the ArchPcode for that language. It
+    carries its own endness and width, so the ``endness`` and ``bits`` hints do not apply to it.
     """
+    if _pypcode is not None and ":" in ident:
+        # A language id names one language, so it answers before arch_id_map, whose regexes would otherwise
+        # claim ARM:LE:32:v7 for ArchARMEL. Delayed import to avoid circular dependency, as in Arch.pcode_arch.
+        from .arch_pcode import ArchPcode  # pylint: disable=import-outside-toplevel
+
+        with contextlib.suppress(ArchError):
+            return ArchPcode(ident)
+
     if bits == 64 or (isinstance(bits, str) and "64" in bits):
         bits = 64
     elif isinstance(bits, str) and "32" in bits:

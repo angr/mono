@@ -3,10 +3,15 @@ from __future__ import annotations
 
 import os
 from unittest import TestCase, main
+from unittest.mock import patch
 
 import archinfo
+from pyvex.expr import Const
+import pypcode
 
 import angr
+from angr.engines.pcode.lifter import PcodeLifterEngineMixin
+from angr.engines.vex.lifter import VEXLifter
 
 test_location = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "..", "..", "binaries", "tests")
 
@@ -144,6 +149,147 @@ class TestPcodeEngine(TestCase):
                 continue
             func_out = func.graph.out_degree(func_node)
             assert func_out > 0
+
+    def test_lift_architecture_whose_word_is_not_a_power_of_two(self):
+        """
+        A SLEIGH language may declare a word size VEX has no named constant for: the PIC and dsPIC
+        families are 24-bit. Lifting one used to raise KeyError on the width itself.
+        """
+        for language in ("dsPIC33F:LE:24:default", "PIC-24E:LE:24:default"):
+            with self.subTest(language=language):
+                arch = archinfo.ArchPcode(language)
+                assert arch.bits == 24
+                project = angr.load_shellcode(
+                    b"\x00" * 6, arch=arch, load_address=0x1000, engine=angr.engines.UberEnginePcode
+                )
+                irsb = project.factory.block(0x1000).vex
+                assert isinstance(irsb.next, Const)
+                assert irsb.next.con.__class__.__name__ == f"U{arch.bits}"
+
+    def test_narrow_arch_jump_targets(self):
+        """
+        The lifter builds a block's jump target at three separate sites, one reached only by an
+        undecodable block and one only by a fallthrough. Extended AVR8 addresses are 24 bits wide.
+        """
+        arch = archinfo.ArchPcode("avr8:LE:16:extended")
+        assert arch.bits == 24
+
+        p = angr.load_shellcode(
+            bytes.fromhex("01e00895"),  # ldi r16, 1 ; ret
+            arch=arch,
+            load_address=0x100,
+            engine=angr.engines.UberEnginePcode,
+        )
+        assert p.factory.block(0x100).vex.jumpkind == "Ijk_Ret"
+
+        undecodable = angr.load_shellcode(
+            b"\xff\xff", arch=arch, load_address=0x100, engine=angr.engines.UberEnginePcode
+        )
+        block = undecodable.factory.block(0x100).vex
+        assert block.jumpkind == "Ijk_NoDecode"
+        assert isinstance(block.next, Const)
+        assert block.next.con.value == 0x100
+        assert block.next.con.type == "Ity_I24"
+
+        fallthrough = angr.load_shellcode(
+            bytes.fromhex("01e012e00895"),  # ldi r16, 1 ; ldi r17, 2 ; ret
+            arch=arch,
+            load_address=0x100,
+            engine=angr.engines.UberEnginePcode,
+        )
+        block = fallthrough.factory.block(0x100, num_inst=1).vex
+        assert block.jumpkind == "Ijk_Boring"
+        assert isinstance(block.next, Const)
+        assert block.next.con.value == 0x102
+        assert block.next.con.type == "Ity_I24"
+
+        state = fallthrough.factory.blank_state(addr=0x100)
+        successors = fallthrough.factory.successors(state, num_inst=1).successors
+        assert [(s.solver.eval(s.regs.ip), s.regs.ip.size()) for s in successors] == [(0x102, 24)]
+    def test_arch_without_program_counter(self):
+        """
+        Test states and CFG recovery on an architecture whose sleigh language declares no program
+        counter register, so there is no register for the instruction pointer to live in.
+        """
+        arch = archinfo.ArchPcode("Dalvik:LE:32:DEX_Nougat")
+
+        # const/4 v0, #0 ; return-void
+        byte_code = bytes.fromhex("12000e00")
+        p = angr.load_shellcode(
+            byte_code, arch=arch, start_offset=0x1000, load_address=0x1000, engine=angr.engines.UberEnginePcode
+        )
+
+        for state in (p.factory.blank_state(), p.factory.blank_state(addr=0x1002), p.factory.entry_state()):
+            assert repr(state) == "<SimState @ ?>"
+            assert state.history.successor_ip is None
+
+        cfg = p.analyses.CFGFast()
+        assert [(n.addr, n.size) for n in cfg.model.nodes()] == [(0x1000, 4)]
+    def test_disassembly_is_lazy(self):
+        """
+        Lifting a block must not disassemble it. CFG recovery never reads IRSB.disassembly, so decoding it eagerly
+        costs a second Sleigh pass and an object per instruction on every lift, all of it retained by the block cache.
+        """
+        proj = angr.Project(os.path.join(test_location, "sh4", "test-instr_sh4"), auto_load_libs=False)
+        assert isinstance(proj.arch, archinfo.ArchPcode)
+
+        real_disassemble = pypcode.Context.disassemble
+        calls = []
+
+        def counting_disassemble(self, *args, **kwargs):
+            calls.append(args)
+            return real_disassemble(self, *args, **kwargs)
+
+        with patch.object(pypcode.Context, "disassemble", counting_disassemble):
+            irsb = proj.factory.block(proj.entry).vex
+            assert irsb.size > 0
+            assert not calls
+
+            disasm = irsb.disassembly
+            assert len(calls) == 1
+            assert [insn.address for insn in disasm.insns] == list(irsb.instruction_addresses)
+            assert sum(insn.size for insn in disasm.insns) == irsb.size
+
+            # The disassembly is decoded once and kept
+            assert irsb.disassembly is disasm
+            assert len(calls) == 1
+
+        # A block that stopped early disassembles to what it lifted, not to whatever follows it
+        short = proj.factory.block(proj.entry, num_inst=1).vex
+        assert len(short.disassembly.insns) == 1
+        assert short.disassembly.insns[0].size == short.size
+
+    def test_disassembly_failure_is_not_raised(self):
+        """
+        IRSB.disassembly does not propagate a Sleigh decode error. A block that will not decode simply has no
+        disassembly, which is all its callers have ever had to handle.
+        """
+        proj = angr.Project(os.path.join(test_location, "sh4", "test-instr_sh4"), auto_load_libs=False)
+        irsb = proj.factory.block(proj.entry).vex
+
+        def failing_disassemble(self, *args, **kwargs):
+            raise pypcode.BadDataError("Unable to resolve constructor")
+
+        with patch.object(pypcode.Context, "disassemble", failing_disassemble):
+            assert irsb.disassembly is None
+
+        # Sleigh is not asked again; a second attempt here would succeed and return a block
+        assert irsb.disassembly is None
+
+    def test_block_cache_no_larger_than_vex(self):
+        """
+        A p-code block retains several times what the equivalent VEX block does, so the p-code engine must not cache
+        more blocks than the VEX engine.
+        """
+        binary_path = os.path.join(test_location, "x86_64", "fauxware")
+        vex_proj = angr.Project(binary_path, auto_load_libs=False)
+        pcode_proj = angr.Project(binary_path, auto_load_libs=False, engine=angr.engines.UberEnginePcode)
+
+        vex_engine = vex_proj.factory.default_engine
+        pcode_engine = pcode_proj.factory.default_engine
+        assert isinstance(vex_engine, VEXLifter)
+        assert isinstance(pcode_engine, PcodeLifterEngineMixin)
+        assert pcode_engine._cache_size <= vex_engine._cache_size  # pylint: disable=protected-access
 
 
 if __name__ == "__main__":
