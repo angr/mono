@@ -7,8 +7,9 @@ import math
 import re
 import string
 import time
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from enum import Enum, unique
+from functools import cache
 from typing import TYPE_CHECKING, Any
 
 import capstone
@@ -16,7 +17,7 @@ import claripy
 import cle
 import networkx
 import pyvex
-from archinfo import Endness
+from archinfo import ArchRISCV64, Endness
 from archinfo.arch_arm import get_real_address_if_arm, is_arm_arch
 from archinfo.arch_soot import SootAddressDescriptor
 from cle.address_translator import AT
@@ -29,8 +30,11 @@ from angr.analyses.forward_analysis import ForwardAnalysis
 from angr.codenode import FuncNode, HookNode
 from angr.errors import (
     AngrCFGError,
+    AngrError,
     AngrSkipJobNotice,
+    AngrUnsupportedSyscallError,
     SimEngineError,
+    SimError,
     SimIRSBNoDecodeError,
     SimMemoryError,
     SimTranslationError,
@@ -47,6 +51,8 @@ from angr.knowledge_plugins.cfg import (
 from angr.knowledge_plugins.cfg.spilling_cfg import block_key_to_addr, block_key_to_size, get_block_key
 from angr.knowledge_plugins.xrefs import XRef, XRefType
 from angr.misc.ux import once
+from angr.procedures.stubs.PathTerminator import PathTerminator
+from angr.procedures.stubs.UnresolvableJumpTarget import UnresolvableJumpTarget
 from angr.rustylib import SegmentList
 from angr.simos import SimWindows
 from angr.utils.constants import DEFAULT_STATEMENT
@@ -79,11 +85,47 @@ if TYPE_CHECKING:
     from angr.engines.pcode.lifter import IRSB as PcodeIRSB
     from angr.knowledge_plugins.cfg.spilling_cfg import SpillingCFG
     from angr.knowledge_plugins.cfg.types import CFGNODE_K
+    from angr.knowledge_plugins.functions.function import Function
 
 
 VEX_IRSB_MAX_SIZE = 400
 # the minimum interval (in seconds) between two consecutive progress notifications
 PROGRESS_NOTIFY_INTERVAL = 0.05
+# Alignment padding encodings, per architecture, in little-endian byte order; the big-endian variant of an
+# architecture is served by reversing them. Only architectures whose padding has actually been surveyed appear
+# here: deriving the set from archinfo's nop_instruction is unsound, because that field is a single canonical
+# encoding rather than what a linker emits, and on some architectures it is not even that.
+_ALIGNMENT_PADDING: dict[str, frozenset[bytes]] = {
+    # ori r0, r0, 0 and ori r2, r2, 0; both architectural no-ops, both emitted as
+    # inter-function padding. Little-endian PowerPC; reversed for big-endian below.
+    "PPC32": frozenset({b"\x00\x00\x00\x60", b"\x00\x00\x42\x60"}),
+    "PPC64": frozenset({b"\x00\x00\x00\x60", b"\x00\x00\x42\x60"}),
+    # nopr %r7; the only encoding that appears in an inter-function gap on s390x. Stored
+    # little-endian like the rest of the table; it is a palindrome, so the big-endian
+    # reversal yields the same two bytes.
+    "S390X": frozenset({b"\x07\x07"}),
+}
+
+
+@cache
+def alignment_padding_encodings(arch_name: str, memory_endness: str) -> tuple[bytes, ...]:
+    """
+    The alignment padding encodings to scan for on an architecture, in the byte order they appear in memory.
+
+    :param arch_name:       The architecture's name, as in Arch.name.
+    :param memory_endness:  The architecture's memory endness. This is the field that tracks the target's byte
+                            order; instruction_endness is a class-level constant that PowerPC never overrides,
+                            so it still reads BE on a little-endian PowerPC target.
+    :return:                The encodings, sorted so that iteration order is deterministic, or an empty tuple if
+                            this architecture's padding has not been surveyed.
+    """
+
+    encodings = _ALIGNMENT_PADDING.get(arch_name)
+    if not encodings:
+        return ()
+    if memory_endness == Endness.BE:
+        encodings = frozenset(bytes(reversed(encoding)) for encoding in encodings)
+    return tuple(sorted(encodings))
 
 
 l = logging.getLogger(name=__name__)
@@ -602,6 +644,35 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
     # TODO: Move arch_options to CFGBase, and add those logic to CFGEmulated as well.
 
     PRINTABLES = string.printable.replace("\x0b", "").replace("\x0c", "").encode()
+    # The NOP encodings that assemblers emit as alignment padding in both 32-bit and 64-bit x86 code, disassembled
+    # here with the 32-bit register names, shortest first. Each entry may be preceded by operand-size (0x66) and
+    # segment (0x2E) prefixes, which is how an assembler stretches an encoding beyond its natural length, so the
+    # prefixes are not part of the patterns; see _x86_nop_size().
+    X86_NOPS = (
+        bytes.fromhex("90"),  # nop
+        bytes.fromhex("0F1F00"),  # nopl (%eax)
+        bytes.fromhex("0F1F4000"),  # nopl 0x0(%eax)
+        bytes.fromhex("0F1F440000"),  # nopl 0x0(%eax,%eax,1)
+        bytes.fromhex("0F1F8000000000"),  # nopl 0x0(%eax)
+        bytes.fromhex("0F1F840000000000"),  # nopl 0x0(%eax,%eax,1)
+    )
+    # The padding encodings that predate the long NOP. They only do nothing in 32-bit mode - in 64-bit mode they
+    # truncate the destination register - and no assembler pads 64-bit code with them.
+    X86_32BIT_NOPS = (
+        bytes.fromhex("89F6"),  # mov %esi,%esi
+        bytes.fromhex("8D7600"),  # lea 0x0(%esi),%esi
+        bytes.fromhex("8D7F00"),  # lea 0x0(%edi),%edi
+        bytes.fromhex("8D742600"),  # lea 0x0(%esi,%eiz,1),%esi
+        bytes.fromhex("8D7C2700"),  # lea 0x0(%edi,%eiz,1),%edi
+        bytes.fromhex("8DB600000000"),  # lea 0x0(%esi),%esi
+        bytes.fromhex("8DBF00000000"),  # lea 0x0(%edi),%edi
+        bytes.fromhex("8DB42600000000"),  # lea 0x0(%esi,%eiz,1),%esi
+        bytes.fromhex("8DBC2700000000"),  # lea 0x0(%edi,%eiz,1),%edi
+    )
+    # both tables in one, still shortest first
+    X86_ALL_NOPS = tuple(sorted(X86_NOPS + X86_32BIT_NOPS, key=len))
+    # an x86 instruction is at most 15 bytes long, prefixes included
+    X86_MAX_INSN_LENGTH = 15
     SPECIAL_THUNKS = {
         "AMD64": {
             bytes.fromhex("E807000000F3900FAEE8EBF9488D642408C3"): ("ret",),
@@ -646,7 +717,7 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         exceptions=True,
         skip_unmapped_addrs=True,
         nodecode_window_size=2048,
-        nodecode_threshold=0.6,
+        nodecode_threshold=0.3,
         nodecode_step=16483,
         check_funcret_max_job=500,
         indirect_calls_always_return: bool | None = None,
@@ -886,6 +957,9 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         self._remaining_eh_frame_addrs: list[int] | None = None
         self._remaining_function_prologue_addrs: list[int] | None = None
         self._used_function_prologue_addrs: set[int] = set()
+        # blocks whose Ijk_NoDecode is an undefined instruction that _generate_cfgnode recognized, and not bytes it
+        # failed to decode
+        self._undefined_instruction_blocks: set[int] = set()
         self._ptr_hints: SortedDict | None = None
         self._processed_eh_prolog3_callsites: set[int] = set()
         self._processed_cxx_frame_handler3_callsites: set[int] = set()
@@ -1238,6 +1312,94 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
             return repeating_length
         return 0
 
+    def _x86_nop_size(self, addr: int) -> int:
+        """
+        Determine the length of the x86 NOP instruction that starts at a given address.
+
+        :param addr:    The address to decode at.
+        :return:        The length of the instruction in bytes, or 0 if no NOP starts at this address.
+        """
+
+        offset = 0
+        val = self._load_a_byte_as_int(addr)
+        while val == 0x66 and offset < self.X86_MAX_INSN_LENGTH:
+            # operand-size prefixes; an assembler repeats them to pad an encoding out
+            offset += 1
+            val = self._load_a_byte_as_int(addr + offset)
+        if val == 0x2E and offset < self.X86_MAX_INSN_LENGTH:
+            # a segment prefix, which pads the encoding out by one more byte
+            offset += 1
+
+        nops = self.X86_NOPS if self.project.arch.bits == 64 else self.X86_ALL_NOPS
+        # no encoding in the tables is a prefix of another, so the first match is the only one; going shortest first
+        # keeps the one-byte NOP to a single byte loaded
+        opcode = bytearray()
+        for nop in nops:
+            while len(opcode) < len(nop):
+                byte = self._load_a_byte_as_int(addr + offset + len(opcode))
+                if byte is None:
+                    return 0
+                opcode.append(byte)
+            if opcode.startswith(nop) and offset + len(nop) <= self.X86_MAX_INSN_LENGTH:
+                return offset + len(nop)
+        return 0
+
+    def _fixed_width_nop_size(self, addr: int) -> int:
+        """
+        Determine whether a fixed-width NOP instruction starts at a given address.
+
+        :param addr:    The address to decode at.
+        :return:        The length of the instruction in bytes, or 0 if no NOP starts at this address.
+        """
+
+        arch = self.project.arch
+        for nop in alignment_padding_encodings(arch.name, arch.memory_endness):
+            if not any(nop):
+                # an all-zero NOP encoding (ARM, MIPS) is indistinguishable from a zeroed data region, and the zero
+                # run is already classified elsewhere, so only distinctive encodings are scanned for here
+                continue
+            if addr % len(nop) != 0:
+                # padding is emitted at its own alignment; a match at any other offset is a coincidence inside data.
+                # This equals s390x's instruction alignment only by accident of that entry being 2 bytes wide: s390x
+                # aligns instructions to 2 whatever the instruction width, so a 4- or 6-byte entry added for it later
+                # would have to take the alignment from arch.instruction_alignment instead of len(nop).
+                continue
+            if all(self._load_a_byte_as_int(addr + offset) == expected for offset, expected in enumerate(nop)):
+                return len(nop)
+        return 0
+
+    def _scan_for_nop_padding(self, start_addr: int) -> int:
+        """
+        Scan from a given address for a run of NOP instructions.
+
+        Compilers pad with NOPs to align the function or the branch target that follows, and that padding is
+        unreachable by construction: whatever transfers control to the aligned address skips over it. A linear scan
+        therefore lands on padding all the time.
+
+        :param start_addr:  The address to start scanning from.
+        :return:            The length of the run in bytes, or 0 if no NOP starts at start_addr.
+        """
+
+        # x86 NOPs are variable-length and come in a table of encodings; everywhere else padding is one of a handful
+        # of fixed-width words, listed per architecture in _ALIGNMENT_PADDING
+        arch = self.project.arch
+        if arch.name in {"X86", "AMD64"}:
+            nop_size_at = self._x86_nop_size
+        elif alignment_padding_encodings(arch.name, arch.memory_endness):
+            nop_size_at = self._fixed_width_nop_size
+        else:
+            # this architecture's padding has not been surveyed, so nothing is scanned for
+            return 0
+
+        addr = start_addr
+        while self._inside_regions(addr):
+            nop_size = nop_size_at(addr)
+            if not nop_size:
+                break
+            addr += nop_size
+
+        return addr - start_addr
+
     def _scan_for_fp_constants(self, start_addr: int, threshold: int = 4) -> int:
         """
         Scan from a given address for a run of plausible floating-point constants.
@@ -1411,6 +1573,12 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         start_addr = next_addr
 
         while True:
+            if start_addr != next_addr and self._seg_list.is_occupied(start_addr):
+                # consuming data has taken us into a region that is already classified - a decoded block, a metadata
+                # region, or data found earlier. scanning on from here would overwrite that classification, so leave
+                # it alone; the caller starts over from the next unscanned address.
+                break
+
             pointer_length, string_length, cc_length = 0, 0, 0
             matched_something = False
 
@@ -1501,13 +1669,21 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                     self.model.memory_data[str_addr] = md
                     start_addr = str_addr + string_length
 
-            if not matched_something and self.project.arch.name in {"X86", "AMD64"}:
-                cc_length = self._scan_for_repeating_bytes(start_addr, 0xCC, threshold=1)
-                if cc_length:
+            if not matched_something:
+                # find alignment padding: 0xCC is what MSVC pads with, NOPs are what everything else pads with
+                cc_length = (
+                    self._scan_for_repeating_bytes(start_addr, 0xCC, threshold=1)
+                    if self.project.arch.name in {"X86", "AMD64"}
+                    else 0
+                )
+                padding_length = cc_length or self._scan_for_nop_padding(start_addr)
+                if padding_length:
                     matched_something = True
-                    self._seg_list.occupy(start_addr, cc_length, "alignment")
-                    self.model.memory_data[start_addr] = MemoryData(start_addr, cc_length, MemoryDataSort.Alignment)
-                    start_addr += cc_length
+                    self._seg_list.occupy(start_addr, padding_length, "alignment")
+                    self.model.memory_data[start_addr] = MemoryData(
+                        start_addr, padding_length, MemoryDataSort.Alignment
+                    )
+                    start_addr += padding_length
 
             is_xfg_hash = (
                 self.project.arch.name in {"X86", "AMD64"}
@@ -1524,10 +1700,19 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
 
             zeros_length = self._scan_for_repeating_bytes(start_addr, 0x00)
             if zeros_length:
-                matched_something = True
-                self._seg_list.occupy(start_addr, zeros_length, "alignment")
-                self.model.memory_data[start_addr] = MemoryData(start_addr, zeros_length, MemoryDataSort.Alignment)
-                start_addr += zeros_length
+                # a data run must not end in the middle of an instruction. on a fixed-width architecture the low
+                # bytes of a little-endian encoding are frequently zero - the ppc64le NOP is 00 00 00 60 - so a run
+                # of zeros walks into the padding that follows and leaves the scan misaligned inside it. the clamp
+                # is scoped to the architectures whose padding _ALIGNMENT_PADDING describes, because on the others
+                # it would move block starts with no evidence that where it moves them to is better.
+                arch = self.project.arch
+                if alignment_padding_encodings(arch.name, arch.memory_endness):
+                    zeros_length -= (start_addr + zeros_length) % (arch.instruction_alignment or 1)
+                if zeros_length > 0:
+                    matched_something = True
+                    self._seg_list.occupy(start_addr, zeros_length, "alignment")
+                    self.model.memory_data[start_addr] = MemoryData(start_addr, zeros_length, MemoryDataSort.Alignment)
+                    start_addr += zeros_length
 
             # we consider over 16 bytes of any repeated bytes to be bad
             repeating_byte_length = self._scan_for_repeating_bytes(start_addr, None, threshold=16)
@@ -1759,7 +1944,10 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         if not self._inside_regions(job.addr):
             obj = self.project.loader.find_object_containing(job.addr)
             if obj is not None and isinstance(obj, self._cle_pseudo_objects):
-                pass
+                # An object CLE invents holds no file content, so the only addresses in it that
+                # stand for anything are the ones something is hooked at. The rest is zero fill.
+                if not self._addr_hooked_or_syscall(job.addr):
+                    raise AngrSkipJobNotice
             else:
                 # it's outside permitted regions. skip.
                 if job.jumpkind == "Ijk_Call":
@@ -1922,16 +2110,23 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         elif self.project.arch.name == "X86":
             func_block_count = self.kb.functions.get_func_block_count(func_addr)
 
-            # determine if the function is __alloca_probe
-            if func_block_count == 4:
+            # determine if the function is a known Windows stack probe. Match the complete basic-block byte set,
+            # rather than a symbol name, since these helpers are just as important in stripped binaries.
+            if func_block_count in {3, 4}:
                 func = self.kb.functions.get_by_addr(func_addr)  # must exist
                 block_bytes = {func.get_block(block_addr).bytes for block_addr in func.block_addrs_set}
-                if block_bytes == {
+                is_msvc_alloca_probe = block_bytes == {
                     b"-\x00\x10\x00\x00\x85\x00\xeb\xe9",
                     b";\xc8r\n",
                     b"Q\x8dL$\x04+\xc8\x1b\xc0\xf7\xd0#\xc8\x8b\xc4%\x00\xf0\xff\xff;\xc8r\n",
                     b"\x8b\xc1Y\x94\x8b\x00\x89\x04$\xc3",
-                }:
+                }
+                is_mingw_chkstk_ms = block_bytes == {
+                    b"QP=\x00\x10\x00\x00\x8dL$\x0cr\x15",
+                    b"\x81\xe9\x00\x10\x00\x00\x83\t\x00-\x00\x10\x00\x00=\x00\x10\x00\x00w\xeb",
+                    b")\xc1\x83\t\x00XY\xc3",
+                }
+                if is_msvc_alloca_probe or is_mingw_chkstk_ms:
                     func.info["is_alloca_probe"] = True
                     self.kb.functions.add_key_func_addr("alloca_probe", func_addr)
 
@@ -2598,10 +2793,22 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         # Propagate special metadata from key functions to trivial jump thunks that target them.
         self._propagate_key_func_info_to_jump_thunks()
 
+        # make_functions() drops the fake-return edge of every call to a non-returning function, so settle which
+        # functions return before it runs, over every function rather than the ones the passes during recovery
+        # happened to reach. A callee left undetermined here is only recognized as non-returning after the rebuild,
+        # by which point its callers have absorbed the bytes after the call site. This determines returning-ness only;
+        # the pass below make_functions() does the bookkeeping that goes with a change of it.
+        self._updated_nonreturning_functions = set(self.functions.unknown_returning_func_addrs())
+        self._iteratively_analyze_function_features(all_funcs_completed=True)
+        # make_functions() refills this with the functions it cannot confirm as returning
+        self._updated_nonreturning_functions = set()
+
         # Revisit all edges and rebuild all functions to correctly handle returning/non-returning functions.
         self.make_functions()
         self._calculate_progress_and_notify(skip_percentage=True)
 
+        # ahead of the loop below, which reads nonreturning_func_addrs() to strip the fall-through edges
+        self._revise_returning_of_functions_that_cannot_return()
         self._analyze_all_function_features(all_funcs_completed=True)
 
         # Scan all functions, and make sure all fake ret edges are either confirmed or removed
@@ -3046,12 +3253,18 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
             blocks_ahead.append(self._lift(cfg_job.src_node.addr).vex)
             procedure.project = self.project
             procedure.arch = self.project.arch
-            new_exits = procedure.static_exits(blocks_ahead, cfg=self)
+            try:
+                new_exits = procedure.static_exits(blocks_ahead, cfg=self)
+            except (AngrError, SimError, claripy.ClaripyError):
+                # a procedure that cannot work out its extra exits loses those exits, like a block we fail to lift
+                l.warning("%s failed to determine its static exits.", name, exc_info=True)
+                new_exits = []
 
             for new_exit in new_exits:
                 addr_ = new_exit["address"]
                 jumpkind = new_exit["jumpkind"]
                 namehint = new_exit.get("namehint", None)
+                prototype_hint = new_exit.get("prototype_hint", None)
                 if isinstance(addr_, claripy.ast.BV) and not addr_.symbolic:  # pylint:disable=isinstance-second-argument-not-valid-type
                     addr_ = addr_.concrete_value
                 if not isinstance(addr_, int):
@@ -3073,6 +3286,10 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                 if namehint and (addr_ not in self.kb.labels or self.kb.labels[addr_] == "_ftext"):
                     unique_label = self.kb.labels.get_unique_label(namehint)
                     self.kb.labels[addr_] = unique_label
+                if isinstance(prototype_hint, str):
+                    target_func = self.kb.functions.function(addr=addr_, create=True)
+                    assert target_func is not None
+                    target_func.info["prototype_hint"] = prototype_hint
 
         # determine if this procedure returns
         # whether this procedure returns or not depends on the context
@@ -3594,6 +3811,11 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         else:
             if self.project.arch.name != "Soot":
                 return_site = addr + irsb.size  # We assume the program will always return to the succeeding position
+                if self._fast_memory_load_byte(get_real_address_if_arm(self.project.arch, return_site)) is None:
+                    # A relocatable object is mapped one section at a time, so a call that ends an allocated
+                    # section returns into the alignment hole in front of the next one, where nothing is
+                    # mapped and no block can begin.
+                    return_site = None
             else:
                 # For Soot, we return to the next statement, which is not necessarily the next block (as Shimple does
                 # not break blocks at calls)
@@ -4481,7 +4703,7 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
 
         removed_node_keys = set()
 
-        a_key = None  # a is always the most recent non-removed node
+        a_key = None  # a is always the most recent node that is still in the graph
         is_arm = is_arm_arch(self.project.arch)
 
         for i in range(len(sorted_node_keys)):  # pylint:disable=consider-using-enumerate
@@ -4495,6 +4717,14 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
 
             if b_key in removed_node_keys:
                 # skip all removed nodes
+                continue
+
+            # the _scan_block() call at the bottom of this loop drops the blocks whose decoding assumptions it
+            # invalidates, anywhere in the graph, so a key from the snapshot above may no longer name a node
+            if not self.graph.has_node_key(b_key):
+                continue
+            if not self.graph.has_node_key(a_key):
+                a_key = b_key
                 continue
 
             a_addr = block_key_to_addr(a_key)
@@ -4698,6 +4928,34 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         # if node.addr in self.kb.functions.callgraph:
         #    self.kb.functions.callgraph.remove_node(node.addr)
 
+    def _reached_only_by_call_fallthrough(self, cfg_node: CFGNode) -> bool:
+        """
+        Is this block reachable only as the fall-through of a call to a function we recovered?
+
+        Whatever a compiler leaves after a call it treats as non-returning is not executed: MSVC pads with
+        ``int3``, GCC emits the TOC restore after every PowerPC64 ``bl``, and both are followed by the
+        alignment of the next function. CFGFast recovers that block anyway, because the callee's returning
+        status is usually still unknown when the scan reaches the call site. What is beyond such a block says
+        nothing about whether the function it hangs off was decoded out of data.
+
+        The callee has to be a function with blocks of its own. A stray ``int`` or ``syscall`` in decoded data
+        gets a fall-through edge too, and so does a call whose target is not in the image; a block behind one of
+        those is the tail of a decode rather than the padding after a call.
+        """
+        graph = self.model.graph
+        in_edges = list(graph.in_edges(cfg_node, data=True))
+        if not in_edges:
+            return False
+        for src, _, data in in_edges:
+            if data.get("jumpkind") != "Ijk_FakeRet":
+                return False
+            if not any(
+                edge_data.get("jumpkind") == "Ijk_Call" and self.kb.functions.get_func_block_count(dst.addr)
+                for _, dst, edge_data in graph.out_edges(src, data=True)
+            ):
+                return False
+        return True
+
     def drop_bad_functions(self):
         # remove all functions that are bad, i.e., likely the result of decoding data as code
         # - if a function jumps to data, then it's likely bad
@@ -4740,15 +4998,28 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
             func = self.kb.functions.get_by_addr(func_addr)
             for block_addr in sorted(func.block_addrs, reverse=True):
                 cfg_node = self.model.get_any_node(block_addr)
-                if cfg_node is not None and cfg_node.size > 0:
+                if (
+                    cfg_node is not None
+                    and cfg_node.size > 0
+                    and cfg_node.addr not in self._undefined_instruction_blocks
+                ):
                     out_degree = self.model.graph.out_degree[cfg_node]
+                    if out_degree < 2 and self._reached_only_by_call_fallthrough(cfg_node):
+                        continue
                     # is it jumping to data?
                     if out_degree == 0:
                         # might be size-limited during CFGNode generation; check the location after the end of the block
                         block_end = cfg_node.addr + cfg_node.size
                         if block_end in self.memory_data:
                             md = self.memory_data[block_end]
-                            if md.size and md.sort not in {MemoryDataSort.Unknown, MemoryDataSort.Unspecified, None}:
+                            # alignment padding follows real code by construction, so it says nothing about whether
+                            # this block was decoded correctly
+                            if md.size and md.sort not in {
+                                MemoryDataSort.Alignment,
+                                MemoryDataSort.Unknown,
+                                MemoryDataSort.Unspecified,
+                                None,
+                            }:
                                 full_funcs_to_remove.append(func_addr)
                                 break
                         if self._seg_list.occupied_by_sort(block_end) == "nodecode":
@@ -4766,9 +5037,13 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                 # TODO: Handle Ijk_Privileged in user-space binaries
                 # TODO: Include conditional jumps that jump to data
 
+        shared_block_addrs = self._blocks_owned_by_other_functions(full_funcs_to_remove)
+
         for func_addr in full_funcs_to_remove:
             func = self.kb.functions.get_by_addr(func_addr, meta_only=True)
             for block_addr in list(func.block_addrs_set):
+                if block_addr in shared_block_addrs:
+                    continue
                 cfg_node = self.model.get_any_node(block_addr)
                 if cfg_node is not None:
                     # mark all blocks as data
@@ -4782,7 +5057,36 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
             if cfg_node is not None:
                 self.model.remove_node_and_graph_node(cfg_node)
             if self.kb.functions.contains_addr(node_addr):
-                del self.kb.functions[func_addr]
+                del self.kb.functions[node_addr]
+
+    def _blocks_owned_by_other_functions(self, func_addrs_to_remove: list[int]) -> set[int]:
+        """
+        Collect the blocks of the given functions that a function outside that set also owns.
+
+        :param func_addrs_to_remove: Addresses of the functions that are about to be removed.
+        :return:                     Addresses of those blocks that a function outside the set also owns.
+        """
+
+        if not func_addrs_to_remove:
+            return set()
+
+        removed_func_addrs = set(func_addrs_to_remove)
+        unclaimed_block_addrs: set[int] = set()
+        for func_addr in removed_func_addrs:
+            unclaimed_block_addrs |= self.kb.functions.get_by_addr(func_addr, meta_only=True).block_addrs_set
+
+        shared_block_addrs: set[int] = set()
+        for func_addr in self.kb.functions:
+            if func_addr in removed_func_addrs:
+                continue
+            func = self.kb.functions.get_by_addr(func_addr, meta_only=True)
+            shared = unclaimed_block_addrs & func.block_addrs_set
+            if shared:
+                shared_block_addrs |= shared
+                unclaimed_block_addrs -= shared
+                if not unclaimed_block_addrs:
+                    break
+        return shared_block_addrs
 
     def _analyze_all_function_features(self, all_funcs_completed=False):
         """
@@ -4839,6 +5143,99 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                             self._updated_nonreturning_functions.add(fr.caller_func_addr)
 
                     del self._function_returns[nonreturning_function_addr]
+
+    def _revise_returning_of_functions_that_cannot_return(self):
+        """
+        Correct a returning status that the rebuilt functions no longer support.
+
+        Function.returning is only ever set while the CFG is recovered and never revised, and
+        make_functions() copies a recorded True onto the rebuilt function. That True can come from
+        a block the rebuild has just taken away: the fall-through of a call to a function that does
+        not return carries its blocks, and any ret among them, into another function. What is left
+        owns no return site at all and still claims to return, and _analyze_function_features()
+        skips it from then on because its status is no longer unknown.
+
+        Decide the correction from the procedures that declare NO_RET, not from the returning
+        status of the callee. That status is False both for a callee that cannot come back and for
+        one whose exit was never recovered -- an ARM function that tail-jumps into the unmapped
+        kuser helper page, say -- and a function angr failed to find the exit of is not evidence
+        that its callers do not return.
+        """
+
+        functions = self.functions
+        cannot_return: set[int] = {
+            func_addr for func_addr in functions.function_addrs_set if self._declares_no_ret(func_addr)
+        }
+        worklist: deque[int] = deque(cannot_return)
+
+        while worklist:
+            callee_addr = worklist.popleft()
+            if callee_addr not in functions.callgraph:
+                continue
+            for caller_addr in functions.callgraph.predecessors(callee_addr):
+                if caller_addr in cannot_return or not functions.contains_addr(caller_addr):
+                    continue
+                # most callers of a function that never returns keep a ret of their own; settle those from the
+                # metadata rather than deserializing the whole function and evicting a live one to make room
+                meta = functions.get_by_addr(caller_addr, meta_only=True)
+                if meta.is_simprocedure or meta.has_return or not meta.block_addrs_set:
+                    continue
+                caller = functions.get_by_addr(caller_addr)
+                if not self._all_ways_out_cannot_return(caller, cannot_return):
+                    continue
+                cannot_return.add(caller_addr)
+                worklist.append(caller_addr)
+                if caller.returning is True:
+                    caller.returning = False
+
+    def _declares_no_ret(self, func_addr: int) -> bool:
+        """
+        Does a procedure that stands in for ``func_addr`` declare that it never returns?
+
+        UnresolvableJumpTarget and PathTerminator carry NO_RET to stop exploration and say that
+        angr does not know where control went, not that it cannot come back;
+        _determine_function_returning() leaves UnresolvableJumpTarget out for the same reason.
+        """
+
+        if self.project.is_hooked(func_addr):
+            procedure = self.project.hooked_by(func_addr)
+        else:
+            try:
+                procedure = self.project.simos.syscall_from_addr(func_addr, allow_unsupported=False)
+            except AngrUnsupportedSyscallError:
+                procedure = None
+        if procedure is None or not procedure.NO_RET:
+            return False
+        return not isinstance(procedure, (UnresolvableJumpTarget, PathTerminator))
+
+    def _all_ways_out_cannot_return(self, func: Function, cannot_return: set[int]) -> bool:
+        """
+        Does every way out of ``func`` hand control to a function in ``cannot_return``?
+
+        Read the ways out of the transition graph rather than from Function.endpoints, which does
+        not hold the calls yet: mark_nonreturning_calls_endpoints() adds those only once every
+        returning status is settled, which is what this is deciding. A call is a way out exactly
+        when the rebuild left it without a fall-through, which is how make_functions() records a
+        callee that does not come back; a fall-through the rebuild put in another function is a
+        way out as well, since what happens after it is that function's business.
+        """
+
+        graph = func.transition_graph
+        edges = list(graph.edges(data=True))
+        with_fallthrough = {src for src, _, data in edges if data.get("type") == "fake_return"}
+        ways_out = []
+        for src, dst, data in edges:
+            type_ = data.get("type")
+            if type_ in ("call", "syscall"):
+                if src not in with_fallthrough:
+                    ways_out.append(dst.addr)
+            elif data.get("outside") and type_ in ("transition", "fake_return"):
+                # a tail jump, or a call whose fall-through the rebuild put in another function
+                ways_out.append(dst.addr)
+        if not ways_out:
+            # nothing leaves the function, so angr never found its exit. That is not evidence.
+            return False
+        return all(addr in cannot_return for addr in ways_out)
 
     def _pop_pending_job(self, returning=True) -> CFGJob | None:
         while self._pending_jobs:
@@ -5700,9 +6097,10 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                     except SimTranslationError:
                         nodecode = True
 
-                    irsb_string = lifted_block.bytes[: irsb.size] if irsb is not None else lifted_block.bytes
+                    lifted_block_bytes = lifted_block.bytes if lifted_block.bytes is not None else b""
+                    irsb_string = lifted_block_bytes[: irsb.size] if irsb is not None else lifted_block_bytes
 
-                    if not (nodecode or irsb.size == 0 or irsb.jumpkind == "Ijk_NoDecode"):
+                    if not (nodecode or irsb is None or irsb.size == 0 or irsb.jumpkind == "Ijk_NoDecode"):
                         # it is decodeable
                         if current_function_addr == addr:
                             current_function_addr = addr_0
@@ -5768,25 +6166,25 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
 
                 # the default case
                 valid_ins = False
-                nodecode_size = 1
+                if isinstance(self.project.arch, ArchRISCV64):
+                    # RISC-V stores the length of an instruction in the instruction itself: the lowest two bits of
+                    # the first halfword are 0b11 for a 32-bit instruction and anything else for a 16-bit
+                    # compressed one. Longer encodings are reserved and unallocated.
+                    first_byte = self.project.loader.memory.load(real_addr + irsb_size, 1)[0]
+                    nodecode_size = 4 if first_byte & 0b11 == 0b11 else 2
+                else:
+                    nodecode_size = 1
 
                 # special handling for ud, ud1, and ud2 on x86 and x86-64
                 if self.project.arch.name == "AMD64" and irsb_string[-2:] == b"\x0f\x0b":
                     # VEX supports ud2 and make it part of the block size, only in AMD64.
                     valid_ins = True
                     nodecode_size = 0
-                elif (
-                    lifted_block is not None
-                    and is_x86_x64_arch
-                    and lifted_block.bytes is not None
-                    and len(lifted_block.bytes) - irsb_size > 2
-                    and lifted_block.bytes[irsb_size : irsb_size + 2]
-                    in {
-                        b"\x0f\xff",  # ud0
-                        b"\x0f\xb9",  # ud1
-                        b"\x0f\x0b",  # ud2
-                    }
-                ):
+                elif is_x86_x64_arch and self._fast_memory_load_bytes(real_addr + irsb_size, 2) in {
+                    b"\x0f\xff",  # ud0
+                    b"\x0f\xb9",  # ud1
+                    b"\x0f\x0b",  # ud2
+                }:
                     # ud0, ud1, and ud2 are actually valid instructions.
                     valid_ins = True
                     # VEX does not support ud0 or ud1 or ud2 under AMD64. they are not part of the block size.
@@ -5848,10 +6246,17 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
 
                     if irsb_size == 0:
                         return None, None, None, None
+                else:
+                    self._undefined_instruction_blocks.add(addr)
 
                 self._seg_list.occupy(real_addr, irsb_size, "code")
                 if nodecode_size > 0:
                     self._seg_list.occupy(real_addr + irsb_size, nodecode_size, "nodecode")
+
+                if irsb_size == 0:
+                    # the undefined instruction is the whole block, so there is nothing to turn into a node.
+                    # its extent is recorded above, which is what keeps the scan from restarting inside it.
+                    return None, None, None, None
 
             if (
                 irsb is not None
@@ -6397,7 +6802,11 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                 blocks_ahead.append(self._lift(callsite_cfgnode.addr).vex)
                 hooker.project = self.project
                 hooker.arch = self.project.arch
-                return hooker.dynamic_returns(blocks_ahead)
+                try:
+                    return hooker.dynamic_returns(blocks_ahead)
+                except (AngrError, SimError, claripy.ClaripyError):
+                    # fall through to the callee's own flag, as for a hook that does not decide dynamically
+                    l.warning("%s failed to determine whether it returns.", hooker.display_name, exc_info=True)
 
         if callee_func is not None:
             return callee_func.returning

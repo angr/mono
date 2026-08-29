@@ -178,12 +178,14 @@ class PE(Backend):
         self.linking = "dynamic" if self.deps else "static"
         self.jmprel = self._get_jmprel()
         mapped_image = self._get_memory_mapped_image()
-        if self.max_addr - self.min_addr < len(mapped_image):
+        # max_addr is the last address the object covers, not one past it.
+        mapped_size = self.max_addr - self.min_addr + 1
+        if mapped_size < len(mapped_image):
             # we are loading more bytes than max_addr would allow (there is data at the end of the file that is not
             # covered by any sections), so we need to truncate mapped_image.
             # this is actually caused by PE.get_memory_mapped_image() not passing ignore_padding=True to
             # section.get_data().
-            mapped_image = mapped_image[: self.max_addr - self.min_addr]
+            mapped_image = mapped_image[:mapped_size]
         self.memory.add_backer(0, mapped_image)
 
         if debug_symbols or self.loader._load_debug_info:
@@ -299,6 +301,7 @@ class PE(Backend):
 
         mapped_data_lst: list[bytes] = [self._pe.header]
         mapped_data_len = len(self._pe.header)
+        image_end = mapped_data_len
         for sec in self._pe.sections:
             if sec.Misc_VirtualSize == 0 and sec.SizeOfRawData == 0:
                 # skip empty sections
@@ -338,6 +341,16 @@ class PE(Backend):
             sec_data = sec.get_data()
             mapped_data_lst.append(sec_data)
             mapped_data_len += len(sec_data)
+
+            if size == sec.SizeOfRawData:
+                # a section is mapped over its whole virtual size, and the part of it the file holds no raw data for
+                # is zero. A section the file cuts short is not this case: those bytes are unknown, not zero.
+                image_end = max(image_end, va_adj + sec.Misc_VirtualSize)
+
+        if mapped_data_len < image_end:
+            # the padding that precedes a section is what backs the previous one's virtual size, so the last section
+            # of all has nothing to back its own
+            mapped_data_lst.append(b"\x00" * (image_end - mapped_data_len))
 
         return b"".join(mapped_data_lst)
 
@@ -470,7 +483,13 @@ class PE(Backend):
                         self.deps.append(forwardlib)
 
     def _handle_seh(self):
-        if hasattr(self._pe, "DIRECTORY_ENTRY_EXCEPTION"):
+        assert self._pe.FILE_HEADER is not None
+        machine = self._pe.FILE_HEADER.Machine
+        if machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_ARM64"]:
+            self._handle_seh_arm(arm64=True)
+        elif machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_ARMNT"]:
+            self._handle_seh_arm(arm64=False)
+        elif hasattr(self._pe, "DIRECTORY_ENTRY_EXCEPTION"):
             for entry in self._pe.DIRECTORY_ENTRY_EXCEPTION:
                 self.function_hints.append(
                     FunctionHint(
@@ -479,6 +498,54 @@ class PE(Backend):
                         FunctionHintSource.EH_FRAME,
                     )
                 )
+
+    def _handle_seh_arm(self, arm64: bool):
+        """
+        Read the ARM64 and ARMNT exception directory, which pefile parses for x86-64 and Itanium
+        only. Each entry is two words: the function's start RVA, then either the RVA of an .xdata
+        record or unwind data packed into the word itself, distinguished by its low two bits.
+        Described in Microsoft's ARM and ARM64 exception handling references.
+        """
+        exc_dd = self._meta_dd("IMAGE_DIRECTORY_ENTRY_EXCEPTION")
+        if exc_dd is None:
+            return
+        try:
+            table = self._pe.get_data(exc_dd.VirtualAddress, exc_dd.Size)
+        except pefile.PEFormatError:
+            log.warning("PE exception directory lies outside the image")
+            return
+
+        instruction_unit = 4 if arm64 else 2
+        for offset in range(0, len(table) - 7, 8):
+            begin, unwind_data = struct.unpack_from("<II", table, offset)
+            if begin == 0 and unwind_data == 0:
+                continue
+            flag = unwind_data & 3
+            if flag == 0:
+                header = self._pe.get_dword_at_rva(unwind_data)
+                if header is None:
+                    continue
+                # ARMNT marks a function fragment with bit 22 of the .xdata header. ARM64 has no
+                # such bit; there a fragment only ever appears in the packed form below.
+                if not arm64 and header & (1 << 22):
+                    continue
+                length = (header & 0x3FFFF) * instruction_unit
+            elif flag == 1:
+                length = ((unwind_data >> 2) & 0x7FF) * instruction_unit
+            else:
+                # Flag 2 describes a piece of a function that begins elsewhere, so its start
+                # address is not a function entry. Flag 3 is reserved.
+                continue
+            # Bit 0 of an ARMNT start address marks Thumb code. CLE names an ARM function by the
+            # address with that bit set, as an ELF symbol table does, because it is what selects
+            # the decoder; the function's first instruction is at the address without it.
+            self.function_hints.append(
+                FunctionHint(
+                    begin + self.linked_base,
+                    length,
+                    FunctionHintSource.EH_FRAME,
+                )
+            )
 
     def _parse_meta_regions(self):
         """
@@ -507,8 +574,14 @@ class PE(Backend):
         ptr_size = 8 if is_64 else 4
         return pe, base, is_64, ptr_size
 
-    def _meta_dd(self, name: str) -> pefile.Structure | None:
-        """Return a data directory entry if it has a nonzero VirtualAddress and Size, else None."""
+    def _meta_dd(self, name: str):
+        """
+        Return a data directory entry if it has a nonzero VirtualAddress and Size, else None.
+
+        The return type is inferred rather than declared: pefile fills a data directory entry in from the format
+        string it parsed, so the pefile.Structure this used to promise declares neither VirtualAddress nor Size and
+        hides both from every caller.
+        """
         idx = pefile.DIRECTORY_ENTRY[name]
         dd = self._pe.OPTIONAL_HEADER.DATA_DIRECTORY[idx]
         if dd.VirtualAddress and dd.Size:

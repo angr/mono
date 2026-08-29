@@ -10,6 +10,7 @@ import re
 import time
 import unittest
 from functools import wraps
+from unittest import mock
 
 import networkx
 
@@ -466,11 +467,23 @@ class TestDecompiler(unittest.TestCase):
         p.analyses[CompleteCallingConventionsAnalysis].prep()(recover_variables=False, analyze_callsites=True)
 
         f = cfg.functions["process_file"]
-        dec = p.analyses[Decompiler].prep(fail_fast=True)(f, cfg=cfg.model, options=decompiler_options)
+        aliased_entries = []
+        original_make_switch_cases_core = PhoenixStructurer._make_switch_cases_core  # pylint:disable=protected-access
+
+        def audit_switch_entries(structurer, *args, **kwargs):
+            head, cases, default = args[0], args[2], args[4]
+            for case_value, case_node in cases.items():
+                if default is case_node:
+                    aliased_entries.append((head.addr, case_value, case_node.addr))
+            return original_make_switch_cases_core(structurer, *args, **kwargs)
+
+        with mock.patch.object(PhoenixStructurer, "_make_switch_cases_core", audit_switch_entries):
+            dec = p.analyses[Decompiler].prep(fail_fast=True)(f, cfg=cfg.model, options=decompiler_options)
         assert dec.codegen is not None, f"Failed to decompile function {f!r}."
         print_decompilation_result(dec)
         code = dec.codegen.text
         assert code is not None
+        self.assertFalse(aliased_entries, f"case/default metadata selected the same live node: {aliased_entries!r}")
         # the reconstructed switch and its case bodies survive: without the fix, structuring drops the outer switch
         # entirely, leaving only a small fragment (~1.4k chars) that is missing these cases and their bodies.
         assert "switch (" in code
@@ -481,6 +494,47 @@ class TestDecompiler(unittest.TestCase):
         assert "print_size(" in code
         # no unstructured switch head statement leaked into the output
         assert "IncompleteSwitchCaseHeadStatement" not in code
+        self.assertRegex(
+            code,
+            re.compile(
+                r"case 7:.*?case 1:\s+[A-Za-z_]\w* = 1;\s+return 1;\s+"
+                r"default:\s+[A-Za-z_]\w* = 1;\s+break;",
+                re.DOTALL,
+            ),
+        )
+
+    @structuring_algo("sailr")
+    def test_duplication_reverter_updates_equal_predecessor_keys(self, decompiler_options=None):
+        bin_path = os.path.join(test_location, "x86_64", "decompiler", "paste")
+        project = angr.Project(bin_path, auto_load_libs=False)
+
+        function_addr = 0x402A40
+        cfg = project.analyses[CFGFast].prep()(
+            normalize=True,
+            regions=[(function_addr, 0x402E89)],
+            function_starts=[function_addr],
+            start_at_entry=False,
+            force_smart_scan=False,
+            symbols=False,
+        )
+        function = cfg.functions[function_addr]
+        self.assertGreaterEqual(function.size, 0x431)
+        self.assertIn(0x402C7F, {block.addr for block in function.blocks})
+        decompilation = project.analyses[Decompiler].prep(fail_fast=True)(
+            function,
+            cfg=cfg.model,
+            preset="full",
+            options=decompiler_options,
+            use_cache=False,
+            update_cache=False,
+        )
+
+        assert decompilation.codegen is not None
+        code = decompilation.codegen.text
+        assert code is not None
+        self.assertIn("paste_parallel", code)
+        self.assertIn("fwrite_unlocked", code)
+        self.assertIn("xputchar", code)
 
     @for_all_structuring_algos
     def test_decompiling_true_x86_64_0(self, decompiler_options=None):
@@ -794,13 +848,24 @@ class TestDecompiler(unittest.TestCase):
         code = dec.codegen.text
         decls = code.split("\n\n")[0]
 
-        argc_name = " a0"  # update this variable once the decompiler picks up
-        # argument names from the common definition of main()
+        # The argument name comes from the semantic main prototype.
+        argc_name = " argc"
         assert argc_name in decls
         assert code.count(decls) == 1  # it should only appear once
 
     def test_decompiling_strings_c_representation(self):
-        input_expected = [("""Foo"bar""", '"Foo\\"bar"'), ("""Foo'bar""", '"Foo\'bar"')]
+        input_expected = [
+            ("""Foo"bar""", '"Foo\\"bar"'),
+            ("""Foo'bar""", '"Foo\'bar"'),
+            # bytes from the binary are rendered as text when they decode as UTF-8...
+            (b"hello", '"hello"'),
+            (b"caf\xc3\xa9", '"caf\u00e9"'),
+            (b'Foo"bar', '"Foo\\"bar"'),
+            # ...and as \xNN escapes when they do not, instead of raising UnicodeDecodeError
+            (b"unable to open file for read\xcc", '"unable to open file for read\\xcc"'),
+            (b"\xff\xfe\x80", '"\\xff\\xfe\\x80"'),
+            (b'Foo"bar\xcc', '"Foo\\"bar\\xcc"'),
+        ]
 
         for _input, expected in input_expected:
             result = angr.analyses.decompiler.structured_codegen.c.CConstant.str_to_c_str(_input)
@@ -1240,6 +1305,46 @@ class TestDecompiler(unittest.TestCase):
         assert '"Username: "' in code
         assert '"Password: "' in code
 
+    def test_arm_thumb_stack_pointer_saved_in_r7(self):
+        bin_path = os.path.join(test_location, "armhf", "fauxware")
+        p = angr.Project(bin_path, auto_load_libs=False)
+
+        cfg = p.analyses[CFGFast].prep()(normalize=True)
+        r7_offset = p.arch.registers["r7"][0]
+        sp_offset = p.arch.sp_offset
+        assert r7_offset == 36
+
+        authenticate = cfg.functions[0x104C9]
+        dec = p.analyses[Decompiler].prep(fail_fast=True)(authenticate, cfg=cfg.model)
+        assert dec.clinic is not None
+        spt = dec.clinic._spt  # pylint: disable=protected-access
+        assert spt is not None
+        assert r7_offset in spt.reg_offsets
+        assert not spt.inconsistent_for(sp_offset)
+        assert authenticate.endpoints
+        assert all(spt.offset_after_block(endpoint.addr, sp_offset) == 0 for endpoint in authenticate.endpoints)
+        assert dec.clinic.graph is not None
+        self.assertFalse(
+            any(
+                isinstance(stmt, ailment.Stmt.Assignment)
+                and isinstance(stmt.dst, ailment.Expr.VirtualVariable)
+                and stmt.dst.was_stack
+                and isinstance(stmt.src, ailment.Expr.VirtualVariable)
+                and stmt.src.was_reg
+                and stmt.src.reg_offset == r7_offset
+                for block in dec.clinic.graph
+                for stmt in block.statements
+            ),
+            "saved r7 leaked into final AIL as a register-save spill",
+        )
+
+        accepted = cfg.functions[0x1052D]
+        dec = p.analyses[Decompiler].prep(fail_fast=True)(accepted, cfg=cfg.model)
+        assert dec.clinic is not None
+        spt = dec.clinic._spt  # pylint: disable=protected-access
+        assert spt is not None
+        assert r7_offset not in spt.reg_offsets
+
     @for_all_structuring_algos
     def test_stack_canary_removal_x8664_extra_exits(self, decompiler_options=None):
         # Test stack canary removal on functions with extra exit
@@ -1677,8 +1782,8 @@ class TestDecompiler(unittest.TestCase):
 
         print_decompilation_result(d)
 
-        # function arguments must be a0 and a1. they cannot be renamed
-        assert re.search(r"int main\([\s\S]+ a0, [\s\S]+a1[\S]*\)", d.codegen.text) is not None
+        # function arguments must keep the semantic names from the main prototype
+        assert re.search(r"int main\([^,\n]+ argc, [^,\n]+argv\)", d.codegen.text) is not None
 
         assert (
             "max_width = (int)xdectoumax(" in d.codegen.text
@@ -2054,6 +2159,36 @@ class TestDecompiler(unittest.TestCase):
         print_decompilation_result(d)
         assert "setlocale(" in d.codegen.text
         assert "NULL);" in d.codegen.text, "The arguments for setlocale() are missing"
+
+        # fadvise has a conditional tail jump to fdadvise.
+        f = proj.kb.functions["fadvise"]
+        d = proj.analyses[Decompiler].prep(fail_fast=True)(f, cfg=cfg.model, options=decompiler_options)
+        print_decompilation_result(d)
+        assert "return fdadvise(" in d.codegen.text
+
+    def test_decompiling_thumb_self_loop_as_loop(self):
+        bin_path = os.path.join(test_location, "armel", "Nucleo_read_hyperterminal.elf")
+        proj = angr.Project(bin_path, auto_load_libs=False)
+        function_symbol = proj.loader.find_symbol("HardFault_Handler")
+        assert function_symbol is not None
+
+        cfg = proj.analyses.CFGFast(normalize=True, function_starts=[function_symbol.rebased_addr])
+        func = cfg.functions[function_symbol.rebased_addr]
+
+        clinic = proj.analyses.Clinic(func, cfg=cfg.model)
+        assert clinic.graph is not None
+        clinic_entry = next(block for block in clinic.graph if block.addr == func.addr)
+        self.assertTrue(clinic.graph.has_edge(clinic_entry, clinic_entry))
+        self.assertIsInstance(clinic_entry.statements[-1], ailment.Stmt.Jump)
+
+        for structurer in (SAILRStructurer.NAME, PhoenixStructurer.NAME):
+            with self.subTest(structurer=structurer):
+                dec = proj.analyses[Decompiler].prep(fail_fast=True)(
+                    func, cfg=cfg.model, options=[(get_structurer_option(), structurer)]
+                )
+                assert dec.codegen is not None and dec.codegen.text is not None
+                self.assertIn("while (1)", dec.codegen.text)
+                self.assertEqual(dec.codegen.text.count(f"{func.name}("), 1)
 
     @for_all_structuring_algos
     def test_decompiling_du_di_set_alloc(self, decompiler_options=None):
@@ -2791,12 +2926,12 @@ class TestDecompiler(unittest.TestCase):
             assert f"case {case_}:" in d.codegen.text
         assert "default:" in d.codegen.text
 
-        # ensure "v14 = fmt(stdin, "-");" shows up before "optind < a0"
+        # ensure "v14 = fmt(stdin, "-");" and the argc-derived optind guard show up before the return
         lines = d.codegen.text.split("\n")
-        a0_assignment_line = next(line for line in lines if " = a0;" in line)
-        a0_var = a0_assignment_line.split(" = ")[0].strip()
+        argc_assignment_line = next(line for line in lines if " = argc;" in line)
+        argc_var = argc_assignment_line.split(" = ")[0].strip()
         fmt_line = next(i for i, line in enumerate(lines) if 'fmt(stdin, "-");' in line)
-        optind_line = next(i for i, line in enumerate(lines) if f"optind < {a0_var}" in line)
+        optind_line = next(i for i, line in enumerate(lines) if f"optind < {argc_var}" in line)
         return_line = next(i for i, line in enumerate(lines) if "do not return" not in line and "return " in line)
         assert 0 <= fmt_line < return_line and 0 <= optind_line < return_line
 
@@ -3711,11 +3846,15 @@ class TestDecompiler(unittest.TestCase):
         proj.analyses.CompleteCallingConventions(cfg=cfg)
 
         f = proj.kb.functions["main"]
-        d = proj.analyses[Decompiler].prep(fail_fast=True)(f, cfg=cfg.model, options=decompiler_options)
+        d = proj.analyses[Decompiler].prep(fail_fast=True)(
+            f,
+            cfg=cfg.model,
+            options=decompiler_options,
+            preset=DECOMPILATION_PRESETS["full"],
+        )
         print_decompilation_result(d)
 
-        # incorrect region replacement was causing the while loop be duplicated, so we would end up with four while
-        # loops. In the original source, there is only a single while loop.
+        # Incorrect fixed-point output could lose or duplicate this loop. In the original source, there is one loop.
         assert d.codegen.text.count("while (") == 1
 
     @structuring_algo("sailr")
@@ -4482,8 +4621,10 @@ class TestDecompiler(unittest.TestCase):
     def test_stop_iteration_in_canary_init_stmt(self, decompiler_options=None):
         bin_path = os.path.join(test_location, "x86_64", "hello_gcc9_reassembler")
         proj = angr.Project(bin_path, auto_load_libs=False)
-        cfg = proj.analyses.CFGFast(normalize=True)
-        function = cfg.functions[4198577]
+        # 0x4010b1 is alignment padding ahead of register_tm_clones, which the smart scan no longer recovers as a
+        # function of its own, so ask for it by hand.
+        cfg = proj.analyses.CFGFast(normalize=True, function_starts=[0x4010B1])
+        function = cfg.functions[0x4010B1]
         function.normalize()
         d = proj.analyses.Decompiler(func=function, cfg=cfg.model, options=decompiler_options)
         print_decompilation_result(d)
@@ -4562,6 +4703,41 @@ class TestDecompiler(unittest.TestCase):
         # TODO: there is some inconsistency in generating the conditions to bound the successors of this region
         #   so this can most-likely be re-enabled with virtual variable insertion
         # assert text.count("sub_404860") == 1
+
+    @structuring_algo("sailr")
+    def test_libbsd_r_sort_a_deduplication_preserves_entry(self, decompiler_options=None):
+        bin_path = os.path.join(test_location, "x86_64", "decompiler", "libbsd.so.0.11.7")
+        proj = angr.Project(bin_path, auto_load_libs=False, load_debug_info=True)
+        symbol = proj.loader.find_symbol("r_sort_a")
+        assert symbol is not None
+
+        function_addr = symbol.rebased_addr
+        cfg = proj.analyses.CFGFast(
+            normalize=True,
+            regions=[(function_addr, function_addr + symbol.size)],
+            start_at_entry=False,
+            function_starts=[function_addr],
+            symbols=True,
+            force_smart_scan=False,
+        )
+        function = cfg.functions[function_addr]
+        decompilation = proj.analyses[Decompiler].prep(fail_fast=True)(
+            function,
+            cfg=cfg.model,
+            options=decompiler_options,
+            preset=DECOMPILATION_PRESETS["full"],
+            use_cache=False,
+            update_cache=False,
+        )
+
+        assert decompilation.codegen is not None
+        assert decompilation.codegen.text is not None
+        clinic = decompilation.clinic
+        assert clinic is not None
+        self.assertEqual(clinic.entry_node_addr, (function_addr, None))
+        entry_nodes = [node for node in clinic.graph if (node.addr, node.idx) == clinic.entry_node_addr]
+        self.assertEqual(len(entry_nodes), 1)
+        self.assertEqual(clinic.graph.in_degree(entry_nodes[0]), 0)
 
     @structuring_algo("sailr")
     def test_deduplication_too_sensitive_split_3(self, decompiler_options=None):
@@ -5494,6 +5670,24 @@ class TestDecompiler(unittest.TestCase):
 
         # ensure decompling this function should not take over 30 seconds - it was taking at least two minutes before
         # recent optimizations
+
+    def test_decompiling_armel_go_boundserror(self, decompiler_options=None):
+        # An ARM32 register-offset store (strb rX, [rB, rI]) lets the traversal pair a stack base with a
+        # .rodata address in the index register, producing an ~800 KB stack variable that swallowed the
+        # frame of runtime.boundsError.Error.
+        bin_path = os.path.join(test_location, "armel", "decompiler", "errorpaths_go")
+        proj, cfg = load_project_with_scoped_cfg(bin_path, 0x2744C)
+
+        start = time.time()
+        dec = proj.analyses[Decompiler].prep(fail_fast=True)(
+            cfg.functions[0x2744C], cfg=cfg.model, options=decompiler_options
+        )
+        elapsed = time.time() - start
+        assert dec.codegen is not None and dec.codegen.text is not None
+        print_decompilation_result(dec)
+
+        assert "|Stack bp-" not in dec.codegen.text, "an unresolved stack variable leaked into the output"
+        assert elapsed <= 120, f"Decompiling runtime.boundsError.Error took {elapsed} seconds"
 
     def test_fastfail_intrinsic(self, decompiler_options=None):
         bin_path = os.path.join(test_location, "x86_64", "windows", "fastfail.exe")
