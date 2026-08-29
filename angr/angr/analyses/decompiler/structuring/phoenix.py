@@ -20,6 +20,7 @@ from angr.analyses.decompiler.sequence_walker import SequenceWalker
 from angr.analyses.decompiler.structurer_nodes import (
     BaseNode,
     BreakNode,
+    CodeNode,
     ConditionalBreakNode,
     ConditionNode,
     ContinueNode,
@@ -89,6 +90,7 @@ class PhoenixStructurer(StructurerBase):
 
     NAME = "phoenix"
     SUPPORTS_OVERLAYS = True
+    _SWITCH_ENTRY_IDX_UNKNOWN = object()
 
     def __init__(
         self,
@@ -162,6 +164,82 @@ class PhoenixStructurer(StructurerBase):
                 f"{msg}: More than one graph entrance. Please report this."
             )
 
+    @classmethod
+    def _switch_entry_idx(cls, node):
+        """Recover the index of a structured node's entry block."""
+
+        if isinstance(node, (Block, MultiNode)):
+            return node.idx
+        if isinstance(node, CodeNode):
+            return cls._switch_entry_idx(node.node)
+        if isinstance(node, SequenceNode) and node.nodes and node.nodes[0].addr == node.addr:
+            return cls._switch_entry_idx(node.nodes[0])
+        if isinstance(node, IncompleteSwitchCaseNode) and node.head is not None and node.head.addr == node.addr:
+            return cls._switch_entry_idx(node.head)
+        return cls._SWITCH_ENTRY_IDX_UNKNOWN
+
+    @classmethod
+    def _switch_resolve_entry_nodes(
+        cls, nodes, expected_entries: set[tuple[int, int | None]]
+    ) -> dict[tuple[int, int | None], Any] | None:
+        """Resolve switch metadata identities against direct successor nodes as a group."""
+
+        candidates_by_addr = defaultdict(list)
+        for candidate in nodes:
+            candidates_by_addr[candidate.addr].append(candidate)
+
+        expected_indices_by_addr = defaultdict(set)
+        for entry_addr, entry_idx in expected_entries:
+            expected_indices_by_addr[entry_addr].add(entry_idx)
+
+        resolved: dict[tuple[int, int | None], Any] = {}
+        for entry_addr, expected_indices in expected_indices_by_addr.items():
+            candidates = candidates_by_addr.get(entry_addr, [])
+            if not candidates:
+                for entry_idx in expected_indices:
+                    resolved[entry_addr, entry_idx] = None
+                continue
+
+            if len(expected_indices) == 1 and len(candidates) == 1:
+                resolved[entry_addr, next(iter(expected_indices))] = candidates[0]
+                continue
+
+            candidates_by_idx = {}
+            for candidate in candidates:
+                candidate_idx = cls._switch_entry_idx(candidate)
+                if candidate_idx is cls._SWITCH_ENTRY_IDX_UNKNOWN or candidate_idx in candidates_by_idx:
+                    return None
+                candidates_by_idx[candidate_idx] = candidate
+
+            remaining_indices = set(expected_indices)
+            for entry_idx in expected_indices:
+                exact_match = candidates_by_idx.pop(entry_idx, None)
+                if exact_match is not None:
+                    resolved[entry_addr, entry_idx] = exact_match
+                    remaining_indices.remove(entry_idx)
+
+            if not candidates_by_idx:
+                for entry_idx in remaining_indices:
+                    resolved[entry_addr, entry_idx] = None
+            else:
+                return None
+
+        return resolved
+
+    @classmethod
+    def _switch_entries_match(cls, left, right) -> bool:
+        if left is right:
+            return True
+        if left.addr != right.addr:
+            return False
+        left_idx = cls._switch_entry_idx(left)
+        right_idx = cls._switch_entry_idx(right)
+        return (
+            left_idx is not cls._SWITCH_ENTRY_IDX_UNKNOWN
+            and right_idx is not cls._SWITCH_ENTRY_IDX_UNKNOWN
+            and left_idx == right_idx
+        )
+
     def _analyze(self):
         # iterate until there is only one node in the region
 
@@ -230,6 +308,8 @@ class PhoenixStructurer(StructurerBase):
                 )
                 self._assert_graph_ok(self._region.graph, "Last resort refinement went wrong")
                 if not removed_edge:
+                    if self._absorb_residual_tree():
+                        continue
                     # cannot make any progress in this region. return the subgraph directly
                     break
 
@@ -1305,37 +1385,50 @@ class PhoenixStructurer(StructurerBase):
         if not isinstance(last_stmt, IncompleteSwitchCaseHeadStatement):
             return False
 
+        # make a fake jumptable
+        node_default_addr = None
+        node_default_idx = None
+        case_entries: dict[int, tuple[int, int | None]] = {}
+        for _, case_value, case_target_addr, case_target_idx, _ in last_stmt.case_addrs:
+            if isinstance(case_value, str):
+                if case_value == "default":
+                    node_default_addr = case_target_addr
+                    node_default_idx = case_target_idx
+                    continue
+                raise ValueError(f"Unsupported 'case_value' {case_value}")
+            case_entries[case_value] = (case_target_addr, case_target_idx)
+
         # sanity check: all case nodes must have at most one common successor at this point
-        # note that we are ignoring AIL blocks with block ID != None
-        nodes = {(nn.addr, nn.idx if isinstance(nn, Block) else None): nn for nn in graph_raw.successors(node)}
+        expected_entries = set(case_entries.values())
+        default_entry = None
+        if node_default_addr is not None:
+            default_entry = node_default_addr, node_default_idx
+            expected_entries.add(default_entry)
+        entry_nodes = self._switch_resolve_entry_nodes(graph_raw.successors(node), expected_entries)
+        if entry_nodes is None:
+            return False
+
         successors: set[int] = set()
         case_nodes: set[int] = set()
         for _, _, case_target_addr, case_target_idx, _ in last_stmt.case_addrs:
             case_nodes.add(case_target_addr)
-            case_node = nodes.get((case_target_addr, case_target_idx))
+            case_node = entry_nodes[case_target_addr, case_target_idx]
             if case_node is None:
                 continue
             successors.update(nn.addr for nn in graph_raw.successors(case_node))
         if len(successors.difference(case_nodes)) > 1:
             return False
 
-        # make a fake jumptable
-        node_default_addr = None
-        case_entries: dict[int, int | tuple[int, int | None]] = {}
-        for _, case_value, case_target_addr, case_target_idx, _ in last_stmt.case_addrs:
-            if isinstance(case_value, str):
-                if case_value == "default":
-                    node_default_addr = case_target_addr
-                    continue
-                raise ValueError(f"Unsupported 'case_value' {case_value}")
-            case_entries[case_value] = (case_target_addr, case_target_idx)
-
+        selected_entry_to_case = {}
         cases, node_default, to_remove = self._switch_build_cases(
             case_entries,
             node,
             node,
             node_default_addr,
             graph_raw,
+            entry_nodes=entry_nodes,
+            default_entry=default_entry,
+            selected_entry_to_case=selected_entry_to_case,
         )
         fake_node_default = False
         if node_default_addr is not None and node_default is None:
@@ -1344,7 +1437,7 @@ class PhoenixStructurer(StructurerBase):
             jmp_to_default_node = Jump(
                 self.ail_manager.next_atom(),
                 Const(self.ail_manager.next_atom(), node_default_addr, self.project.arch.bits),
-                None,
+                target_idx=node_default_idx,
                 ins_addr=SWITCH_MISSING_DEFAULT_NODE_ADDR,
             )
             node_default = Block(SWITCH_MISSING_DEFAULT_NODE_ADDR, 0, statements=[jmp_to_default_node])
@@ -1363,6 +1456,7 @@ class PhoenixStructurer(StructurerBase):
             graph_raw,
             full_graph_raw,
             bail_on_nonhead_outedges=True,
+            selected_entry_to_case=selected_entry_to_case,
         )
         if not r:
             if fake_node_default:
@@ -1376,7 +1470,7 @@ class PhoenixStructurer(StructurerBase):
         if node_default is not None and self._region.graph.out_degree[node] > 1:
             other_out_nodes = list(self._region.graph.successors(node))
             for o in other_out_nodes:
-                if o.addr == node_default.addr and o is not node_default:
+                if o is not node_default and self._switch_entries_match(o, node_default):
                     self._region.remove_node(o, absorbed_into=node_default, absorb_out_edges=True)
 
         switch_end_addr = self._switch_find_switch_end_addr(cases, node_default, {nn.addr for nn in self._region.graph})
@@ -1974,49 +2068,59 @@ class PhoenixStructurer(StructurerBase):
         node_a: BaseNode,
         node_b_addr: int | None,
         graph_raw: networkx.DiGraph,
+        *,
+        entry_nodes: dict[tuple[int, int | None], Any] | None = None,
+        default_entry: tuple[int, int | None] | None = None,
+        selected_entry_to_case: dict[int, SequenceNode] | None = None,
     ) -> tuple[OrderedDict, Any, set[Any]]:
         cases: OrderedDict[int | tuple[int, ...], SequenceNode] = OrderedDict()
         to_remove = set()
 
         graph = graph_raw.filtered()
+        default_node_candidates = []
+        node_a_successors = []
+        node_b_in_node_a_successors = False
 
-        default_node_candidates = (
-            [nn for nn in graph.nodes if nn.addr == node_b_addr] if node_b_addr is not None else []
-        )
-        node_default = (
-            self._switch_find_default_node(graph, head_node, node_b_addr) if node_b_addr is not None else None
-        )
+        if entry_nodes is None:
+            default_node_candidates = (
+                [nn for nn in graph.nodes if nn.addr == node_b_addr] if node_b_addr is not None else []
+            )
+            node_default = (
+                self._switch_find_default_node(graph, head_node, node_b_addr) if node_b_addr is not None else None
+            )
+        else:
+            node_default = entry_nodes[default_entry] if default_entry is not None else None
         if node_default is not None and not isinstance(node_default, SequenceNode):
             # make the default node a SequenceNode so that we can insert Break and Continue nodes into it later
             new_node = SequenceNode(node_default.addr, nodes=[node_default])
             self.replace_nodes_both(node_default, new_node)
             node_default = new_node
+        if entry_nodes is not None and node_default is not None and selected_entry_to_case is not None:
+            selected_entry_to_case[id(node_default)] = node_default
 
         converted_nodes: dict[tuple[int, int | None], Any] = {}
         entry_addr_to_ids: defaultdict[tuple[int, int | None], set[int]] = defaultdict(set)
 
-        # the default node might get duplicated (e.g., by EagerReturns). we detect if a duplicate of the default node
-        # (node b) is a successor node of node a. we only skip those entries going to the default node if no duplicate
-        # of default node exists in node a's successors.
-        node_a_successors = list(graph.successors(node_a))
-        if len(default_node_candidates) > 1:
-            node_b_in_node_a_successors = any(nn for nn in node_a_successors if nn in default_node_candidates)
-        else:
-            # the default node is not duplicated
-            node_b_in_node_a_successors = False
+        if entry_nodes is None:
+            # the default node might get duplicated (e.g., by EagerReturns). we detect if a duplicate of the default
+            # node (node b) is a successor node of node a. we only skip those entries going to the default node if no
+            # duplicate of default node exists in node a's successors.
+            node_a_successors = list(graph.successors(node_a))
+            if len(default_node_candidates) > 1:
+                node_b_in_node_a_successors = any(nn for nn in node_a_successors if nn in default_node_candidates)
 
-        for case_idx, entry_addr in case_and_entryaddrs.items():
-            if isinstance(entry_addr, tuple):
-                entry_addr, entry_idx = entry_addr
-            else:
-                entry_idx = None
+        for case_idx, entry_addr_and_idx in case_and_entryaddrs.items():
+            entry_key = entry_addr_and_idx if isinstance(entry_addr_and_idx, tuple) else (entry_addr_and_idx, None)
+            entry_addr, entry_idx = entry_key
 
-            if not node_b_in_node_a_successors and entry_addr == node_b_addr:
+            if entry_nodes is not None and entry_key == default_entry:
+                continue
+            if entry_nodes is None and not node_b_in_node_a_successors and entry_addr == node_b_addr:
                 # jump to default or end of the switch-case structure - ignore this case
                 continue
 
-            entry_addr_to_ids[(entry_addr, entry_idx)].add(case_idx)
-            if (entry_addr, entry_idx) in converted_nodes:
+            entry_addr_to_ids[entry_key].add(case_idx)
+            if entry_key in converted_nodes:
                 continue
 
             if entry_addr in {self._region.head.addr, head_node.addr}:
@@ -2024,6 +2128,8 @@ class PhoenixStructurer(StructurerBase):
                 # lead to the removal of the region head node or the switch head node). replace this entry with a
                 # goto statement later.
                 entry_node = None
+            elif entry_nodes is not None:
+                entry_node = entry_nodes[entry_key]
             else:
                 entry_node = next(
                     iter(
@@ -2050,7 +2156,7 @@ class PhoenixStructurer(StructurerBase):
                     ],
                 )
                 case_node = SequenceNode(0, nodes=[case_inner_node])
-                converted_nodes[(entry_addr, entry_idx)] = case_node
+                converted_nodes[entry_key] = case_node
                 continue
 
             if isinstance(entry_node, SequenceNode):
@@ -2059,7 +2165,9 @@ class PhoenixStructurer(StructurerBase):
                 case_node = SequenceNode(entry_node.addr, nodes=[entry_node])
             to_remove.add(entry_node)
 
-            converted_nodes[(entry_addr, entry_idx)] = case_node
+            converted_nodes[entry_key] = case_node
+            if entry_nodes is not None and selected_entry_to_case is not None:
+                selected_entry_to_case[id(entry_node)] = case_node
 
         for entry_addr_and_idx, converted_node in converted_nodes.items():
             assert entry_addr_and_idx in entry_addr_to_ids
@@ -2087,8 +2195,11 @@ class PhoenixStructurer(StructurerBase):
         full_graph: networkx.DiGraph,
         node_a=None,
         bail_on_nonhead_outedges: bool = False,
+        selected_entry_to_case: dict[int, SequenceNode] | None = None,
     ) -> bool:
         scnode = SwitchCaseNode(cmp_expr, cases, node_default, addr=addr)
+        if selected_entry_to_case is not None:
+            to_remove = set(to_remove)
 
         # insert the switch-case node to the graph
         other_nodes_inedges = []
@@ -2163,9 +2274,15 @@ class PhoenixStructurer(StructurerBase):
                 [edge for edge in out_edges if edge[1] is not head], key=lambda edge: (edge[0].addr, edge[1].addr)
             )
 
-            # for all out edges going to head, we ensure there is a goto at the end of each corresponding case node
+            resolved_out_edges_to_head: list[tuple[Any, SequenceNode]] = []
             for out_src, out_dst in out_edges_to_head:
                 assert out_dst is head
+                if selected_entry_to_case is not None:
+                    selected_case_node = selected_entry_to_case.get(id(out_src))
+                    if selected_case_node is None:
+                        return False
+                    resolved_out_edges_to_head.append((out_src, selected_case_node))
+                    continue
                 all_case_nodes = list(cases.values())
                 if node_default is not None:
                     all_case_nodes.append(node_default)
@@ -2227,6 +2344,21 @@ class PhoenixStructurer(StructurerBase):
                         scnode.addr,
                         out_dst_succ_fullgraph.addr,
                     )
+
+            for out_src, case_node in resolved_out_edges_to_head:
+                try:
+                    case_node_last_stmt = self.cond_proc.get_last_statement(case_node)
+                except EmptyBlockNotice:
+                    case_node_last_stmt = None
+                if not isinstance(case_node_last_stmt, Jump):
+                    jump_stmt = Jump(
+                        self.ail_manager.next_atom(),
+                        Const(self.ail_manager.next_atom(), head.addr, self.project.arch.bits),
+                        None,
+                        ins_addr=out_src.addr,
+                    )
+                    jump_node = Block(out_src.addr, 0, statements=[jump_stmt])
+                    case_node.nodes.append(jump_node)
 
             if out_dst_succ is not None:
                 self._region.add_edge(scnode, out_dst_succ)
@@ -3123,13 +3255,15 @@ class PhoenixStructurer(StructurerBase):
             l.debug("last_resort: Removed edge %r -> %r (type 2)", src, dst)
             return True
 
-        if self._region.parent is None and not self._region.cyclic and not graph_is_dag:
+        if self._parent_region is None and not self._region.cyclic and not graph_is_dag:
             # an acyclic region must not contain cycles; one can appear as debris when an inner cyclic region
             # fails to structure and dissolves its partially-refined body into this region. the cycle-closing
             # edges are excluded from the candidate lists above (they are back edges, dropped from
             # acyclic_graph), so without this fallback the region can never become structurable. only the root
             # region recovers this way (a goto): anywhere else, failing and dissolving into an enclosing region
-            # gives a cyclic ancestor the chance to structure the loop properly first.
+            # gives a cyclic ancestor the chance to structure the loop properly first. the root is the region
+            # RecursiveStructurer passed in with no parent, not the one whose overlay-tree link is unset:
+            # region identification also sets that link on the top region when it wraps it in one overlay.
             # virtualize one cycle edge to recover.
             cycle_edges = []
             for src, dst in full_graph.edges:
@@ -3152,6 +3286,376 @@ class PhoenixStructurer(StructurerBase):
 
         l.debug("last_resort: No edge to remove")
         return False
+
+    #
+    # Residual-tree absorption (the reduction of last resort)
+    #
+
+    def _absorb_residual_tree(self) -> bool:
+        """
+        Attempted only after ``_last_resort_refinement`` has already declined to virtualize any edge: lay the
+        remaining region out as a single SequenceNode instead of giving up on it.
+
+        It applies when the remaining graph is a tree rooted at the region head. Every non-head node then has
+        exactly one predecessor, so it is entered through exactly one transfer, and that transfer is either an
+        explicit jump statement that already survives in the emitted code (in which case the node may be laid out
+        anywhere) or a fall-through (in which case the node must be laid out immediately after its predecessor).
+        ``_residual_tree_layout`` establishes such an order, or refuses; a refusal leaves the region untouched and
+        the caller gives up exactly as it did before.
+
+        Only the root region absorbs this way, for the same reason the type-4 fallback above is root-only:
+        anywhere else, reporting no progress dissolves the region into its parent, which loses no code and gives
+        an enclosing region the chance to structure these nodes with more context. It is the root region's
+        failure that makes RecursiveStructurer keep one node of the residual graph and drop the rest.
+        """
+        if self._parent_region is not None:
+            return False
+
+        region = self._region
+        graph = region.graph
+        head = region.head
+
+        reason = None
+        order = None
+        if len(graph.nodes) < 2:
+            reason = "single_node"
+        elif head not in graph:
+            reason = "head_gone"
+        elif not networkx.is_directed_acyclic_graph(graph):
+            reason = "cyclic"
+        elif graph.in_degree[head] != 0:
+            reason = "head_in_degree"
+        elif any(graph.in_degree[nn] != 1 for nn in graph.nodes if nn is not head):
+            reason = "not_a_tree"
+        elif len(list(networkx.dfs_preorder_nodes(graph, head))) != len(graph.nodes):
+            reason = "unreachable_nodes"
+        elif any(isinstance(nn, IncompleteSwitchCaseNode) for nn in graph.nodes):
+            # an IncompleteSwitchCaseNode is an intermediate node that must not survive into the result
+            reason = "incomplete_switch_case"
+        elif (
+            region.raw_graph.number_of_edges() != graph.number_of_edges()
+            or region.raw_graph_with_successors.number_of_edges() != region.graph_with_successors.number_of_edges()
+        ):
+            # edges marked during cyclic refinement are hidden from these views but are still real transfers in
+            # the shared graph; the layout below would be reasoning about the wrong control flow
+            reason = "marked_edges"
+        else:
+            order, reason = self._residual_tree_layout(graph, region.graph_with_successors, head)
+
+        if order is None:
+            l.debug("absorb_residual_tree: Declined a %d-node residual: %s", len(graph.nodes), reason)
+            return False
+
+        node_0 = order[0]
+        for node_1 in order[1:]:
+            jump_kind, jump_target = self._residual_stripped_jump(node_0)
+            if jump_kind == "none" or (jump_kind == "const" and jump_target == node_1.addr):
+                # _merge_nodes's terminator fixup is right here: either there is no trailing jump to strip, or
+                # the one it strips names exactly the node being appended behind it
+                new_node = self._merge_nodes(node_0, node_1)
+            else:
+                # the trailing jump goes somewhere else and must survive; concatenate without the fixup
+                new_node = self._concat_nodes(node_0, node_1)
+            self.replace_nodes_both(node_0, new_node, old_node_1=node_1)
+            node_0 = new_node
+        l.debug("absorb_residual_tree: Concatenated %d residual nodes into %r", len(order), node_0)
+        return True
+
+    def _residual_tree_layout(self, graph, full_graph, head) -> tuple[list | None, str | None]:
+        """
+        Order the nodes of a residual tree so that concatenating them preserves control flow, or refuse.
+
+        The invariant maintained for every adjacent pair (X, Y) in the returned order is: either X cannot fall off
+        its own end, or Y is the single successor X falls into. Successors X reaches only through a goto that is
+        already written inside X are queued and laid out later, wherever a node that cannot fall through leaves a
+        free slot. Anything that cannot be decided this way is a refusal, not a guess. A refusal returns no order
+        and the reason it declined.
+        """
+        members = set(graph.nodes)
+        emitted = []
+        entered: dict = {}
+        emitted_set = set()
+        pending: list = []
+
+        node = head
+        entered[head] = "head"
+        while True:
+            emitted.append(node)
+            emitted_set.add(node)
+            kind, forced = self._residual_next_node(graph, full_graph, members, node)
+            if kind == "refuse":
+                return None, forced
+            for succ in graph.successors(node):
+                if succ is not forced and succ not in emitted_set and succ not in pending:
+                    pending.append(succ)
+            if kind == "last":
+                # this node falls out of the region (or ends in a jump that must not be rewritten): nothing of
+                # this region may be laid out behind it
+                if pending:
+                    return None, "tail_with_pending"
+                break
+            if kind == "forced":
+                if forced in emitted_set or forced not in members:
+                    return None, "forced_unavailable"
+                if forced in pending:
+                    pending.remove(forced)
+                # after _merge_nodes/_concat_nodes this node runs straight into the next one
+                entered[forced] = "fallthrough"
+                node = forced
+            else:
+                # the node ends in an explicit transfer of control: any goto-reached node may follow it
+                if not pending:
+                    break
+                pending.sort(key=self._residual_sort_key)
+                node = pending.pop(0)
+                entered[node] = "goto"
+
+        if len(emitted) != len(members):
+            return None, "incomplete_layout"
+        if not self._residual_layout_is_reachable(emitted, entered):
+            return None, "unreachable_layout"
+        return emitted, None
+
+    def _residual_layout_is_reachable(self, emitted: list, entered: dict) -> bool:
+        """
+        The invariant the whole reduction rests on, checked against the layout it actually produced: every node
+        that is not the head and is not laid out as its predecessor's fall-through has to be entered by a goto
+        that survives concatenation. That means some member names its address as a constant jump target, and the
+        node carries the label that goto lands on. A region whose transfers are computed (an unstructured jump
+        table) fails here, and failing is the point: concatenating it would emit unreachable code.
+        """
+        named: set[int] = set()
+        for node in emitted:
+            targets: set[int] = set()
+            if self._residual_goto_targets(node, targets) != "ok":
+                return False
+            named |= targets
+        for node in emitted:
+            if entered.get(node) != "goto":
+                continue
+            if node.addr is None or node.addr not in named:
+                return False
+            if node.addr not in self._residual_entry_label_addrs(node):
+                return False
+        return True
+
+    @staticmethod
+    def _residual_sort_key(node):
+        return (
+            node.addr if node.addr is not None else -1,
+            (node.idx if node.idx is not None else -1) if hasattr(node, "idx") else -1,
+        )
+
+    def _residual_next_node(self, graph, full_graph, members, node) -> tuple[str, Any]:
+        """
+        Decide what may be laid out immediately after ``node``:
+
+        - ``("forced", succ)``: ``node`` falls into ``succ`` (or ends in a goto that ``_merge_nodes`` will strip
+          because ``succ`` is the node it names), so ``succ`` must come next.
+        - ``("free", None)``: ``node`` ends in an explicit transfer of control that survives concatenation, so
+          anything may come next.
+        - ``("last", None)``: nothing of this region may come next (its fall-through leaves the region).
+        - ``("refuse", reason)``: the layout is not decidable.
+        """
+        targets: set[int] = set()
+        status = self._residual_goto_targets(node, targets)
+        if status != "ok":
+            return "refuse", f"transfer_{status}"
+
+        succs = [succ for succ in full_graph.successors(node) if succ is not node]
+        # a successor whose address is named by a jump statement inside this node is reached through that
+        # statement, wherever the successor ends up in the layout
+        candidates = [succ for succ in succs if succ.addr is None or succ.addr not in targets]
+
+        if self._residual_falls_through(node):
+            if not candidates:
+                # every successor is named by a goto somewhere in the node, so one of them is reached both ways.
+                # narrow the question to the node's tail, which is what control runs off the end of: a goto in
+                # the tail names an exit of the tail, so the exit the tail falls out of is the one it does not
+                # name. (a goto inside a structured loop never names that loop's own successor -- the cyclic
+                # matchers rewrite jumps to the successor into breaks -- so the tail of a loop-terminated node
+                # is decidable this way.)
+                tail_targets: set[int] = set()
+                if self._residual_goto_targets(self._residual_tail(node), tail_targets) == "ok":
+                    candidates = [succ for succ in succs if succ.addr is None or succ.addr not in tail_targets]
+            if len(candidates) != 1:
+                # either nothing to fall into, or no way to tell which successor it is
+                return "refuse", f"fallthrough_candidates_{len(candidates)}"
+            fallthrough = candidates[0]
+            if fallthrough not in members:
+                # the fall-through leaves the region entirely
+                return "last", None
+            return "forced", fallthrough
+
+        # the node cannot fall through, so the successor order is free -- except that _merge_nodes strips a
+        # trailing unconditional Jump from its first argument, which is only correct when the node laid out
+        # behind it is the one that jump names
+        jump_kind, jump_target = self._residual_stripped_jump(node)
+        if jump_kind == "const":
+            candidates = [succ for succ in graph.successors(node) if succ.addr == jump_target]
+            if len(candidates) == 1:
+                # laying the named node out behind this one turns the jump into a fall-through, which is what
+                # _merge_nodes does by stripping it
+                return "forced", candidates[0]
+        # the jump names something outside the region (or nothing constant): _concat_nodes keeps it, so the node
+        # still cannot fall through and anything may follow it
+        return "free", None
+
+    @staticmethod
+    def _concat_nodes(node_0, node_1) -> SequenceNode:
+        """
+        ``_merge_nodes`` without its terminator fixup, for a pair whose first node ends in a jump that has to
+        survive: the flattening is the same, but no statement is removed or rewritten.
+        """
+        addr = node_0.addr if node_0.addr is not None else node_1.addr
+        if isinstance(node_0, SequenceNode):
+            if isinstance(node_1, SequenceNode):
+                return SequenceNode(addr, nodes=node_0.nodes + node_1.nodes)
+            return SequenceNode(addr, nodes=[*node_0.nodes, node_1])
+        if isinstance(node_1, SequenceNode):
+            return SequenceNode(addr, nodes=[node_0, *node_1.nodes])
+        return SequenceNode(addr, nodes=[node_0, node_1])
+
+    @staticmethod
+    def _residual_stripped_jump(node) -> tuple[str, int | None]:
+        """
+        Report the unconditional Jump that ``_merge_nodes`` would strip if ``node`` were its first argument:
+        ``("const", target)``, ``("indirect", None)``, or ``("none", None)`` when it would strip nothing.
+
+        This mirrors ``_merge_nodes``'s own choice of the block to fix up. It is deliberately the rule for a
+        first argument that is a SequenceNode *or* a MultiNode: in the pairwise reduction every argument after
+        the first is an accumulated SequenceNode, for which _merge_nodes flattens a SequenceNode operand but
+        appends a MultiNode whole, so applying the MultiNode rule everywhere can only over-report a strip, and
+        over-reporting costs a refusal rather than a mis-ordering.
+        """
+        last_node = None
+        if isinstance(node, (SequenceNode, MultiNode)) and node.nodes:
+            last_node = node.nodes[-1]
+        elif isinstance(node, Block):
+            last_node = node
+        if isinstance(last_node, Block) and last_node.statements and isinstance(last_node.statements[-1], Jump):
+            target = last_node.statements[-1].target
+            if isinstance(target, Const):
+                return "const", target.value
+            return "indirect", None
+        return "none", None
+
+    @classmethod
+    def _residual_tail(cls, node):
+        """
+        The construct control runs off the end of: the last child of the last child, and so on. Loops,
+        conditions and blocks are terminal here -- they are what actually ends the node.
+        """
+        while True:
+            if isinstance(node, (SequenceNode, MultiNode)):
+                if not node.nodes:
+                    return node
+                node = node.nodes[-1]
+            elif isinstance(node, CodeNode) and node.node is not None:
+                node = node.node
+            else:
+                return node
+
+    @classmethod
+    def _residual_falls_through(cls, node) -> bool:
+        """
+        Whether control can run off the end of ``node`` into whatever is laid out behind it. Only a node whose
+        tail demonstrably ends in a Jump, a Return or a two-target ConditionalJump does not; everything else (a
+        loop, a condition, an unrecognized node, a ConditionalJump that leaves one target implicit) is assumed to
+        fall through, which costs a refusal rather than a mis-ordering.
+        """
+        tail = cls._residual_tail(node)
+        if not isinstance(tail, Block):
+            return True
+        stmts = [stmt for stmt in tail.statements if not isinstance(stmt, Label)]
+        if not stmts:
+            return True
+        last_stmt = stmts[-1]
+        if isinstance(last_stmt, (Jump, Return)):
+            return False
+        if isinstance(last_stmt, ConditionalJump):
+            # a conditional jump with only one target falls through on the other side
+            return last_stmt.true_target is None or last_stmt.false_target is None
+        return True
+
+    @classmethod
+    def _residual_goto_targets(cls, node, targets: set[int]) -> str:
+        """
+        Collect into ``targets`` every address a statement inside ``node`` names as a jump target, and report
+        whether that collection can be trusted:
+
+        - ``"ok"``: every transfer out of this node is either a fall-through or a constant target now in
+          ``targets``, so laying a named node out anywhere behind it still reaches it.
+        - ``"indirect"``: a jump with a computed target (a jump table that never got structured, a call through
+          a pointer). It names no address, so a successor reached through it can only be entered by falling into
+          it -- concatenating such a region emits code nothing can reach.
+        - ``"opaque"``: a node or statement this walk does not understand, so the collection is incomplete.
+        """
+        if node is None:
+            return "ok"
+        if isinstance(node, Block):
+            for stmt in node.statements:
+                if isinstance(stmt, IncompleteSwitchCaseHeadStatement):
+                    return "opaque"
+                if isinstance(stmt, Jump):
+                    if not isinstance(stmt.target, Const):
+                        return "indirect"
+                    targets.update(extract_jump_targets(stmt))
+                elif isinstance(stmt, ConditionalJump):
+                    for target in (stmt.true_target, stmt.false_target):
+                        # a None target is the implicit fall-through side, not an unresolvable one
+                        if target is not None and not isinstance(target, Const):
+                            return "indirect"
+                    targets.update(extract_jump_targets(stmt))
+            return "ok"
+
+        def _all(children) -> str:
+            for child in children:
+                status = cls._residual_goto_targets(child, targets)
+                if status != "ok":
+                    return status
+            return "ok"
+
+        if isinstance(node, (SequenceNode, MultiNode)):
+            return _all(node.nodes)
+        if isinstance(node, CodeNode):
+            return cls._residual_goto_targets(node.node, targets)
+        if isinstance(node, LoopNode):
+            return cls._residual_goto_targets(node.sequence_node, targets)
+        if isinstance(node, ConditionNode):
+            return _all([node.true_node, node.false_node])
+        if isinstance(node, SwitchCaseNode):
+            return _all([*node.cases.values(), node.default_node])
+        if isinstance(node, (BreakNode, ContinueNode)):
+            # a break or a continue is a transfer within an enclosing loop, not a goto out of this node
+            return "ok"
+        return "opaque"
+
+    @classmethod
+    def _residual_entry_label_addrs(cls, node) -> set[int]:
+        """
+        The addresses a goto can actually land on at the top of ``node``: the ins_addrs of the labels that lead
+        its entry block, which is what RedundantLabelRemover keeps and the backend emits as ``LABEL_x``.
+        """
+        while True:
+            if isinstance(node, (SequenceNode, MultiNode)):
+                if not node.nodes:
+                    return set()
+                node = node.nodes[0]
+            elif isinstance(node, CodeNode) and node.node is not None:
+                node = node.node
+            else:
+                break
+        if not isinstance(node, Block):
+            return set()
+        addrs = set()
+        for stmt in node.statements:
+            if isinstance(stmt, Label):
+                if "ins_addr" in stmt.tags:
+                    addrs.add(stmt.tags["ins_addr"])
+            elif not is_phi_assignment(stmt):
+                break
+        return addrs
 
     @staticmethod
     def _on_virtualize_edge_failure(src, dst) -> bool:

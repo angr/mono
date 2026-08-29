@@ -1,9 +1,11 @@
 # pylint: disable=R0201,C0111,line-too-long,bad-builtin,expression-not-assigned,no-member
 from __future__ import annotations
 
+import os
 import struct
 from unittest import TestCase
 
+import pyvex
 from archinfo import ArchAArch64
 
 import angr
@@ -11,12 +13,74 @@ from angr.analyses import CFGFast, ReachingDefinitionsAnalysis
 from angr.knowledge_plugins import Function
 from angr.knowledge_plugins.key_definitions.atoms import Atom
 from angr.knowledge_plugins.key_definitions.constants import OP_BEFORE
+from tests.common import bin_location
 
 
 class TestRDARegressions(TestCase):
     """
     Test misc regressions for the ReachingDefinitionsAnalysis.
     """
+
+    def test_concat_of_a_multivalues_with_itself(self):
+        """
+        Iop_16HLto32(t, t) reads the same VEX temporary for both operands, and _expr_bv() returns the live
+        object stored in self.tmps, so MultiValues.concat() used to receive one object as both self and
+        other. It copy-constructed MultiValues(self), which aliased the offset map rather than copying it,
+        and the add_value() that followed inserted into the dict its own items() iteration was walking.
+        """
+        binary = os.path.join(
+            bin_location,
+            "tests",
+            "x86_64",
+            "windows",
+            "dd56403d14ffe220a645a964a19f8b488e200b84ae5a414b0c020b561ae40880.sys",
+        )
+        func_addr = 0x1400DF7BF
+
+        proj = angr.Project(binary, auto_load_libs=False)
+        # Scope the scan to the one function that carries the pattern: the whole binary is 18k functions.
+        cfg = proj.analyses[CFGFast].prep()(
+            regions=[(func_addr, func_addr + 0x200)], function_starts=[func_addr], normalize=True
+        )
+        assert func_addr in cfg.functions, "fixture no longer contains the function under test"
+
+        # Used to raise RuntimeError("dictionary changed size during iteration").
+        proj.analyses[ReachingDefinitionsAnalysis].prep()(subject=cfg.functions[func_addr], observe_all=False)
+
+    def test_vector_comparison_keeps_the_vex_result_width(self):
+        """
+        A NEON comparison such as Iop_CmpGT8Sx8 has no handler of its own, so the
+        longest-prefix dispatch in _handle_expr_Binop sends it to the scalar CmpGT
+        handler. Its result is a per-lane mask as wide as the operands, not a condition
+        bit, so a one-bit answer contradicts the tmp's declared I64 type and the next
+        statement that combines that tmp with anything of the declared width raises
+        ClaripyOperationError inside claripy.
+        """
+        # The two ARM entries raise before the fix. The x86 ones do not -- nothing in
+        # their blocks consumes the mask at its declared width -- but they pin the same
+        # contract on the CmpEQ and CmpLE handlers, which NEON does not reach here.
+        for arch, filename, block_addr, op in [
+            ("armhf", "float_int_conversion.elf", 0xC83B, "Iop_CmpGT8Sx8"),
+            ("armel", "i2c_master_read-nucleol152re.elf", 0x800254F, "Iop_CmpGT8Ux8"),
+            ("i386", "test_arrays.exe", 0x40C489, "Iop_CmpEQ8x16"),
+            ("i386", "test_arrays.exe", 0x409FE2, "Iop_CmpLE64Fx2"),
+        ]:
+            with self.subTest(filename=filename, op=op):
+                path = os.path.join(bin_location, "tests", arch, filename)
+                proj = angr.Project(path, auto_load_libs=False)
+                block = proj.factory.block(block_addr)
+
+                binops = {
+                    stmt.data.op
+                    for stmt in block.vex.statements
+                    if isinstance(stmt, pyvex.stmt.WrTmp) and isinstance(stmt.data, pyvex.expr.Binop)
+                }
+                assert op in binops, f"{filename} no longer carries {op} at {block_addr:#x}"
+
+                # Raised ClaripyOperationError("args' length must all be equal") before the
+                # scalar comparison handlers started respecting expr.result_size().
+                rda = proj.analyses[ReachingDefinitionsAnalysis].prep()(subject=block)
+                assert rda.model is not None
 
     def test_load_multiple_concrete_addresses(self):
         """

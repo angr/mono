@@ -43,7 +43,14 @@ def _get_relro(elf):
     dyn_sec = elf.get_section_by_name(".dynamic")
     if dyn_sec is None or not isinstance(dyn_sec, DynamicSection):
         return Relro.PARTIAL
-    flags = [tag for tag in dyn_sec.iter_tags() if tag.entry.d_tag == "DT_FLAGS"]
+    try:
+        flags = [tag for tag in dyn_sec.iter_tags() if tag.entry.d_tag == "DT_FLAGS"]
+    except Exception:  # pylint: disable=broad-except
+        # DT_FLAGS is a number, but pyelftools resolves the dynamic string table for every tag it
+        # yields, and an object without one cannot. Not being able to confirm BIND_NOW is what
+        # partial RELRO already means, so report that rather than failing the load over it.
+        log.debug("Could not read the dynamic table while detecting RELRO", exc_info=True)
+        return Relro.PARTIAL
     if len(flags) != 1:
         return Relro.PARTIAL
     return (
@@ -161,7 +168,7 @@ class MetaELF(Backend):
         )
 
         # ATTEMPT 1: some arches will just leave the plt stub addr in the import symbol
-        if self.arch.name in ("ARM", "ARMEL", "ARMHF", "ARMCortexM", "AARCH64", "MIPS32", "MIPS64"):
+        if self.arch.name in ("ARM", "ARMEL", "ARMHF", "ARMCortexM", "AARCH64", "MIPS32", "MIPS64", "MIPSN32"):
             for name, reloc in func_jmprel.items():
                 if not plt_secs or any(plt_sec.contains_addr(reloc.symbol.linked_addr) for plt_sec in plt_secs):
                     self._add_plt_stub(name, reloc.symbol.linked_addr, sanity_check=bool(plt_secs))
@@ -453,8 +460,11 @@ class MetaELF(Backend):
         exists a pointer to the entry point.
 
         Utter bollocks, but this function should fix it.
+
+        A file with no entry point has no such pointer: e_entry is zero, which is how ELF says there is
+        none, and every relocatable object is in that state.
         """
-        if self.is_ppc64_abiv1:
+        if self.is_ppc64_abiv1 and self._entry != 0:
             ep_offset = self._entry
             self._entry = self.memory.unpack_word(AT.from_lva(ep_offset, self).to_rva())
             self._ppc64_abiv1_initial_rtoc = self.memory.unpack_word(AT.from_lva(ep_offset + 8, self).to_rva())
@@ -483,12 +493,18 @@ class MetaELF(Backend):
                     if seg.header.p_type == "PT_NULL":
                         break
                     elif seg.header.p_type == "PT_DYNAMIC":
-                        for tag in seg.iter_tags():
-                            if tag.entry.d_tag == "DT_SONAME":
-                                return maybedecode(tag.soname)
+                        # Ask for DT_SONAME specifically: an unfiltered iter_tags() makes pyelftools
+                        # resolve the dynamic string table for every tag, which objects with no
+                        # string table at all cannot do.
+                        for tag in seg.iter_tags("DT_SONAME"):
+                            return maybedecode(tag.soname)
                         if isinstance(path, str):
                             return os.path.basename(path)
 
-            except elftools.common.exceptions.ELFError:
-                pass
+            # This is a best-effort heuristic, so any failure to parse just means "no soname". The
+            # exception type is deliberately not narrowed: a file that names a DT_SONAME it cannot
+            # resolve makes pyelftools assert rather than raise ELFError, and which of the two a
+            # given malformed file gets has already changed once between pyelftools releases.
+            except Exception:  # pylint: disable=broad-except
+                log.debug("Could not extract a soname from %s", path, exc_info=True)
             return None

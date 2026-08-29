@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import unittest
@@ -300,6 +301,20 @@ class TestPEBackend(unittest.TestCase):
         assert ld.main_object.max_addr == 0x44F02D
         assert ld.all_objects[1].min_addr == 0x500000
 
+    def test_short_data_directory(self):
+        # NumberOfRvaAndSizes may be smaller than the 16 directories the format defines, and the
+        # trailing directories are then simply absent. EFI stub images commonly declare 6, which is
+        # what this one does; indexing the IAT (12) or the .NET descriptor (14) has to cope.
+        efi = os.path.join(TEST_BASE, "tests", "x86_64", "efi_short_data_directory.efi")
+        ld = cle.Loader(efi, auto_load_libs=False)
+
+        assert isinstance(ld.main_object, cle.PE)
+        assert [sec.name for sec in ld.main_object.sections] == [".text", ".data"]
+        assert ld.main_object.entry == 0x1000
+        assert not ld.main_object.deps
+        # The .NET descriptor is directory 14, past the end of this image's directories.
+        assert not ld.main_object.is_dotnet
+
     def test_loading_incomplete_pe_file(self):
         exe = os.path.join(
             TEST_BASE, "tests", "i386", "windows", "a94bbeed0ef51db3d3964bb0cc2cbed0adab0e47997d88f34daa92faa1a91e8a"
@@ -314,6 +329,42 @@ class TestPEBackend(unittest.TestCase):
         assert len(data) == 5025
         assert data[:4] == b"\x8bD$\x04"
         assert data[-4:] == b"3\xdb;\xc3"
+
+    def test_readytorun_machine_os_override(self):
+        dll = os.path.join(TEST_BASE, "tests", "x86_64", "readytorun_linux_x64.dll")
+        with open(dll, "rb") as f:
+            header = f.read(0x200)
+        machine = struct.unpack_from("<H", header, struct.unpack_from("<I", header, 0x3C)[0] + 4)[0]
+        # published for linux-x64, so the machine type is AMD64 exclusive-ored with the .NET
+        # override constant for Linux
+        assert machine == 0x8664 ^ 0x7B79
+
+        ld = cle.Loader(dll, auto_load_libs=False)
+        assert isinstance(ld.main_object, cle.PE)
+        assert ld.main_object.arch.name == "AMD64"
+        assert ld.main_object.is_dotnet
+
+    def test_mapped_image_covers_max_addr(self):
+        exe = os.path.join(TEST_BASE, "tests", "i386", "simple_windows.exe")
+        ld = cle.Loader(exe, auto_load_libs=False)
+        obj = ld.main_object
+
+        mapped_size = obj.max_addr - obj.min_addr + 1
+        assert len(ld.memory.load(obj.min_addr, mapped_size)) == mapped_size
+
+    def test_mapped_image_covers_uninitialized_tail(self):
+        exe = os.path.join(TEST_BASE, "tests", "i386", "windows", "rain32.upx")
+        ld = cle.Loader(exe, auto_load_libs=False)
+        obj = ld.main_object
+
+        rsrc = ld.main_object.sections_map[".rsrc"]
+        assert rsrc.memsize == 0x1000
+        assert rsrc.filesize == 0x600
+        tail = rsrc.memsize - rsrc.filesize
+        assert ld.memory.load(rsrc.vaddr + rsrc.filesize, tail) == bytes(tail)
+
+        mapped_size = obj.max_addr - obj.min_addr + 1
+        assert len(ld.memory.load(obj.min_addr, mapped_size)) == mapped_size
 
 
 if __name__ == "__main__":
