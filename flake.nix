@@ -19,13 +19,6 @@
       flake = false;
     };
 
-    # Test fixtures. The component suites resolve them as `../../binaries`
-    # relative to their own tests directory, which is exactly where
-    # `ci/link-external.sh` puts this input.
-    binaries = {
-      url = "github:angr/binaries";
-      flake = false;
-    };
   };
 
   outputs =
@@ -34,7 +27,6 @@
       nixpkgs,
       vex,
       angr-data,
-      binaries,
     }:
     let
       inherit (nixpkgs) lib;
@@ -198,7 +190,6 @@
 
           # Test fixtures and VEX sources as store paths, so CI warms and
           # transfers them through the same binary cache as everything else.
-          binaries = pkgs.runCommandLocal "angr-binaries" { } "ln -s ${binaries} $out";
           vex-src = pkgs.runCommandLocal "angr-vex" { } "ln -s ${vex} $out";
 
         }
@@ -312,9 +303,18 @@
           import-smoke =
             runPython "angr-import-smoke" ./nix/checks/import_smoke.py
               (pythonFor pkgs).pkgs.monoPinned.z3-solver.version;
+          # The fixtures live in this repository now and deliberately do
+          # not go into the flake -- half a gigabyte of them would land in
+          # every closure and every cache upload. This check needs exactly
+          # one 8.7 KB file, so that one file is content-addressed into the
+          # store on its own. Nothing else in `binaries/` reaches Nix, and a
+          # fixture change elsewhere cannot invalidate a build.
           fauxware-cfg =
             runPython "angr-fauxware-cfg" ./nix/checks/fauxware_cfg.py
-              "${binaries}/tests/x86_64/fauxware";
+              "${builtins.path {
+                path = ./binaries/tests/x86_64/fauxware;
+                name = "fauxware";
+              }}";
         }
       );
     };

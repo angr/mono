@@ -70,6 +70,16 @@ ECOSYSTEM = [
 
 COMPONENTS = CORE + ECOSYSTEM
 
+# The test fixtures. Vendored like a component and imported like one, but
+# deliberately not *a* component: `ci/nix-cache.sh`'s key is built from
+# `mono.json`'s component list, and putting 460 MB of fixtures in it would
+# mean a one-file fixture change rebuilding every closure in the matrix.
+# It is recorded under its own manifest key for exactly that reason, and
+# `flake.nix` reaches into it for one 8.7 KB file and nothing else.
+FIXTURES = "binaries"
+
+IMPORTABLE = [*COMPONENTS, FIXTURES]
+
 # Paths dropped from every component snapshot.
 COMMON_EXCLUDES = [".git", ".github"]
 
@@ -181,6 +191,16 @@ def repin_vex(commit: str) -> bool:
     return True
 
 
+def bucket(manifest: dict, name: str) -> dict:
+    """The manifest section a name is recorded in.
+
+    Fixtures are kept out of `components` so the Nix cache key, which is
+    built from that list, never sees them.
+    """
+    key = "fixtures" if name == FIXTURES else "components"
+    return manifest.setdefault(key, {})
+
+
 def snapshot(name: str, src: Path, dest: Path) -> None:
     if dest.exists():
         shutil.rmtree(dest)
@@ -225,7 +245,7 @@ def from_trees(
         prs = [p["number"] for p in entry.get("applied", [])]
         print(f"{name}: {len(prs)} pull request(s) merged onto {entry.get('base', '?')[:12]}",
               file=sys.stderr)
-        manifest["components"][name] = {
+        bucket(manifest, name)[name] = {
             "upstream": f"https://github.com/angr/{name}",
             "commit": entry.get("base", ""),
             "committed_at": "",
@@ -235,7 +255,9 @@ def from_trees(
             "rolled_up": prs,
         }
 
-    manifest["components"] = dict(sorted(manifest["components"].items()))
+    for key in ("components", "fixtures"):
+        if key in manifest:
+            manifest[key] = dict(sorted(manifest[key].items()))
     manifest["imported_at"] = (
         dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
     )
@@ -255,8 +277,8 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    components = args.components or COMPONENTS
-    unknown = [c for c in components if c not in COMPONENTS]
+    components = args.components or IMPORTABLE
+    unknown = [c for c in components if c not in IMPORTABLE]
     if unknown:
         parser.error(f"unknown component(s): {', '.join(unknown)}")
 
@@ -281,7 +303,7 @@ def main() -> int:
             manifest["external"] = {"vex": vex}
             if repin_vex(vex):
                 print(f"vex: repinned to {vex[:12]}", file=sys.stderr)
-        manifest["components"][name] = {
+        bucket(manifest, name)[name] = {
             "upstream": f"https://github.com/angr/{name}",
             "commit": commit,
             "committed_at": committed,
@@ -290,7 +312,9 @@ def main() -> int:
             "sibling_sources_repointed_at_workspace": workspaced,
         }
 
-    manifest["components"] = dict(sorted(manifest["components"].items()))
+    for key in ("components", "fixtures"):
+        if key in manifest:
+            manifest[key] = dict(sorted(manifest[key].items()))
 
     # Stamp a time only when something moved, so re-importing an unchanged
     # upstream leaves the manifest alone and the tree stays clean. Otherwise

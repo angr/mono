@@ -37,7 +37,6 @@ keep=${NIX_CACHE_KEEP:-5}
 default_installables=(
     ".#test-env"
     ".#gui-env"
-    ".#binaries"
     ".#angr"
     ".#angr-management-lib"
 )
@@ -49,7 +48,10 @@ default_installables=(
 # component derivations take their own directory as `src`, not the whole tree.
 key_for()
 {
-    local paths=(flake.nix flake.lock nix)
+    # The one fixture the flake reaches into. `binaries/` is otherwise not
+    # part of any derivation, so the other 1823 files are deliberately absent
+    # from this key -- adding a fixture must not rebuild the world.
+    local paths=(flake.nix flake.lock nix binaries/tests/x86_64/fauxware)
     local component
     while read -r component; do
         paths+=("$component")
@@ -68,8 +70,24 @@ print('\n'.join(json.load(open('$root/mono.json'))['components']))
     # Nix returned the fallback every time and the component was a no-op.
     local system
     system="$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]')"
+    # Per path and verified, not one `rev-parse` over all of them. Given a
+    # path that is not in HEAD, git prints the *literal* `HEAD:<path>` on
+    # stdout and exits 128 -- and the exit status is lost inside the command
+    # substitution, so the key silently became a hash of a filename that can
+    # never change. A mistyped path, or one added to the list before it was
+    # committed, would pin the whole matrix to one stale closure forever.
+    local hashes=() object
+    local path
+    for path in "${paths[@]}"; do
+        if ! object=$(git -C "$root" rev-parse --verify --quiet "HEAD:$path"); then
+            echo "nix-cache: '$path' is not in HEAD; the cache key would be" \
+                 "meaningless. Commit it or take it out of key_for." >&2
+            return 1
+        fi
+        hashes+=("$object")
+    done
     printf '%s-%s\n' "$system" \
-        "$(git -C "$root" rev-parse "${paths[@]/#/HEAD:}" | sha256sum | cut -c1-32)"
+        "$(printf '%s\n' "${hashes[@]}" | sha256sum | cut -c1-32)"
 }
 
 case ${1:-} in

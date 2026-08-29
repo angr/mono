@@ -1,0 +1,75 @@
+// Test binary for angr's KnownPatternFinder: inlined std::string::length() and
+// std::vector<int>::size() idioms that should be recognized and outlined back
+// into calls by the decompiler.
+//
+// The accessors must receive the containers by reference (so they appear as
+// pointer vvars in AIL, not decomposed stack objects) and must not themselves
+// be inlined into main.
+//
+// Build: make -f Makefile.known_patterns
+// Compiler used for the checked-in artifact: g++ (Debian 12.2.0-14+deb12u1) 12.2.0,
+// libstdc++ new ABI (_M_p at +0, _M_string_length at +8; vector _M_start at +0,
+// _M_finish at +8).
+#include <cstdio>
+#include <string>
+#include <vector>
+
+// extern "C": C++ mangled names do not encode the return type, and angr builds
+// prototypes from demangled symbols; a C++-mangled accessor would be typed as
+// returning void and its body dead-code-eliminated by the decompiler.
+extern "C" __attribute__((noinline)) size_t get_len(const std::string &s)
+{
+    return s.length();
+}
+
+extern "C" __attribute__((noinline)) size_t get_size(const std::vector<int> &v)
+{
+    return v.size();
+}
+
+extern "C" __attribute__((noinline)) size_t get_size_s(const std::vector<short> &v)
+{
+    return v.size();
+}
+
+extern "C" __attribute__((noinline)) size_t get_size_ll(const std::vector<long long> &v)
+{
+    return v.size();
+}
+
+// container accessors (Family B): empty / capacity / operator[]
+extern "C" __attribute__((noinline)) bool vec_empty(const std::vector<int> &v)
+{
+    return v.empty();
+}
+
+extern "C" __attribute__((noinline)) size_t vec_capacity(const std::vector<int> &v)
+{
+    return v.capacity();
+}
+
+extern "C" __attribute__((noinline)) int vec_index(const std::vector<int> &v, size_t i)
+{
+    return v[i];
+}
+
+extern "C" __attribute__((noinline)) bool str_empty(const std::string &s)
+{
+    return s.empty();
+}
+
+extern "C" __attribute__((noinline)) char str_index(const std::string &s, size_t i)
+{
+    return s[i];
+}
+
+int main(int argc, char **argv)
+{
+    std::string s(argv[0]);
+    std::vector<int> v(argc, 7);
+    std::vector<short> vs(argc, 7);
+    std::vector<long long> vll(argc, 7);
+    printf("%zu %zu %zu %zu %d %zu %d %d %d\n", get_len(s), get_size(v), get_size_s(vs), get_size_ll(vll),
+           vec_empty(v), vec_capacity(v), vec_index(v, argc), str_empty(s), str_index(s, argc));
+    return 0;
+}

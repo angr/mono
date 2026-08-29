@@ -54,15 +54,14 @@ materialise()
 }
 
 wanted=("$@")
-(( ${#wanted[@]} )) || wanted=(binaries vex)
+(( ${#wanted[@]} )) || wanted=(vex)
 
 status=0
 for what in "${wanted[@]}"; do
     case $what in
-        binaries) materialise binaries "$root/binaries" || status=1 ;;
         vex) materialise vex-src "$root/pyvex/vex" || status=1 ;;
         *)
-            echo "Nothing external called '$what'. Try: binaries vex" >&2
+            echo "Nothing external called '$what'. Try: vex" >&2
             exit 2
             ;;
     esac

@@ -8,7 +8,6 @@ __pycache__/
 
 # Fixtures and external sources materialised from flake inputs; both are
 # pinned in flake.lock, neither belongs in this tree.
-/binaries
 /pyvex/vex
 
 # CI scratch.
@@ -24,3 +23,10 @@ __pycache__/
 /.typecheck-base/
 /.ci-run-native/
 /.venv-native/
+
+# angr/tests/common.py:do_trace() caches QEMU traces into the fixture tree.
+# The dozen upstream tracks are real fixtures -- they let the tests run
+# without tracer installed -- and stay tracked, since an ignore rule does not
+# reach a tracked file. Everything a local run generates beside them does not
+# get committed.
+/binaries/tests_data/runner_traces/*.p

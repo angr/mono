@@ -136,8 +136,8 @@ def install(
     wheel first and angr is pointed at it with `--find-links`. Upstream hits
     the same wall and solves it the same way.
     """
-    # pyvex compiles VEX out of ./vex and the suites read ../../binaries;
-    # both are pinned in flake.lock rather than tracked here.
+    # pyvex compiles VEX out of ./vex, the one input still pinned in
+    # flake.lock rather than tracked here. The fixtures are tracked.
     run(sys.executable, ROOT / "ci" / "fetch-external.py")
 
     # --clear so a second install replaces the environment rather than

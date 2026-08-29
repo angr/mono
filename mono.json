@@ -118,8 +118,18 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-08-29T00:14:00+00:00",
+  "imported_at": "2026-08-29T01:35:48+00:00",
   "external": {
     "vex": "875f7c9a5f6be621b4f000c29c016e15ddf32207"
+  },
+  "fixtures": {
+    "binaries": {
+      "upstream": "https://github.com/angr/binaries",
+      "commit": "a87538bc248531d2a1d22434143e8b9752459bac",
+      "committed_at": "2026-08-28T08:16:37-07:00",
+      "subject": "Add Windows ARM64 and ARMNT fastfail fixtures (#191)",
+      "excluded": [],
+      "sibling_sources_repointed_at_workspace": []
+    }
   }
 }

@@ -1,0 +1,5 @@
+# Fixtures are inputs, not source, and their bytes are what tests assert on.
+# `actions/checkout` leaves core.autocrlf at the runner default, which is true
+# on Windows, and git would happily rewrite line endings in the 476 fixtures
+# under binaries/ it detects as text -- silently, on one platform only.
+binaries/** -text

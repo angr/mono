@@ -86,7 +86,7 @@ jobs:
       - name: Build everything
         run: |
           nix build --no-link --print-build-logs \
-            .#test-env .#gui-env .#binaries .#angr .#angr-management-lib
+            .#test-env .#gui-env .#angr .#angr-management-lib
 
       # The test jobs enter these shells, so the warm-up enters them too: it
       # proves the exact derivations they will ask for are the ones now in the
@@ -738,11 +738,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # vex for the pyvex wheel, binaries for cle's suite -- this job only
-      # fetched the first, and the cle step then failed on
-      # `cp: cannot stat 'binaries'`.
-      - name: Fetch the pinned externals
-        run: python ci/fetch-external.py vex binaries
+      - name: Fetch the pinned VEX sources
+        run: python ci/fetch-external.py vex
       - uses: pypa/cibuildwheel@v4.1.0
         with:
           package-dir: pyvex

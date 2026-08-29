@@ -50,7 +50,6 @@ Python package set:
 
 ```shell
 nix develop                # everything: components, test deps, cargo, cmake
-ci/link-external.sh        # put the angr/binaries fixtures at ./binaries
 ci/run-suite.sh cle        # run one component's suite
 ci/run-suite.sh angr --shard 1 --of 10
 ```
@@ -58,6 +57,36 @@ ci/run-suite.sh angr --shard 1 --of 10
 A component's tests are the ones upstream wrote, unmodified, and they find
 their fixtures the way they always have — as `../../binaries` relative to the
 tests directory, which in this layout is the repository root.
+
+## The fixtures are tracked here, and are not in the flake
+
+`binaries/` is `angr/binaries`, vendored: 1824 files and about 460 MB. It is
+here because a fixture and the test that needs it belong in one commit.
+Upstream needs a whole action — `ci-settings/actions/binaries-ref`, which
+parses a fixture pull request's number out of a code pull request's body — to
+approximate that across two repositories, and a rollup of a hundred changes
+made the cost concrete: 28 of them referenced fixture pull requests that no
+pin could resolve, so they could not be green anywhere.
+
+**It is deliberately not a Nix input.** Half a gigabyte in the flake would
+land in every closure, every `nix copy` to the release cache, and every
+warm-cache key — and a one-line fixture would then rebuild the world. So:
+
+- `flake.nix` has no `binaries` input. The `fauxware-cfg` check needs one
+  8.7 KB file and gets exactly that file, content-addressed on its own with
+  `builtins.path`, which is also the only fixture path in
+  `ci/nix-cache.sh`'s key.
+- Nothing else reaches Nix. Adding, changing or deleting a fixture cannot
+  invalidate a build or a cached closure.
+- The suites read the working tree, not the store, which they can because
+  they run in `nix develop` rather than in the sandbox.
+
+Both lanes already put the tree where the `../../binaries` convention looks:
+`ci/run-suite.sh` symlinks it beside the scratch run directory and
+`ci/run-native.py` does the same under `.ci-run-native`. That link is
+load-bearing — `angr/tests/ailment/test_irsb.py` walks up from
+`dirname(__file__)` without `realpath`, and without the link it silently
+sub-skips six architectures inside a test that still reports as passed.
 
 `ci/run-suite.sh` runs each suite from a scratch directory that contains
 nothing but a symlink to that suite's tests, and then checks where the import
@@ -86,7 +115,6 @@ Three things are pinned in `flake.lock` instead of vendored:
 | | why |
 | --- | --- |
 | `angr/vex` | It is a fork of valgrind's IR library with its own cadence; pyvex only ever consumes it as a source drop, and it is the one dependency this experiment deliberately leaves outside. |
-| `angr/binaries` | 450 MB of test fixtures. `ci/link-external.sh` puts it at `./binaries`, where every suite already looks. |
 | `angr/angr-data` | 200 MB of generated JSON. |
 
 One test is deselected, in `ci/suites.json`, with its reason beside it and
@@ -213,7 +241,7 @@ is a thing upstream CI does today and this repository does not.
 | Nightly | Ten repositories run a nightly. Its distinctive content was angr's full suite on Windows and macOS, which now runs here on every push instead. What is left is the `NIGHTLY=1` slow-test tier in `ga-test.sh` and the Mailgun failure mail. | No `schedule:` trigger: a nightly on an experiment is recurring cost on somebody else's account, and the part that mattered is no longer nightly-only. |
 | Release | `angr-release.yml` bumps versions, builds sdists and wheels for six components, verifies them with `--only-binary`, tags and publishes to PyPI. | Only `pypcode` wheels are built here, and nothing is published. Publishing from an experiment is not something to do by accident. |
 | Bundles | `angr-management`'s nightly build produces an NSIS installer, an AppImage and a macOS `.app`, and tests each by launching it. | Only the raw PyInstaller freeze is built, and only the Linux one is launched. |
-| Cross-repo fixtures | `ci-settings/actions/binaries-ref` reads `angr/binaries#N` out of a pull-request body so a fixture and the code that needs it go green together. | `binaries` is pinned in `flake.lock` with no override. A new fixture therefore needs two rounds here. |
+| Cross-repo fixtures | `ci-settings/actions/binaries-ref` reads `angr/binaries#N` out of a pull-request body so a fixture and the code that needs it go green together. | Not needed: `binaries/` is tracked here, so a fixture and the code that needs it are one commit. |
 
 ## Regenerating the tree
 

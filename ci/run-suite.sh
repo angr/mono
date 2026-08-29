@@ -89,8 +89,11 @@ if [[ ! -d $root/$suite/tests ]]; then
     echo "No tests directory: $root/$suite/tests" >&2
     exit 2
 fi
-if [[ ! -e $root/binaries ]]; then
-    "$root/ci/link-external.sh"
+if [[ ! -d $root/binaries ]]; then
+    # Tracked in this repository since the fixtures were vendored, so a
+    # missing one means a broken checkout rather than an unfetched pin.
+    echo "$root/binaries is missing; the fixtures are tracked here." >&2
+    exit 1
 fi
 
 # A neutral working directory: only the tests are visible from it.

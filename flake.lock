@@ -16,22 +16,6 @@
         "type": "github"
       }
     },
-    "binaries": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1787787195,
-        "narHash": "sha256-BYQAEsZBKm82jAciI8cDKvbYAsD5c7LjTb9+IHGEiVk=",
-        "owner": "angr",
-        "repo": "binaries",
-        "rev": "de38bc3dbd052f7f9d2442cda0e43eee8e4263a8",
-        "type": "github"
-      },
-      "original": {
-        "owner": "angr",
-        "repo": "binaries",
-        "type": "github"
-      }
-    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1786593342,
@@ -51,7 +35,6 @@
     "root": {
       "inputs": {
         "angr-data": "angr-data",
-        "binaries": "binaries",
         "nixpkgs": "nixpkgs",
         "vex": "vex"
       }

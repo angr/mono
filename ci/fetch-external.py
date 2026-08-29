@@ -6,8 +6,7 @@ answer on Linux and no answer at all on Windows. Both read the same
 `flake.lock`, so the Nix lane and the native lane are pinned to the same
 commits and cannot drift.
 
-    ci/fetch-external.py                # binaries and vex
-    ci/fetch-external.py binaries       # just one
+    ci/fetch-external.py                # vex
     ci/fetch-external.py --print-rev vex
 
 Re-running is safe: a checkout already at the pinned commit is left alone.
@@ -27,8 +26,10 @@ ROOT = Path(__file__).resolve().parent.parent
 # The paths are where the component suites and builds already look: the test
 # fixtures beside the components, VEX inside pyvex where its CMakeLists wants
 # it.
+# VEX only. The test fixtures used to be pinned here too; they are tracked in
+# this repository now, so a fixture and the code that needs it land in one
+# commit instead of needing a pull request in another repository first.
 DESTINATIONS = {
-    "binaries": Path("binaries"),
     "vex": Path("pyvex") / "vex",
 }
 
