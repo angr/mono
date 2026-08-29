@@ -5,7 +5,7 @@ import logging
 import claripy
 
 from angr import sim_options as options
-from angr.errors import SimMemoryMissingError
+from angr.errors import SimMemoryMissingError, SimSolverError
 from angr.misc.ux import once
 from angr.storage.memory_mixins.memory_mixin import MemoryMixin
 
@@ -13,6 +13,25 @@ l = logging.getLogger(__name__)
 
 
 class DefaultFillerMixin(MemoryMixin):
+    def _refplace(self, addr: int, size: int) -> tuple[int, str]:
+        """
+        Where execution is, to name in the warning about filling ``size`` bytes at ``addr``.
+
+        :return: The address held by the instruction pointer and a description of it, or ``0`` and
+                 ``"symbolic"`` when it holds no single address.
+        """
+        ip_offset, ip_size = self.state.arch.registers.get("ip", (0, 0))
+        if self.category == "reg" and addr < ip_offset + ip_size and ip_offset < addr + size:
+            # The instruction pointer is what is being filled, so there is nowhere to ask. It does
+            # not have to begin on a register slot boundary, so a fill can cover part of it.
+            return 0, "symbolic"
+        ip: claripy.ast.BV = self.state._ip
+        try:
+            refplace_int = self.state.solver.eval(ip)
+        except SimSolverError:
+            return 0, "symbolic"
+        return refplace_int, self.state.project.loader.describe_addr(refplace_int)
+
     def _default_value(
         self, addr, size, *, name=None, inspect=True, events=True, key=None, fill_missing: bool = True, **kwargs
     ):
@@ -63,9 +82,8 @@ class DefaultFillerMixin(MemoryMixin):
                     "to suppress these messages."
                 )
 
+            refplace_int, refplace_str = self._refplace(addr, size)
             if is_mem:
-                refplace_int = self.state.solver.eval(self.state._ip)
-                refplace_str = self.state.project.loader.describe_addr(refplace_int)
                 l.warning(
                     "Filling memory at %#x with %d unconstrained bytes referenced from %#x (%s)",
                     addr,
@@ -74,12 +92,6 @@ class DefaultFillerMixin(MemoryMixin):
                     refplace_str,
                 )
             else:
-                if addr == self.state.arch.ip_offset:
-                    refplace_int = 0
-                    refplace_str = "symbolic"
-                else:
-                    refplace_int = self.state.solver.eval(self.state._ip)
-                    refplace_str = self.state.project.loader.describe_addr(refplace_int)
                 reg_str = self.state.arch.translate_register_name(addr, size=size)
                 l.warning(
                     "Filling register %s with %d unconstrained bytes referenced from %#x (%s)",

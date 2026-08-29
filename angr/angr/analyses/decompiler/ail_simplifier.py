@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import networkx
 
-from angr.ailment import Address, AILBlockRewriter, AILBlockViewer
+from angr.ailment import INVALID_ADDR, Address, AILBlockRewriter, AILBlockViewer
 from angr.ailment.block import Block
 from angr.ailment.expression import (
     BinaryOp,
@@ -40,6 +40,7 @@ from angr.ailment.statement import (
     Store,
     WeakAssignment,
 )
+from angr.ailment.utils import has_llsc_expression
 from angr.analyses.analysis import AnalysesHub, Analysis
 from angr.analyses.s_propagator import SPropagator
 from angr.analyses.s_reaching_definitions import SRDAModel, SReachingDefinitions
@@ -261,7 +262,7 @@ class AILSimplifier(Analysis):
         self._avoid_vvar_ids = avoid_vvar_ids if avoid_vvar_ids is not None else set()
         self._propagator_dead_vvar_ids: set[int] = set()
         # per-block cache of dirty/ccall-defined vvar IDs, keyed by block key, validated by block identity
-        self._dirty_vvar_scan_cache: dict[tuple[int, int | None], tuple[Block, set[int]]] = {}
+        self._dirty_vvar_scan_cache: dict[tuple[int, int | None], tuple[Block, set[int], set[int]]] = {}
         # only set to True when any simplification pass has modified the graph or updated any blocks.
         # skips _remove_dead_assignments if this flag is False.
         self._should_eliminate_dead_assignments: bool = True
@@ -2141,14 +2142,14 @@ class AILSimplifier(Analysis):
                         codeloc = AILCodeLocation(block.addr, block.idx, idx, stmt.tags.get("ins_addr"))
                         if codeloc in self._assignments_to_remove:
                             # it should be removed
-                            new_statements.append(NoOp(stmt.idx, ins_addr=stmt.tags.get("ins_addr", -1)))
+                            new_statements.append(NoOp(stmt.idx, ins_addr=stmt.tags.get("ins_addr", INVALID_ADDR)))
                             simplified = True
                             continue
 
                         if self._statement_has_call_exprs(stmt):
                             if codeloc in self._calls_to_remove:
                                 # it has a call and must be removed
-                                new_statements.append(NoOp(stmt.idx, ins_addr=stmt.tags.get("ins_addr", -1)))
+                                new_statements.append(NoOp(stmt.idx, ins_addr=stmt.tags.get("ins_addr", INVALID_ADDR)))
                                 simplified = True
                                 continue
                             if isinstance(stmt, Assignment) and isinstance(stmt.dst, VirtualVariable):
@@ -2167,14 +2168,14 @@ class AILSimplifier(Analysis):
                                     pass
                         else:
                             # no calls. remove it
-                            new_statements.append(NoOp(stmt.idx, ins_addr=stmt.tags.get("ins_addr", -1)))
+                            new_statements.append(NoOp(stmt.idx, ins_addr=stmt.tags.get("ins_addr", INVALID_ADDR)))
                             simplified = True
                             continue
                     elif isinstance(stmt, SideEffectStatement):
                         codeloc = AILCodeLocation(block.addr, block.idx, idx, stmt.tags.get("ins_addr"))
                         if codeloc in self._calls_to_remove:
                             # this call can be removed
-                            new_statements.append(NoOp(stmt.idx, ins_addr=stmt.tags.get("ins_addr", -1)))
+                            new_statements.append(NoOp(stmt.idx, ins_addr=stmt.tags.get("ins_addr", INVALID_ADDR)))
                             simplified = True
                             continue
 
@@ -2235,6 +2236,7 @@ class AILSimplifier(Analysis):
         blocks_dict: dict[tuple[int, int | None], Block] = {(bb.addr, bb.idx): bb for bb in self.func_graph}
 
         dirty_vvar_ids = set()
+        llsc_vvar_ids = set()
         # cache dirty or ccall vvar IDs per block to avoid re-scanning
         # TODO: Move this cache to ailment.Block once per-block defs/uses cache lands on master.
         cache = self._dirty_vvar_scan_cache
@@ -2243,8 +2245,10 @@ class AILSimplifier(Analysis):
             entry = cache.get(key)
             if entry is not None and entry[0] is bb:
                 block_dirty_ids = entry[1]
+                block_llsc_ids = entry[2]
             else:
                 block_dirty_ids = set()
+                block_llsc_ids = set()
                 for stmt in bb.statements:
                     # reg/tmp = ccall(...)
                     # we see tmps when it's used in a cycle;
@@ -2257,9 +2261,13 @@ class AILSimplifier(Analysis):
                         and isinstance(stmt.src, (DirtyExpression, VEXCCallExpression))
                     ):
                         block_dirty_ids.add(stmt.dst.varid)
-                cache[key] = bb, block_dirty_ids
+                        if has_llsc_expression(stmt.src):
+                            block_llsc_ids.add(stmt.dst.varid)
+                cache[key] = bb, block_dirty_ids, block_llsc_ids
             if block_dirty_ids:
                 dirty_vvar_ids |= block_dirty_ids
+            if block_llsc_ids:
+                llsc_vvar_ids |= block_llsc_ids
 
         phi_and_dirty_vvar_ids = (rd.phi_vvar_ids | dirty_vvar_ids).difference(dead_vvar_ids)
 
@@ -2297,6 +2305,8 @@ class AILSimplifier(Analysis):
         cyclic_dependent_phi_varids = set()
         for scc in _strongly_connected_components(succs_map):
             if len(scc) == 1:
+                continue
+            if not llsc_vvar_ids.isdisjoint(scc):
                 continue
 
             bail = False

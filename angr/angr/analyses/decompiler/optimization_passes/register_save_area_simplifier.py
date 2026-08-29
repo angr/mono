@@ -83,7 +83,7 @@ class RegisterSaveAreaSimplifier(OptimizationPass):
                     )
 
     def _find_registers_stored_on_stack(self) -> list[tuple[int, int, CodeLocation]]:
-        first_block = self._get_block(self._func.addr)
+        first_block = self._get_block(self.entry_node_addr[0], idx=self.entry_node_addr[1])
         if first_block is None:
             return []
 
@@ -236,11 +236,14 @@ class RegisterSaveAreaSimplifier(OptimizationPass):
             lr_reg_offset = None
 
         for reg in list(result.keys()):
-            # stored link register should always be removed
-            if lr_reg_offset is not None and reg == lr_reg_offset:
-                if "restored" not in result[reg]:
-                    # add a dummy one
-                    result[reg]["restored"] = []
+            info = result[reg]
+
+            # a link register may be stored without a matching restore: such a function returns by loading the
+            # saved value into pc, which never appears as a write to the link register. one that is only restored
+            # has no save area behind it, and falls through to (b) like any other half-matched register.
+            if lr_reg_offset is not None and reg == lr_reg_offset and "stored" in info and "restored" not in info:
+                # add a dummy one
+                info["restored"] = []
                 continue
 
             if ret_val_reg_offset is not None and reg == ret_val_reg_offset:
@@ -248,7 +251,6 @@ class RegisterSaveAreaSimplifier(OptimizationPass):
                 del result[reg]
                 continue
 
-            info = result[reg]
             if len(info.keys()) != 2:
                 # (a) or (b)
                 del result[reg]

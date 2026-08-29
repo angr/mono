@@ -9,13 +9,18 @@ import logging
 import os
 import random
 import unittest
+from unittest import mock
 
 import archinfo
 
 import angr
+from angr.analyses.cfg.cfg_fast import CFGFast
 from angr.analyses.cfg.indirect_jump_resolvers import mips_elf_fast
-from angr.codenode import FuncNode
+from angr.codenode import BlockNode, FuncNode
 from angr.knowledge_plugins.cfg import CFGModel, CFGNode
+from angr.knowledge_plugins.cfg.indirect_jump import IndirectJump
+from angr.utils.constants import DEFAULT_STATEMENT
+from angr.knowledge_plugins.cfg.memory_data import MemoryDataSort
 from tests.common import bin_location, broken
 
 l = logging.getLogger("angr.tests.test_cfgfast")
@@ -111,6 +116,18 @@ class TestCfgfast(unittest.TestCase):
         function_features = {}
 
         self.cfg_fast_functions_check("x86_64", "cfg_0_pe", functions, function_features)
+
+    def test_printable_string_that_reaches_the_end_of_a_region(self):
+        # The last 32 bytes of .text are newlib's blanks[16] + zeroes[16]; .text ends at
+        # 0x8007484, where .ARM.exidx begins, so this string is not null-terminated.
+        path = os.path.join(test_location, "armel", "libopencm3_adc-dac-printf.elf")
+        proj = angr.Project(path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True, data_references=True)
+
+        data = cfg.model.memory_data[0x8007464]
+        assert data.sort == MemoryDataSort.String
+        assert data.size == 32
+        assert data.content == b" " * 16 + b"0" * 16
 
     def test_arm_function_merge(self):
         # function 0x7bb88 is created due to a data hint in another block. this function should be merged with the
@@ -488,6 +505,34 @@ class TestCfgfast(unittest.TestCase):
     #
 
     # For test cases for jump table resolver, please refer to test_jumptables.py
+
+    def test_pending_indirect_jumps_are_resolved_in_discovery_order(self):
+        # pylint:disable=protected-access
+        # resolving one indirect jump builds blocks and occupies bytes that the next resolver reads, so the order
+        # they come out of the pending collection decides the answer and must not depend on where their objects
+        # happen to sit in memory
+        path = os.path.join(test_location, "x86_64", "fauxware")
+        proj = angr.Project(path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast()
+
+        addresses = [0x400000 + ((index * 0x2801) % 0x10000) for index in range(64)]
+        assert addresses != sorted(addresses)
+        cfg.indirect_jumps.clear()
+        for addr in addresses:
+            cfg.indirect_jumps[addr] = IndirectJump(addr, addr, 0x400000, "Ijk_Boring", DEFAULT_STATEMENT)
+        cfg._indirect_jumps_to_resolve = set(cfg.indirect_jumps.values())
+
+        resolved = []
+
+        def record(jump, func_graph_complete=True):  # pylint:disable=unused-argument
+            resolved.append(jump.addr)
+            return set()
+
+        cfg._process_one_indirect_jump = record
+        cfg._process_unresolved_indirect_jumps()
+
+        assert resolved == addresses
+        assert not cfg._indirect_jumps_to_resolve
 
     def test_resolve_x86_elf_pic_plt(self):
         path = os.path.join(test_location, "i386", "fauxware_pie")
@@ -875,6 +920,30 @@ class TestCfgfast(unittest.TestCase):
         assert node is not None
         assert node.function_address == 0x40F770
 
+    def test_normalize_does_not_anchor_a_group_on_a_zero_size_node(self):
+        # a UDF instruction lifts to a zero-byte IRSB, and CFGFast still records an ordinary (non-SimProcedure)
+        # CFGNode for it. Two overlapping blocks end where that node starts, so grouping nodes by end address
+        # collects all three, and the zero-extent node has the highest address in the group.
+        path = os.path.join(test_location, "armel", "normalize_zero_size_anchor")
+        proj = angr.Project(path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+        assert cfg.normalized
+
+        nodes = [n for n in cfg.model.nodes() if not n.is_simprocedure]
+        sized = [n for n in nodes if n.size]
+
+        # guard the fixture: it stops covering this defect if it ever loses the zero-size node that shares an
+        # end address with sized blocks
+        end_addrs = {n.addr + n.size for n in sized}
+        assert any(not n.size and n.addr in end_addrs for n in nodes)
+
+        # normalization's contract: no block may start at a non-leading instruction of another block
+        block_starts = {n.addr for n in sized}
+        for n in sized:
+            instruction_addrs = list(n.instruction_addrs)
+            inner_starts = [i for i in instruction_addrs[1:] if i in block_starts]
+            assert not inner_starts, f"{n!r} was left unsplit at {[hex(i) for i in inner_starts]}"
+
     def test_removing_lock_edges(self):
         path = os.path.join(
             test_location, "x86_64", "windows", "6f289eb8c8cd826525d79b195b1cf187df509d56120427b10ea3fb1b4db1b7b5.sys"
@@ -1002,11 +1071,28 @@ class TestCfgfast(unittest.TestCase):
         for addr in not_separate_functions:
             assert addr not in cfg.kb.functions, f"{hex(addr)} should not be a separate function"
 
+    def test_x86_ud2_is_not_scanned_into(self):
+        # VEX does not decode ud2 under 32-bit x86, so _generate_cfgnode has to recognize it from the
+        # bytes after the block it could decode. It looked for them in the lifted block, which by then
+        # holds exactly the bytes VEX consumed, so the check never fired: one byte was marked
+        # undecodable and the linear scan seeded a function on the second byte of the ud2.
+        path = os.path.join(test_location, "i386", "ld-linux.so.2")
+        proj = angr.Project(path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+
+        assert proj.loader.memory.load(0x41211E, 2) == b"\x0f\x0b"
+        assert cfg.model.get_any_node(0x41211F) is None
+        assert 0x41211F not in cfg.kb.functions
+        # the block before the ud2 keeps every instruction it had
+        node = cfg.model.get_any_node(0x412114)
+        assert node is not None
+        assert list(node.instruction_addrs) == [0x412114, 0x41211A, 0x41211C]
+
     @staticmethod
-    def _blob_project(data: bytes) -> angr.Project:
+    def _blob_project(data: bytes, arch: str | archinfo.Arch = "AMD64") -> angr.Project:
         return angr.Project(
             io.BytesIO(data),
-            main_opts={"backend": "blob", "arch": "AMD64", "base_addr": 0, "entry_point": 0},
+            main_opts={"backend": "blob", "arch": arch, "base_addr": 0, "entry_point": 0},
             auto_load_libs=False,
             use_sim_procedures=False,
         )
@@ -1027,7 +1113,7 @@ class TestCfgfast(unittest.TestCase):
         # scan used to cover it with thousands of one-block functions that drop_bad_functions() threw away again
         rng = random.Random(0xDEADBEEF)
         proj = self._blob_project(bytes(rng.getrandbits(8) for _ in range(32768)))
-        cfg = proj.analyses.CFGFast(normalize=True, nodecode_threshold=0.3)
+        cfg = proj.analyses.CFGFast(normalize=True)
 
         assert len(cfg.kb.functions) < 150, f"32 KB of random data produced {len(cfg.kb.functions)} functions"
 
@@ -1062,6 +1148,161 @@ class TestCfgfast(unittest.TestCase):
             (0x4686A0, "_dl_runtime_resolve_xsavec"),
         ):
             assert addr in cfg.kb.functions, f"{name} at {addr:#x} was dropped"
+
+    def test_fresh_model_rebuilds_function_graphs(self):
+        project = angr.Project(os.path.join(test_location, "armel", "libsoap.so"), auto_load_libs=False)
+        original_post_analysis = CFGFast._post_analysis  # pylint: disable=protected-access
+        observed_block_sizes = []
+
+        def observe_before_normalization(cfg):
+            function = cfg.functions[0x4066C8]
+            observed_block_sizes.append(
+                sorted(node.size for node in function.graph if isinstance(node, BlockNode) and node.addr == 0x4066EC)
+            )
+            return original_post_analysis(cfg)
+
+        with mock.patch.object(CFGFast, "_post_analysis", observe_before_normalization):
+            for _ in range(2):
+                cfg = project.analyses.CFGFast(
+                    normalize=True,
+                    regions=[(0x4066C8, 0x40676C)],
+                    function_starts=[0x4066C8],
+                )
+                self.assertTrue(cfg.functions[0x4066C8].normalized)
+
+        self.assertEqual(observed_block_sizes, [[28], [28]])
+
+    def test_fresh_model_invalidates_function_graph_caches(self):
+        project = angr.Project(os.path.join(test_location, "armel", "libsoap.so"), auto_load_libs=False)
+        function_addr = 0x4066C8
+        first = project.analyses.CFGFast(
+            normalize=False,
+            regions=[(function_addr, 0x406710)],
+            function_starts=[function_addr],
+        )
+        function = first.functions[function_addr]
+        first_complexity = function.cyclomatic_complexity
+        original_post_analysis = CFGFast._post_analysis  # pylint: disable=protected-access
+        observed = {}
+
+        def observe_rebuilt_graph(cfg):
+            rebuilt_function = cfg.functions[function_addr]
+            observed["same_function"] = rebuilt_function is function
+            observed["formula"] = (
+                rebuilt_function.transition_graph.number_of_edges()
+                - rebuilt_function.transition_graph.number_of_nodes()
+                + 2
+            )
+            observed["complexity"] = rebuilt_function.cyclomatic_complexity
+            return original_post_analysis(cfg)
+
+        with mock.patch.object(CFGFast, "_post_analysis", observe_rebuilt_graph):
+            project.analyses.CFGFast(
+                normalize=False,
+                regions=[(function_addr, 0x40676C)],
+                function_starts=[function_addr],
+            )
+
+        self.assertTrue(observed["same_function"])
+        self.assertNotEqual(first_complexity, observed["formula"])
+        self.assertEqual(observed["complexity"], observed["formula"])
+    def _check_single_instruction_indirect_jump(self, data: bytes, arch: str | archinfo.Arch) -> None:
+        # a lifter turns an instruction it cannot translate into a trap that leaves through a non-constant
+        # target, so the block is a single instruction long. CFGFast looks for the branch of a delay-slot
+        # block in the instruction before the last one, and used to abort the whole analysis when a block
+        # was too short to have one. See https://github.com/angr/angr/issues/6763.
+        proj = self._blob_project(data, arch=arch)
+        assert proj.arch.branch_delay_slot
+
+        trap_block = proj.factory.block(proj.entry)
+        assert len(trap_block.instruction_addrs) == 1
+        assert not trap_block.vex.constant_jump_targets  # so the scan takes the indirect jump path
+
+        cfg = proj.analyses.CFGFast()
+
+        node = cfg.model.get_any_node(0)
+        assert node is not None
+        # a block this short cannot hold both a branch and its delay slot, so the indirect goto is an artifact of
+        # the trap rather than a jump to anywhere: the node gets no successors and is not queued for resolution
+        assert not list(cfg.graph.successors(node))
+        assert 0 not in cfg.indirect_jumps
+        assert 4 in cfg.kb.functions
+
+    def test_single_instruction_indirect_jump_on_sparc(self):
+        # 0x0: illtrap 0   - a run of zero bytes, which p-code lifts to a trap and an indirect goto
+        # 0x4: retl; nop   - a real function that the scan must still pick up afterwards
+        self._check_single_instruction_indirect_jump(
+            b"\x00\x00\x00\x00" + b"\x81\xc3\xe0\x08" + b"\x01\x00\x00\x00",
+            archinfo.ArchPcode("sparc:BE:32:default"),
+        )
+
+    def test_single_instruction_indirect_jump_on_mips(self):
+        # 0x0: trunc.l.s $f0, $f0   - an instruction VEX does not implement, so it lifts to Ijk_SigILL
+        # 0x4: jr $ra; nop          - a real function that the scan must still pick up afterwards
+        self._check_single_instruction_indirect_jump(
+            b"\x46\x00\x00\x09" + b"\x03\xe0\x00\x08" + b"\x00\x00\x00\x00",
+            "MIPS64",
+        )
+    def test_function_ending_in_an_undefined_instruction_is_kept(self):
+        # split-rust is stripped, so no symbol names these three functions, and the ud2 that ends each one is
+        # reached by a jump inside the function rather than as the fall-through of a call. Each is a real
+        # 200-300 byte function that drop_bad_functions() deletes outright, reading the ud2 that rustc emits
+        # for an unreachable path as the function running into data.
+        proj = angr.Project(os.path.join(test_location, "x86_64", "split-rust"), auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+
+        for addr in (0x501610, 0x5019B0, 0x501B20):
+            assert addr in cfg.kb.functions, f"{addr:#x} was dropped"
+            assert cfg.model.get_any_node(addr) is not None, f"no block covers {addr:#x}"
+    def test_dropping_a_bad_function_keeps_the_blocks_another_function_owns(self):
+        # drop_bad_functions() drops 0x46cd99: it does not return, it has three blocks, and the last of them
+        # has no successors and is followed by alignment padding. That last block is 0x46cdb0, the fall-through
+        # of the call at 0x46cdab, and it is also the entire body of core::slice::iter::Iter::size_hint, which
+        # the binary's own symbol table names. Removing the dropped function's CFG nodes took the named
+        # function with it.
+        proj = angr.Project(os.path.join(test_location, "x86_64", "decompiler", "fmt_rust"), auto_load_libs=False)
+        cfg = proj.analyses.CFGFast()
+
+        assert 0x46CD99 not in cfg.kb.functions
+        assert cfg.model.get_any_node(0x46CD99) is None
+        assert 0x46CDB0 in cfg.kb.functions
+        assert cfg.kb.functions.get_by_addr(0x46CDB0).block_addrs_set == {0x46CDB0}
+        assert cfg.model.get_any_node(0x46CDB0) is not None
+    def test_function_whose_only_exit_is_a_noreturn_call_does_not_return(self):
+        # pthread_exit and __pthread_unwind_next are each one block ending in a call to
+        # __pthread_unwind, whose own only way out reaches a SimProcedure that declares NO_RET.
+        # Neither has a ret. While the CFG is recovered the call sites are walked past before the
+        # callee is settled, so both pick up the blocks that follow and are recorded as returning;
+        # make_functions() takes those blocks away again but keeps the recorded status.
+        proj = angr.Project(os.path.join(test_location, "i386", "libpthread.so.0"), auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+
+        for addr in (0x408020, 0x40D800):
+            func = cfg.kb.functions[addr]
+            assert not func.ret_sites
+            assert func.returning is False, f"{func.name} should not return"
+
+        # correcting the status must not move a block or invent a function. 0x40c3c6 is one byte
+        # of hlt behind __pthread_once's call to __pthread_unwind_next, inside __pthread_once's
+        # .eh_frame range 0x40c2e0..0x40c3c7, and it stays where both ground truths put it.
+        once = cfg.kb.functions[0x40C2E0]
+        assert 0x40C3C6 in once.block_addrs_set
+        assert 0x40C3C6 not in cfg.kb.functions
+        assert max(block.addr + block.size for block in once.blocks) - once.addr == 0xE7
+
+    def test_callee_whose_exit_was_never_recovered_does_not_make_its_callers_nonreturning(self):
+        # __aeabi_read_tp jumps into the ARM kuser helper page at 0xffff0fe0, which the kernel
+        # provides and CLE never maps, so angr recovers no exit for it and reads it, and
+        # __errno_location and strtol and vfprintf above it, as non-returning. That is a failure
+        # to recover rather than evidence about the callee, and it must not reach the callers:
+        # printf, fprintf and atoi all return, and each one's only recovered way out is a call to
+        # a function in that chain.
+        proj = angr.Project(os.path.join(test_location, "armel", "libc.so.6"), auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+
+        for addr in (0x4469C0, 0x446990, 0x42EC3C):
+            func = cfg.kb.functions[addr]
+            assert func.returning is True, f"{func.name} should still return"
 
 
 if __name__ == "__main__":

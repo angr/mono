@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from collections import OrderedDict
 from typing import cast
 
 import archinfo
@@ -11,7 +12,9 @@ from archinfo import Endness
 
 import angr
 from angr import AngrMissingTypeError
+from angr.rust.sim_type import RustSimStruct
 from angr.sim_type import (
+    SimCppClass,
     SimStruct,
     SimType,
     SimTypeArray,
@@ -19,6 +22,7 @@ from angr.sim_type import (
     SimTypeChar,
     SimTypeCppFunction,
     SimTypeDouble,
+    SimTypeFixedSizeArray,
     SimTypeFloat,
     SimTypeFunction,
     SimTypeInt,
@@ -47,6 +51,7 @@ class TestTypes(unittest.TestCase):
         assert isinstance(pyproto, SimTypeFunction)
         assert isinstance(pyproto.args[0], SimTypeInt)
         assert isinstance(pyproto.args[1], SimTypePointer)
+        assert isinstance(pyproto.args[1].pts_to, SimTypePointer)
         assert isinstance(pyproto.args[1].pts_to.pts_to, SimTypeChar)
         assert isinstance(pyproto.returnty, SimTypeInt)
 
@@ -222,6 +227,7 @@ class TestTypes(unittest.TestCase):
         assert isinstance(struct_llist, SimStruct)
         assert isinstance(struct_llist.fields["next"], SimTypePointer)
         next_struct_llist = struct_llist.fields["next"].pts_to
+        assert isinstance(next_struct_llist, SimStruct)
         assert len(next_struct_llist.fields) == 2
         assert isinstance(next_struct_llist.fields["data"], SimTypeInt)
         assert isinstance(next_struct_llist.fields["next"], SimTypePointer)
@@ -230,6 +236,7 @@ class TestTypes(unittest.TestCase):
         assert isinstance(union_heap, SimUnion)
         assert isinstance(union_heap.members["forward"], SimTypePointer)
         forward_union_heap = union_heap.members["forward"].pts_to
+        assert isinstance(forward_union_heap, SimUnion)
         assert len(forward_union_heap.members) == 2
         assert isinstance(forward_union_heap.members["data"], SimTypeInt)
         assert isinstance(forward_union_heap.members["forward"], SimTypePointer)
@@ -355,6 +362,30 @@ class TestTypes(unittest.TestCase):
             (1, 7),
         ]
 
+    def test_sub_byte_types_align_to_one_byte(self):
+        # SimTypeNum is sized in bits, so a type narrower than a byte used to report an
+        # alignment of zero -- the truncated quotient -- and every struct laying such a
+        # field out divided by zero while rounding the running bit offset up.
+        arch = archinfo.ArchX86()
+
+        assert [SimTypeNum(bits).with_arch(arch).alignment for bits in range(1, 9)] == [1] * 8
+        assert SimTypeInt().with_arch(arch).alignment == 4  # wider types are unchanged
+
+        # Aggregates take a max() over their members, so they propagated the zero outwards.
+        assert SimTypeFixedSizeArray(SimTypeNum(4), 3).with_arch(arch).alignment == 1
+        assert SimUnion({"m": SimTypeNum(4)}, name="nibble_union").with_arch(arch).alignment == 1
+
+        nibble = cast(SimStruct, SimStruct({"b": SimTypeNum(4)}, name="nibble").with_arch(arch))
+        assert nibble.offsets == {"b": 0}
+        holds_union = cast(
+            SimStruct,
+            SimStruct(
+                {"a": SimTypeInt(), "u": SimUnion({"m": SimTypeNum(4)}, name="nibble_union2")},
+                name="holds_nibble_union",
+            ).with_arch(arch),
+        )
+        assert holds_union.offsets == {"a": 0, "u": 4}
+
     def test_dereference_type_anonymous_struct(self):
         angr.procedures.definitions.load_win32_type_collections()
         variant_type = angr.SIM_TYPE_COLLECTIONS["win32"].get("VARIANT")
@@ -403,6 +434,32 @@ class TestTypes(unittest.TestCase):
         union_type = union_type.with_arch(archinfo.ArchAMD64())
         assert union_type.size == 8  # fall back to architecture word size
 
+    def test_struct_offsets_with_unaligned_aggregate_field(self):
+        # An aggregate with no members reports NotImplemented for its alignment, because
+        # all() over an empty field set is vacuously true. Two supported shapes produce one:
+        # an opaque C++ class, whose layout is unknown so its size is forced, and an empty
+        # union. Laying out a struct that holds either must not depend on multiplying that
+        # sentinel by the byte width.
+        arch = archinfo.ArchX86()
+
+        opaque_class = SimCppClass(unique_name="Opaque", name="Opaque", members={}, size=32)
+        assert opaque_class.with_arch(arch).alignment is NotImplemented
+        holds_class = SimStruct(
+            {"a": SimTypeInt(), "b": opaque_class, "c": SimTypeInt()}, name="holds_class"
+        ).with_arch(arch)
+        assert isinstance(holds_class, SimStruct)
+        assert holds_class.offsets == {"a": 0, "b": 4, "c": 8}
+
+        empty_union = SimUnion({}, name="OpaqueUnion")
+        assert empty_union.with_arch(arch).alignment is NotImplemented
+        holds_union = SimStruct(
+            {"a": SimTypeChar(), "b": empty_union, "c": SimTypeInt()}, name="holds_union"
+        ).with_arch(arch)
+        assert isinstance(holds_union, SimStruct)
+        offsets = holds_union.offsets
+        assert set(offsets) == {"a", "b", "c"}
+        assert offsets["a"] == 0 and offsets["a"] < offsets["b"] < offsets["c"]
+
     def test_widechar_extraction(self):
         proj = angr.load_shellcode(b"\x90\x90\x90\x90", arch="AMD64")
         state = proj.factory.blank_state()
@@ -424,6 +481,49 @@ class TestTypes(unittest.TestCase):
         new_t = SimType.from_json(d)
         deref_new_t = dereference_simtype(new_t, [angr.SIM_TYPE_COLLECTIONS["win32"]])
         assert deref_t == deref_new_t
+
+    def test_serialize_self_referential_rust_struct(self):
+        # struct Node { next: &Node } -- RustSimStruct consulted the memo without ever filling it
+        node = RustSimStruct(OrderedDict(), name="Node")
+        node.fields["next"] = SimTypePointer(node)
+
+        d = node.to_json()  # shall not raise
+        assert d["fields"]["next"]["pts_to"] == {"_t": "_ref", "name": "Node", "ot": "rust_struct"}
+
+    def test_serialize_self_referential_union(self):
+        union_heap = angr.types.parse_type("union heap { int data; union heap *forward; }")
+        d = union_heap.to_json()  # shall not raise
+        assert d["members"]["forward"]["pts_to"] == {"_t": "_ref", "name": "heap", "ot": "union"}
+
+    def test_union_with_arch_keeps_the_name_and_label(self):
+        union_heap = angr.types.parse_type("union heap { int data; union heap *forward; }")
+        assert union_heap.with_arch(archinfo.ArchAMD64()).name == "heap"  # shall not raise
+
+        u = SimUnion({"i": SimTypeInt()}, name="heap", label="lbl")
+        arched = cast(SimUnion, u.with_arch(archinfo.ArchAMD64()))
+        assert (arched.name, arched.label) == ("heap", "lbl")
+
+    def test_serialize_keeps_distinct_anonymous_aggregates_apart(self):
+        # every anonymous aggregate is named "<anon>", so a name-keyed memo would serialize the
+        # second one as a reference to the first and lose its members
+        t = angr.types.parse_type("struct outer { struct { int x; } a; struct { char c; } b; }")
+        d = t.to_json()
+        assert d["fields"]["b"]["_t"] == "struct"
+
+        restored = cast(SimStruct, SimType.from_json(d))
+        assert isinstance(cast(SimStruct, restored.fields["b"]).fields["c"], SimTypeChar)
+
+    def test_with_arch_keeps_distinct_anonymous_structs_apart(self):
+        t = angr.types.parse_type("struct outer { struct { int x; } a; struct { char c; } b; }")
+        arched = cast(SimStruct, t.with_arch(archinfo.ArchAMD64()))
+        assert arched.fields["a"] is not arched.fields["b"]
+        assert list(cast(SimStruct, arched.fields["b"]).fields) == ["c"]
+
+    def test_dereference_keeps_distinct_anonymous_structs_apart(self):
+        t = angr.types.parse_type("struct outer { struct { struct { int x; } deep; } mid; int y; }")
+        mid = cast(SimStruct, cast(SimStruct, dereference_simtype(t, [])).fields["mid"])
+        assert mid.fields["deep"] is not mid
+        assert isinstance(cast(SimStruct, mid.fields["deep"]).fields["x"], SimTypeInt)
 
     def test_simstruct_cmp_recursion_error(self):
         t0 = SimStruct(fields={"a": SimTypeBottom()})

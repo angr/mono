@@ -2,17 +2,29 @@
 from __future__ import annotations
 
 import os
+import pickle
+import threading
 from unittest import TestCase, main
+from unittest.mock import patch
 
 import archinfo
+from pyvex.expr import Const
+import pyvex
 
 import angr
+from angr.block import Block
+import pypcode
+
+import angr
+from angr.engines.pcode.lifter import PcodeLifterEngineMixin
+from angr.engines.vex.lifter import VEXLifter
 
 test_location = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "..", "..", "binaries", "tests")
 
 
 # pylint: disable=missing-class-docstring
 # pylint: disable=no-self-use
+# pylint: disable=protected-access
 class TestPcodeEngine(TestCase):
     def test_shellcode(self):
         """
@@ -144,6 +156,251 @@ class TestPcodeEngine(TestCase):
                 continue
             func_out = func.graph.out_degree(func_node)
             assert func_out > 0
+
+    def test_lift_architecture_whose_word_is_not_a_power_of_two(self):
+        """
+        A SLEIGH language may declare a word size VEX has no named constant for: the PIC and dsPIC
+        families are 24-bit. Lifting one used to raise KeyError on the width itself.
+        """
+        for language in ("dsPIC33F:LE:24:default", "PIC-24E:LE:24:default"):
+            with self.subTest(language=language):
+                arch = archinfo.ArchPcode(language)
+                assert arch.bits == 24
+                project = angr.load_shellcode(
+                    b"\x00" * 6, arch=arch, load_address=0x1000, engine=angr.engines.UberEnginePcode
+                )
+                irsb = project.factory.block(0x1000).vex
+                assert isinstance(irsb.next, Const)
+                assert irsb.next.con.__class__.__name__ == f"U{arch.bits}"
+
+    def test_narrow_arch_jump_targets(self):
+        """
+        The lifter builds a block's jump target at three separate sites, one reached only by an
+        undecodable block and one only by a fallthrough. Extended AVR8 addresses are 24 bits wide.
+        """
+        arch = archinfo.ArchPcode("avr8:LE:16:extended")
+        assert arch.bits == 24
+
+        p = angr.load_shellcode(
+            bytes.fromhex("01e00895"),  # ldi r16, 1 ; ret
+            arch=arch,
+            load_address=0x100,
+            engine=angr.engines.UberEnginePcode,
+        )
+        assert p.factory.block(0x100).vex.jumpkind == "Ijk_Ret"
+
+        undecodable = angr.load_shellcode(
+            b"\xff\xff", arch=arch, load_address=0x100, engine=angr.engines.UberEnginePcode
+        )
+        block = undecodable.factory.block(0x100).vex
+        assert block.jumpkind == "Ijk_NoDecode"
+        assert isinstance(block.next, Const)
+        assert block.next.con.value == 0x100
+        assert block.next.con.type == "Ity_I24"
+
+        fallthrough = angr.load_shellcode(
+            bytes.fromhex("01e012e00895"),  # ldi r16, 1 ; ldi r17, 2 ; ret
+            arch=arch,
+            load_address=0x100,
+            engine=angr.engines.UberEnginePcode,
+        )
+        block = fallthrough.factory.block(0x100, num_inst=1).vex
+        assert block.jumpkind == "Ijk_Boring"
+        assert isinstance(block.next, Const)
+        assert block.next.con.value == 0x102
+        assert block.next.con.type == "Ity_I24"
+
+        state = fallthrough.factory.blank_state(addr=0x100)
+        successors = fallthrough.factory.successors(state, num_inst=1).successors
+        assert [(s.solver.eval(s.regs.ip), s.regs.ip.size()) for s in successors] == [(0x102, 24)]
+    def test_arch_without_program_counter(self):
+        """
+        Test states and CFG recovery on an architecture whose sleigh language declares no program
+        counter register, so there is no register for the instruction pointer to live in.
+        """
+        arch = archinfo.ArchPcode("Dalvik:LE:32:DEX_Nougat")
+
+        # const/4 v0, #0 ; return-void
+        byte_code = bytes.fromhex("12000e00")
+        p = angr.load_shellcode(
+            byte_code, arch=arch, start_offset=0x1000, load_address=0x1000, engine=angr.engines.UberEnginePcode
+        )
+
+        for state in (p.factory.blank_state(), p.factory.blank_state(addr=0x1002), p.factory.entry_state()):
+            assert repr(state) == "<SimState @ ?>"
+            assert state.history.successor_ip is None
+
+        cfg = p.analyses.CFGFast()
+        assert [(n.addr, n.size) for n in cfg.model.nodes()] == [(0x1000, 4)]
+    def test_sleigh_context_is_not_shared_between_projects(self):
+        """
+        Test that a project's blocks do not depend on which other projects were lifted before it.
+
+        Sleigh records context variables per address, so a PA-RISC branch lifted in one project used to leave the
+        delay slot context it sets behind at the following address, and an unrelated project's instruction at that
+        address was then decoded as that branch's delay slot.
+        """
+        base_addr = 0x1000
+        nop = b"\x08\x00\x02\x40"  # or %r0, %r0, %r0
+        branch = b"\xe8\x00\x00\x10"  # b 0x1010, whose delay slot is the instruction at 0x1004
+        arch = archinfo.ArchPcode("pa-risc:BE:32:default")
+
+        def project(code):
+            return angr.load_shellcode(code, arch=arch, load_address=base_addr, engine=angr.engines.UberEnginePcode)
+
+        def delay_slot_block():
+            block = project(nop * 8).factory.block(base_addr + 4)
+            next_expr = block.vex.next
+            assert isinstance(next_expr, pyvex.expr.Const)
+            return block.size, block.vex.jumpkind, next_expr.con.value
+
+        before = delay_slot_block()
+        assert before == (28, "Ijk_Boring", 0x1020)
+
+        # Lift the branch in another project, writing its delay slot context at base_addr + 4. The branch and its
+        # delay slot are one two-instruction block, which is what leaves the context behind.
+        branch_block = project(branch + nop * 7).factory.block(base_addr)
+        assert (branch_block.size, branch_block.instructions) == (8, 2)
+
+        assert delay_slot_block() == before
+
+    def test_block_lifter_is_kept_per_project(self):
+        """
+        Test that a project decodes with one basic block lifter, and therefore one Sleigh context.
+
+        Block.pcode reads that context, so a project whose engine is not the p-code engine must neither share one
+        with another project nor build one for every block.
+        """
+        code = b"\x13\x00\x00\x00" * 4  # four RISC-V nops
+        first = angr.load_shellcode(code, arch="RISCV64", load_address=0)
+        second = angr.load_shellcode(code, arch="RISCV64", load_address=0)
+
+        assert [insn.mnemonic for insn in first.factory.block(0).pcode.insns] == ["nop"] * 4
+
+        block_lifter = first.pcode_block_lifter(first.arch)
+        assert first.pcode_block_lifter(first.arch) is block_lifter
+        assert second.pcode_block_lifter(second.arch) is not block_lifter
+
+        # a lifter decodes one architecture, so a Block naming another gets its own rather than this one, which
+        # would answer for the architecture the caller did not ask for
+        other_arch = archinfo.ArchPcode("pa-risc:BE:32:default")
+        assert first.pcode_block_lifter(other_arch).arch == other_arch
+        assert first.pcode_block_lifter(first.arch) is not block_lifter
+
+        # Block.__init__ takes an architecture from the caller, so this is reachable: decoded through the
+        # project's own context these bytes read as RISC-V nops, which is not what the caller asked for
+        elsewhere = Block(0, project=first, arch=other_arch, size=len(code))
+        assert [insn.mnemonic for insn in elsewhere.pcode.insns] == ["SPOP0,0x0"] * 4
+
+        # a Sleigh context cannot be pickled, so the lifter a project keeps must not go into its pickle
+        restored = pickle.loads(pickle.dumps(first))
+        assert [insn.mnemonic for insn in restored.factory.block(0).pcode.insns] == ["nop"] * 4
+
+        # a project running the p-code engine keeps it in the same place, so its engine and its Block.pcode decode
+        # with one context rather than one each
+        arch = archinfo.ArchPcode("pa-risc:BE:32:default")
+        third = angr.load_shellcode(
+            b"\x08\x00\x02\x40" * 4, arch=arch, load_address=0x1000, engine=angr.engines.UberEnginePcode
+        )
+        assert third._pcode_block_lifter is None
+        assert third.factory.block(0x1000).instructions == 4
+        assert third._pcode_block_lifter is not None
+        assert third.pcode_block_lifter(arch) is third._pcode_block_lifter
+
+    def test_block_lifter_is_shared_between_threads(self):
+        """
+        Test that a project decodes with one basic block lifter whichever thread lifts.
+
+        The factory hands out one engine per thread, so keeping the lifter on the engine gave each thread its own
+        Sleigh context and made a block's decoding depend on which thread reached it first.
+        """
+        arch = archinfo.ArchPcode("pa-risc:BE:32:default")
+        proj = angr.load_shellcode(
+            b"\x08\x00\x02\x40" * 4, arch=arch, load_address=0x1000, engine=angr.engines.UberEnginePcode
+        )
+        assert proj.factory.block(0x1000).instructions == 4
+        main_lifter = proj._pcode_block_lifter
+        assert main_lifter is not None
+
+        seen = []
+
+        def lift_in_thread():
+            proj.factory.block(0x1000)
+            seen.append((proj.factory.default_engine, proj.pcode_block_lifter(arch)))
+
+        thread = threading.Thread(target=lift_in_thread)
+        thread.start()
+        thread.join()
+
+        assert len(seen) == 1
+        other_engine, other_lifter = seen[0]
+        assert other_engine is not proj.factory.default_engine  # the factory really did hand out a second engine
+        assert other_lifter is main_lifter
+    def test_disassembly_is_lazy(self):
+        """
+        Lifting a block must not disassemble it. CFG recovery never reads IRSB.disassembly, so decoding it eagerly
+        costs a second Sleigh pass and an object per instruction on every lift, all of it retained by the block cache.
+        """
+        proj = angr.Project(os.path.join(test_location, "sh4", "test-instr_sh4"), auto_load_libs=False)
+        assert isinstance(proj.arch, archinfo.ArchPcode)
+
+        real_disassemble = pypcode.Context.disassemble
+        calls = []
+
+        def counting_disassemble(self, *args, **kwargs):
+            calls.append(args)
+            return real_disassemble(self, *args, **kwargs)
+
+        with patch.object(pypcode.Context, "disassemble", counting_disassemble):
+            irsb = proj.factory.block(proj.entry).vex
+            assert irsb.size > 0
+            assert not calls
+
+            disasm = irsb.disassembly
+            assert len(calls) == 1
+            assert [insn.address for insn in disasm.insns] == list(irsb.instruction_addresses)
+            assert sum(insn.size for insn in disasm.insns) == irsb.size
+
+            # The disassembly is decoded once and kept
+            assert irsb.disassembly is disasm
+            assert len(calls) == 1
+
+        # A block that stopped early disassembles to what it lifted, not to whatever follows it
+        short = proj.factory.block(proj.entry, num_inst=1).vex
+        assert len(short.disassembly.insns) == 1
+        assert short.disassembly.insns[0].size == short.size
+
+    def test_disassembly_failure_is_not_raised(self):
+        """
+        IRSB.disassembly does not propagate a Sleigh decode error. A block that will not decode simply has no
+        disassembly, which is all its callers have ever had to handle.
+        """
+        proj = angr.Project(os.path.join(test_location, "sh4", "test-instr_sh4"), auto_load_libs=False)
+        irsb = proj.factory.block(proj.entry).vex
+
+        def failing_disassemble(self, *args, **kwargs):
+            raise pypcode.BadDataError("Unable to resolve constructor")
+
+        with patch.object(pypcode.Context, "disassemble", failing_disassemble):
+            assert irsb.disassembly is None
+
+        # Sleigh is not asked again; a second attempt here would succeed and return a block
+        assert irsb.disassembly is None
+
+    def test_block_cache_no_larger_than_vex(self):
+        """
+        A p-code block retains several times what the equivalent VEX block does, so the p-code engine must not cache
+        more blocks than the VEX engine.
+        """
+        binary_path = os.path.join(test_location, "x86_64", "fauxware")
+        vex_proj = angr.Project(binary_path, auto_load_libs=False)
+        pcode_proj = angr.Project(binary_path, auto_load_libs=False, engine=angr.engines.UberEnginePcode)
+
+        vex_engine = vex_proj.factory.default_engine
+        pcode_engine = pcode_proj.factory.default_engine
+        assert isinstance(vex_engine, VEXLifter)
+        assert isinstance(pcode_engine, PcodeLifterEngineMixin)
+        assert pcode_engine._cache_size <= vex_engine._cache_size  # pylint: disable=protected-access
 
 
 if __name__ == "__main__":

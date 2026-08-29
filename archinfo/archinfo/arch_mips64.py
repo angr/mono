@@ -196,5 +196,50 @@ class ArchMIPS64(Arch):
     elf_tls = TLSArchInfo(1, 16, [], [0], [], 0x7000, 0x8000)
 
 
+class ArchMIPSN32(ArchMIPS64):
+    """
+    The MIPS n32 ABI, and the older O64 ABI alongside it.
+
+    Both put a 64-bit instruction stream in an ELFCLASS32 container: the registers and the
+    instructions are those of ArchMIPS64, while pointers, GOT slots, relocation entries and
+    symbol table entries stay 32-bit. Every ELF structure an n32 object carries is an Elf32_*
+    one, so ``bits`` -- which is what decides how wide a word CLE reads and writes -- is 32,
+    and only the decoding side is inherited from the 64-bit architecture.
+
+    Picking ArchMIPS64 for these instead would decode correctly and then corrupt the object:
+    CLE would stride the GOT by 8 rather than 4, read an 8-byte implicit addend out of a
+    4-byte REL slot, and write 8 bytes back over the neighbouring word.
+
+    ``bits`` is therefore the width of a pointer here and nothing else. It is not the width of a
+    register, and a consumer that needs one -- to slot an argument into ``a0``, say -- has to read
+    the size out of the register file (``registers[name]`` and ``Register.size``) or state it
+    itself. n32 is the architecture that separates the two, so it is the one that catches a
+    consumer conflating them, and on a little-endian target it will not: the two disagree only
+    about which half of a 64-bit register a 32-bit value occupies.
+    """
+
+    def __init__(self, endness=Endness.BE):
+        super().__init__(endness)
+        if endness == Endness.BE:
+            self.pcode_id = "MIPS:BE:64:64-32addr"
+            self.triplet = "mips64-linux-gnuabin32"
+            self.linux_name = "mipsn32"
+            self.ida_name = "mips64b"
+        else:
+            self.pcode_id = "MIPS:LE:64:64-32addr"
+            self.triplet = "mips64el-linux-gnuabin32"
+            self.linux_name = "mipsn32el"
+
+    bits = 32
+    name = "MIPSN32"
+    qemu_name = "mipsn32el"
+    linux_name = "mipsn32el"
+    triplet = "mips64el-linux-gnuabin32"
+    # n32 keeps the 64-bit registers but narrows the C long and the pointer.
+    sizeof = {"short": 16, "int": 32, "long": 32, "long long": 64}
+    # Two 32-bit words of thread pointer head, as on any 32-bit MIPS.
+    elf_tls = TLSArchInfo(1, 8, [], [0], [], 0x7000, 0x8000)
+
+
 register_arch([r".*mipsel.*|.*mips64el|.*mipsel64"], 64, Endness.LE, ArchMIPS64)
 register_arch([r".*mips64.*|.*mips.*"], 64, Endness.ANY, ArchMIPS64)

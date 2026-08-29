@@ -666,9 +666,24 @@ class SimCC:
 
     STACK_ALIGNMENT = 1  # the alignment requirement of the stack pointer at function start BEFORE call
 
+    # The width in bytes of one argument slot: one integer argument register, and one stack argument
+    # slot. None means "the architecture's word size", which is what every ABI whose registers are as
+    # wide as its pointers wants. Set it explicitly when the two differ -- MIPS n32 passes arguments
+    # in the 64-bit register file of MIPS64 while its pointers, and therefore ``arch.bytes``, are 32
+    # bits. Getting this wrong is invisible on a little-endian target and silently places every
+    # sub-slot argument in the wrong half of the register on a big-endian one.
+    ARG_SLOT_SIZE: int | None = None
+
     #
     # Here are several things you MAY want to override to change your cc's convention
     #
+
+    @property
+    def arg_slot_size(self) -> int:
+        """
+        The width in bytes of one argument slot. See ``ARG_SLOT_SIZE``.
+        """
+        return self.ARG_SLOT_SIZE if self.ARG_SLOT_SIZE is not None else self.arch.bytes
 
     @property
     def int_args(self):
@@ -679,7 +694,7 @@ class SimCC:
         """
         if self.ARG_REGS is None:
             raise NotImplementedError
-        return SerializableListIterator([SimRegArg(reg, self.arch.bytes) for reg in self.ARG_REGS])
+        return SerializableListIterator([SimRegArg(reg, self.arg_slot_size) for reg in self.ARG_REGS])
 
     @property
     def memory_args(self):
@@ -689,7 +704,8 @@ class SimCC:
         Returns an iterator of SimFunctionArguments
         """
         start = self.STACKARG_SP_BUFF + self.STACKARG_SP_DIFF
-        return SerializableCounter(start, self.arch.bytes, lambda offset: SimStackArg(offset, self.arch.bytes))
+        slot = self.arg_slot_size
+        return SerializableCounter(start, slot, lambda offset: SimStackArg(offset, slot))
 
     @property
     def fp_args(self):
@@ -700,7 +716,7 @@ class SimCC:
         """
         if self.FP_ARG_REGS is None:
             raise NotImplementedError
-        return SerializableListIterator([SimRegArg(reg, self.arch.bytes) for reg in self.FP_ARG_REGS])
+        return SerializableListIterator([SimRegArg(reg, self.arg_slot_size) for reg in self.FP_ARG_REGS])
 
     def is_fp_arg(self, arg):
         """
@@ -748,7 +764,7 @@ class SimCC:
         out = self.STACKARG_SP_DIFF
         for arg in args:
             if isinstance(arg, SimStackArg):
-                out = max(out, arg.stack_offset + self.arch.bytes)
+                out = max(out, arg.stack_offset + self.arg_slot_size)
 
         out += self.STACKARG_SP_BUFF
         return out
@@ -1232,7 +1248,9 @@ class SimCC:
     def _guess_arg_count(cls, args, limit: int = 64) -> int:
         # pylint:disable=not-callable
         assert cls.ARCH is not None
-        if hasattr(cls, "LANGUAGE"):  # noqa: SIM108
+        if cls.ARG_SLOT_SIZE is not None:
+            stack_arg_size = cls.ARG_SLOT_SIZE
+        elif hasattr(cls, "LANGUAGE"):
             # this is a PCode SimCC where cls.ARCH is directly callable
             stack_arg_size = cls.ARCH().bytes  # type: ignore
         else:
@@ -1445,6 +1463,43 @@ class SimCCMicrosoftFastcall(SimCC):
             locs_size += locs[-1].size
         return refine_locs_with_struct_type(self.arch, locs, arg_type)
 
+    STRUCT_RETURN_THRESHOLD = 64
+
+    def return_val(self, ty, perspective_returned=False):
+        # __fastcall changes how arguments are passed, not how values are returned: on Windows x86 an
+        # aggregate of at most eight bytes comes back in EAX:EDX and a larger one is written through a
+        # hidden pointer, exactly as for __cdecl. OVERFLOW_RETURN_VAL above already states this, but
+        # without an override the base class refuses every aggregate return type.
+        #
+        # The hidden pointer's location is taken from next_arg rather than assumed, because it is the
+        # call's first argument and __fastcall passes that in ECX -- not in the stack slot that
+        # SimCCCdecl.return_val hard-codes for its own convention. That is why this cannot simply
+        # inherit or delegate to the cdecl implementation.
+        if ty._arch is None:
+            ty = ty.with_arch(self.arch)
+        if not isinstance(ty, SimStruct):
+            return super().return_val(ty, perspective_returned)
+
+        if ty.size > self.STRUCT_RETURN_THRESHOLD:
+            byte_size = ty.size // self.arch.byte_width
+            referenced_locs = [SimStackArg(offset, self.arch.bytes) for offset in range(0, byte_size, self.arch.bytes)]
+            referenced_loc = refine_locs_with_struct_type(self.arch, referenced_locs, ty)
+            if perspective_returned:
+                ptr_loc = self.RETURN_VAL
+            else:
+                ptr_loc = self.next_arg(self.ArgSession(self), SimTypePointer(SimTypeBottom()).with_arch(self.arch))
+            assert ptr_loc is not None
+            return SimReferenceArgument(ptr_loc, referenced_loc)
+
+        return refine_locs_with_struct_type(self.arch, [self.RETURN_VAL, self.OVERFLOW_RETURN_VAL], ty)
+
+    def return_in_implicit_outparam(self, ty):
+        # Kept consistent with return_val: when the aggregate comes back through a hidden pointer that
+        # pointer is the first argument, so it must consume ECX and push the declared arguments along.
+        if isinstance(ty, SimTypeBottom):
+            return False
+        return isinstance(ty, SimStruct) and ty.size > self.STRUCT_RETURN_THRESHOLD
+
 
 class MicrosoftAMD64ArgSession(ArgSession):
     pass
@@ -1489,7 +1544,7 @@ class SimCCMicrosoftAMD64(SimCC):
         return SimReferenceArgument(int_loc, referenced_loc)
 
     def return_in_implicit_outparam(self, ty):
-        if isinstance(ty, (SimTypeBottom, SimTypeRef)):
+        if ty is None or isinstance(ty, (SimTypeBottom, SimTypeRef)):
             return False
         return not isinstance(ty, SimTypeFloat) and ty.size > self.STRUCT_RETURN_THRESHOLD
 
@@ -2517,7 +2572,7 @@ class SimCCO32LinuxSyscall(SimCCSyscall):
         return state.regs.v0
 
 
-class SimCCN64(SimCC):  # TODO: add n32
+class SimCCN64(SimCC):
     ARG_REGS = ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"]
     CALLER_SAVED_REGS = ["t9", "gp"]
     FP_ARG_REGS = []  # TODO: ???
@@ -2528,6 +2583,24 @@ class SimCCN64(SimCC):  # TODO: add n32
 
 
 SimCCO64 = SimCCN64  # compatibility
+
+
+class SimCCN32(SimCCN64):
+    """
+    n32 passes its arguments exactly as n64 does -- eight 64-bit registers, then 64-bit stack slots --
+    and differs only in the width of a pointer, which lives in the architecture rather than in the
+    convention.
+
+    That is why the argument slot has to be stated here. ``ArchMIPSN32.bits`` is 32 because an n32
+    pointer, GOT slot and relocation entry are 32 bits, and the loader reads it for exactly that; the
+    register file it inherits from ArchMIPS64 is still 64 bits wide. Letting the slot width default
+    to ``arch.bytes`` would describe ``a0`` as four bytes, which is not merely narrow: on a
+    big-endian n32 target it places a 32-bit argument at offset 0 of ``a0``, the sign-extension half,
+    and it refuses a 64-bit scalar outright.
+    """
+
+    ARCH = archinfo.ArchMIPSN32
+    ARG_SLOT_SIZE = 8
 
 
 class SimCCN64LinuxSyscall(SimCCSyscall):
@@ -2548,6 +2621,11 @@ class SimCCN64LinuxSyscall(SimCCSyscall):
     @staticmethod
     def syscall_num(state):
         return state.regs.v0
+
+
+class SimCCN32LinuxSyscall(SimCCN64LinuxSyscall):
+    ARCH = archinfo.ArchMIPSN32
+    ARG_SLOT_SIZE = 8
 
 
 class SimCCPowerPC(SimCC):
@@ -2696,6 +2774,10 @@ CC: dict[str, dict[str, list[type[SimCC]]]] = {
         "default": [SimCCN64],
         "Linux": [SimCCN64],
     },
+    "MIPSN32": {
+        "default": [SimCCN32],
+        "Linux": [SimCCN32],
+    },
     "PPC32": {
         "default": [SimCCPowerPC],
         "Linux": [SimCCPowerPC],
@@ -2724,6 +2806,7 @@ DEFAULT_CC: dict[str, dict[str, type[SimCC]]] = {
     "ARMCortexM": {"Linux": SimCCARMHF},
     "MIPS32": {"Linux": SimCCO32},
     "MIPS64": {"Linux": SimCCN64},
+    "MIPSN32": {"Linux": SimCCN32},
     "PPC32": {"Linux": SimCCPowerPC},
     "PPC64": {"Linux": SimCCPowerPC64},
     "AARCH64": {"Linux": SimCCAArch64},
@@ -2759,6 +2842,7 @@ ARCH_NAME_ALIASES = {
     "AARCH64": ["arm64", "aarch64"],
     "MIPS32": [],
     "MIPS64": [],
+    "MIPSN32": ["mipsn32"],
     "PPC32": ["powerpc32"],
     "PPC64": ["powerpc64"],
     "RISCV64": ["riscv64"],
@@ -2876,6 +2960,10 @@ SYSCALL_CC: dict[str, dict[str, type[SimCCSyscall]]] = {
     "MIPS64": {
         "default": SimCCN64LinuxSyscall,
         "Linux": SimCCN64LinuxSyscall,
+    },
+    "MIPSN32": {
+        "default": SimCCN32LinuxSyscall,
+        "Linux": SimCCN32LinuxSyscall,
     },
     "PPC32": {
         "default": SimCCPowerPCLinuxSyscall,
