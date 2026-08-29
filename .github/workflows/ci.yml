@@ -41,6 +41,23 @@ permissions:
   contents: read
 
 jobs:
+  # The scripts in ci/ are the only code this repository writes, and the ones
+  # that run on a rollup branch -- `ci/import.py --from-trees` above all --
+  # run nowhere else, so a fault in them surfaces as ninety-six jobs
+  # disagreeing about something the branch does not contain. Standard
+  # library only, no components, no Nix: it is a minute at the front of the
+  # run and it fails before the matrix has started.
+  scripts:
+    name: ci scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover -v -s ci/tests -p 'test_*.py'
+
   plan:
     name: Plan
     runs-on: ubuntu-latest
