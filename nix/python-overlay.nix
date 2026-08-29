@@ -3,9 +3,10 @@
 # Every derivation reads its dependency list and build backend from the
 # component's own pyproject.toml, so the flake follows upstream as the trees
 # move. The hand-maintained pieces are: the version-file locations, the
-# packages nixpkgs does not carry (`skipped`), the exact-version table
-# (`pinned`) for the few third-party packages whose version matters, and the
-# native build wiring (Rust for angr, CMake for pyvex and pypcode).
+# requirements dropped from every closure (`skipped`, currently empty), the
+# exact-version table (`pinned`) for the few third-party packages whose version
+# matters, the derivations for packages nixpkgs does not carry, and the native
+# build wiring (Rust for angr, CMake for pyvex and pypcode).
 {
   lib,
   src, # the monorepo root
@@ -44,18 +45,26 @@ let
     "pyobjc-framework-cocoa" = "pyobjc-framework-Cocoa";
   };
 
-  # Runtime requirements nixpkgs does not package and this overlay does not
-  # add. cle guards the import (cle/backends/uefi_firmware.py), so only the
-  # UEFI-firmware path loses functionality.
+  # Runtime requirements dropped from every component's closure. The list is
+  # empty, and the two packages that used to be on it are the argument for
+  # leaving it that way.
   #
-  # pyxdia used to be on this list. It is not any more: dropping it makes five
-  # of cle's PE tests fail, because a PDB is unreadable without it and
-  # `find_symbol` quietly returns None. A test suite that fails for want of an
-  # optional dependency is not a suite that tells you anything, so the wheel is
-  # packaged below instead.
-  skipped = [
-    "uefi-firmware"
-  ];
+  # pyxdia came off first: dropping it makes five of cle's PE tests fail,
+  # because a PDB is unreadable without it and `find_symbol` quietly returns
+  # None. uefi-firmware came off next and was never arguable at all --
+  # cle/pyproject.toml asks for `uefi-firmware~=1.16` in `dependencies`, not in
+  # an extra. The note that stood here said cle guards the import
+  # (cle/backends/uefi_firmware.py) so only the UEFI-firmware path loses
+  # functionality; the guard is defensive coding, not a statement that the
+  # dependency is optional. What the drop actually bought was six failures in
+  # cle/tests/test_uefi_modules.py -- `Unable to find a loader backend for
+  # ... edk2_armvirtqemu.fd` -- and four skips in test_uefi_firmware.py that
+  # read as a healthy suite (angr/mono#11).
+  #
+  # A suite that fails, or quietly skips, for want of a dependency the
+  # component declares is not a suite that tells you anything. Both packages
+  # are built below instead, which is where a third candidate belongs too.
+  skipped = [ ];
 
   # ---------------------------------------------------------------------------
   # Exact-version table.
@@ -389,6 +398,48 @@ in
         license = lib.licenses.mit;
       };
     };
+
+  # cle's UEFI firmware volume parser, and unlike pyxdia not optional in any
+  # reading: cle/pyproject.toml requires `uefi-firmware~=1.16` everywhere but
+  # emscripten, and without it `cle.Loader` finds no backend for a firmware
+  # volume at all. nixpkgs does not carry it.
+  #
+  # Built from the sdist rather than a wheel, which pyxdia above cannot be: the
+  # only native part is EDK2's Tiano and LZMA decompressors, a few dozen C
+  # files that compile in the sandbox in seconds, so one source hash covers
+  # every system instead of a wheel URL per platform.
+  uefi-firmware = buildPythonPackage rec {
+    pname = "uefi-firmware";
+    version = "1.16";
+    pyproject = true;
+    src = python-final.fetchPypi {
+      pname = "uefi_firmware";
+      inherit version;
+      hash = "sha256-Fia5kwsQBvnsELde+In/wXxjLgtDpKugehCQ2QIxM+o=";
+    };
+    build-system = [
+      python-final.setuptools
+      python-final.setuptools-scm
+    ];
+    # setup.py reads its version from git tags. An unpacked sdist has no
+    # history and the fallback it declares is "0.1.0+unknown", which would
+    # install a package cle's `~=1.16` cannot be satisfied by.
+    env.SETUPTOOLS_SCM_PRETEND_VERSION = version;
+    # `future` is the Python 2 compatibility distribution, which setup.py
+    # still install_requires. Nothing in the package imports it -- the
+    # `from __future__ import print_function` lines are the stdlib module of
+    # the same name -- but the metadata names it, so it is provided rather
+    # than stripped.
+    dependencies = [ python-final.future ];
+    # The sdist's tests/ needs dictdiffer, which is not otherwise in the tree.
+    doCheck = false;
+    pythonImportsCheck = [ "uefi_firmware" ];
+    meta = {
+      description = "UEFI firmware volume parser used by cle";
+      homepage = "https://github.com/theopolis/uefi-firmware-parser";
+      license = lib.licenses.bsd3;
+    };
+  };
 
   # Two packages nixpkgs does not carry that the tree needs.
   #
