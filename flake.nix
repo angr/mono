@@ -4,15 +4,6 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/6b5e5b7a6631f065bf6908986990b37d845f847f";
 
-    # VEX stays external on purpose: it is a vendored fork of valgrind's IR
-    # library with its own release cadence, and pyvex only ever consumes it as
-    # a source drop. Pinning it here keeps `pyvex/vex` out of this tree while
-    # still giving every build the same bytes.
-    vex = {
-      url = "github:angr/vex/875f7c9a5f6be621b4f000c29c016e15ddf32207";
-      flake = false;
-    };
-
     # angr's function and type definitions: ~200 MB of generated JSON.
     angr-data = {
       url = "github:angr/angr-data";
@@ -25,7 +16,6 @@
     {
       self,
       nixpkgs,
-      vex,
       angr-data,
     }:
     let
@@ -42,7 +32,6 @@
         import ./nix/python-overlay.nix {
           inherit (pkgs) lib;
           src = self;
-          vexSrc = vex;
           angrDataSrc = angr-data;
         };
 
@@ -188,10 +177,6 @@
           pypcode-lib = ps.pypcode;
           angr-data-lib = ps.angr-data;
 
-          # Test fixtures and VEX sources as store paths, so CI warms and
-          # transfers them through the same binary cache as everything else.
-          vex-src = pkgs.runCommandLocal "angr-vex" { } "ln -s ${vex} $out";
-
         }
         // lib.optionalAttrs (hasGui pkgs) {
           gui-env = guiEnvFor pkgs;
@@ -268,7 +253,6 @@
             ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.gcc ];
             shellHook = ''
               echo "angr/mono dev shell."
-              echo "  ci/link-external.sh   fixtures and VEX sources into place"
               echo "  ci/dev-setup.sh       editable installs of every component in .venv"
               echo "  ci/run-suite.sh cle   one component's suite"
             '';

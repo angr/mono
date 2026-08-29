@@ -24,10 +24,6 @@ set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 venv=$root/.venv
 
-# pyvex compiles VEX out of ./vex, which is a pinned input rather than tracked
-# content, so it has to be on disk before pip runs.
-"$root/ci/link-external.sh" vex
-
 # Dependency order: a component's build imports the ones under it -- angr's
 # unicornlib compiles against pyvex's headers.
 components=(archinfo pyvex pypcode claripy cle angr angr-management)

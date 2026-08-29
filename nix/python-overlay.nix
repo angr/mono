@@ -9,7 +9,6 @@
 {
   lib,
   src, # the monorepo root
-  vexSrc, # checkout of github:angr/vex (kept external, pinned in flake.lock)
   angrDataSrc, # checkout of github:angr/angr-data (flake input)
 }:
 python-final: python-prev:
@@ -524,11 +523,6 @@ in
     dontUseNinjaBuild = true;
     dontUseNinjaInstall = true;
     dontUseNinjaCheck = true;
-    # VEX is not in this tree; CMakeLists.txt and license-files both want it
-    # at ./vex, so the pinned flake input is copied in before the build.
-    postPatch = ''
-      cp -r --no-preserve=mode,ownership ${vexSrc} vex
-    '';
     pythonImportsCheck = [ "pyvex" ];
     # angr's unicornlib compiles against these at build time.
     postInstall = ''

@@ -35,25 +35,7 @@
     "root": {
       "inputs": {
         "angr-data": "angr-data",
-        "nixpkgs": "nixpkgs",
-        "vex": "vex"
-      }
-    },
-    "vex": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1784683116,
-        "narHash": "sha256-Otx8mR1FWY5KOd6aN4EkNiYePuZJNEiaDKUUjAm3k/M=",
-        "owner": "angr",
-        "repo": "vex",
-        "rev": "875f7c9a5f6be621b4f000c29c016e15ddf32207",
-        "type": "github"
-      },
-      "original": {
-        "owner": "angr",
-        "repo": "vex",
-        "rev": "875f7c9a5f6be621b4f000c29c016e15ddf32207",
-        "type": "github"
+        "nixpkgs": "nixpkgs"
       }
     }
   },

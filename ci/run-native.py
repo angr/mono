@@ -3,8 +3,9 @@
 
 The Nix lane is the better test -- it pins everything down to the C library --
 and it only exists on Linux. Windows and macOS are where upstream gates, so
-they get the same suites through `uv`, against the same component sources and
-the same external commits, because both lanes read `flake.lock`.
+they get the same suites through `uv`, against the same component sources --
+every one of them tracked here, VEX included, so the two lanes cannot build
+different code.
 
     ci/run-native.py --install
     ci/run-native.py archinfo pyvex pypcode claripy cle
@@ -136,10 +137,6 @@ def install(
     wheel first and angr is pointed at it with `--find-links`. Upstream hits
     the same wall and solves it the same way.
     """
-    # pyvex compiles VEX out of ./vex, the one input still pinned in
-    # flake.lock rather than tracked here. The fixtures are tracked.
-    run(sys.executable, ROOT / "ci" / "fetch-external.py")
-
     # --clear so a second install replaces the environment rather than
     # refusing; the components install non-editable here, as upstream
     # installs them, so a stale one silently tests yesterday's source.

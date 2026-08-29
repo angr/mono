@@ -105,9 +105,12 @@
       "committed_at": "2026-08-27T10:58:45-07:00",
       "subject": "Mark GPL components as GPL-2.0-or-later (#577)",
       "excluded": [
-        "vex"
+        ".gitmodules"
       ],
-      "sibling_sources_repointed_at_workspace": []
+      "sibling_sources_repointed_at_workspace": [],
+      "vendored_submodules": {
+        "vex": "875f7c9a5f6be621b4f000c29c016e15ddf32207"
+      }
     },
     "tracer": {
       "upstream": "https://github.com/angr/tracer",
@@ -118,10 +121,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-08-29T01:35:48+00:00",
-  "external": {
-    "vex": "875f7c9a5f6be621b4f000c29c016e15ddf32207"
-  },
+  "imported_at": "2026-08-29T02:47:32+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",

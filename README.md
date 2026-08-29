@@ -110,12 +110,20 @@ fail, which would be honest -- they report as skips.
 `ci/import.py` re-snapshots them all from upstream and records what it took
 in `mono.json`.
 
-Three things are pinned in `flake.lock` instead of vendored:
+One thing is pinned in `flake.lock` instead of vendored:
 
 | | why |
 | --- | --- |
-| `angr/vex` | It is a fork of valgrind's IR library with its own cadence; pyvex only ever consumes it as a source drop, and it is the one dependency this experiment deliberately leaves outside. |
 | `angr/angr-data` | 200 MB of generated JSON. |
+
+`angr/vex` used to be pinned there too. It is tracked now, at
+`pyvex/vex`, because pyvex's `CMakeLists.txt` compiles it and a pin cannot
+follow a pull request: a rollup that applied the C half of a pyvex change
+while `vex` stayed at the commit pyvex's master names did not compile, and
+51 of that run's 55 failing checks were the one error. `ci/import.py` checks
+the submodule out at the commit pyvex's gitlink names and vendors it like any
+other source, and `mono.json` records the commit under the component's
+`vendored_submodules`.
 
 One test is deselected, in `ci/suites.json`, with its reason beside it and
 printed on every run of that suite. Nothing else is. That includes the suites
