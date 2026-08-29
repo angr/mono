@@ -514,6 +514,27 @@ jobs:
           PATH="$PWD/.venv-native/bin:$PATH" .venv-native/bin/python ci/typecheck.py \
             --base "origin/$BASE"
 
+  # The CI scripts themselves. Every other job in this workflow trusts them:
+  # the pre-commit lane strips what `ci/vendored.py` names, the ratchet scores
+  # what `ci/lint.py` decides to score, and a rollup branch's entire tree comes
+  # out of `ci/import.py`. Both defects in #4 lived in that gap -- ninety-six
+  # jobs, and not one of them could notice a manifest key that had gone
+  # missing or a score taken in the wrong directory.
+  ci-scripts:
+    name: ci scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The lint tests compare two real pylint scores. Without pylint they
+      # skip themselves, and a gate that skips is the failure mode
+      # `ci/lint.py`'s own require_pylint() exists to stop.
+      - run: python -m pip install --quiet "pylint>=2.14.0"
+      - run: python -m unittest discover --start-directory ci/tests --verbose
+
   # Every component ships a .pre-commit-config.yaml, three of the commits
   # this tree imported are literally "[pre-commit.ci] pre-commit autoupdate",
   # and nothing here ran any of it. It is the ecosystem's only gate on
@@ -893,6 +914,7 @@ jobs:
         coverage,
         rust,
         ratchets,
+        ci-scripts,
         wheels,
         checks,
         pre-commit,

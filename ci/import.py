@@ -206,6 +206,76 @@ def bucket(manifest: dict, name: str) -> dict:
     return manifest.setdefault(key, {})
 
 
+def manifest_entry(
+    name: str,
+    *,
+    commit: str,
+    committed_at: str,
+    subject: str,
+    workspaced: list[str],
+    vendored: dict[str, str],
+    **extra: object,
+) -> dict:
+    """One component's `mono.json` record, however it was imported.
+
+    Both import paths build the entry here, for the same reason both run the
+    same exclusions and the same `[tool.uv.sources]` rewrite: an ordinary
+    import and a rollup have to describe the tree identically, because every
+    gate downstream reads this record rather than the tree.
+
+    `vendored_submodules` is the one that bites. `ci/vendored.py` answers from
+    it, `ci/pre-commit.sh` strips what it names and `ci/lint.py` skips what it
+    names -- so when `--from-trees` built its entry by hand and left the key
+    out, a rollup branch's `pre-commit` job linted the 181 vendored VEX
+    sources it exists to leave alone, and reported a third-party drop nobody
+    edited as a pyvex lint failure.
+    """
+    entry = {
+        "upstream": f"https://github.com/angr/{name}",
+        "commit": commit,
+        "committed_at": committed_at,
+        "subject": subject,
+        "excluded": sorted(set(EXCLUDES.get(name, []))),
+        "sibling_sources_repointed_at_workspace": workspaced,
+        **extra,
+    }
+    if vendored:
+        entry["vendored_submodules"] = vendored
+    return entry
+
+
+def vendored_from_tree(name: str, source: Path, applied: dict) -> dict[str, str]:
+    """The submodule pins for a component snapshotted from an assembled tree.
+
+    There is no gitlink to read here -- the assembler already checked the
+    submodule out and exported its contents -- so the commit comes from the
+    manifest it wrote beside the trees, which records the merged submodule
+    commit per component under `submodules`.
+
+    Missing either half is fatal rather than quiet. Vendored sources with no
+    record of where they came from is exactly the state that made a rollup
+    branch lint the VEX drop, and it looked like a clean import at the time.
+    """
+    recorded = applied.get("submodules", {})
+    vendored = {}
+    for path in SUBMODULES.get(name, []):
+        if not (source / path).is_dir():
+            raise SystemExit(
+                f"{name}/{path} is vendored by an ordinary import but is not in "
+                f"the assembled tree at {source}; {name} cannot build without it"
+            )
+        commit = recorded.get(path)
+        if not commit:
+            raise SystemExit(
+                f"{source}/{path} was assembled but the trees' manifest records "
+                f"no commit for it, so mono.json cannot say where those files "
+                f"came from and every gate that reads `vendored_submodules` "
+                f"would treat them as code this repository wrote"
+            )
+        vendored[path] = commit
+    return vendored
+
+
 def snapshot(name: str, src: Path, dest: Path) -> None:
     if dest.exists():
         shutil.rmtree(dest)
@@ -233,6 +303,9 @@ def from_trees(
     applies, or the rollup would reintroduce the twelve component `.github`
     directories and point every sibling dependency back at GitHub. Doing it
     here rather than in the skill keeps one implementation of the rules.
+
+    The manifest entry goes through the same `manifest_entry()` the ordinary
+    path uses, so the two cannot end up describing one tree differently.
     """
     applied = {}
     for candidate in ("rollup.json", "vibr.json"):
@@ -248,17 +321,20 @@ def from_trees(
         workspaced = use_workspace_sources(ROOT / name)
         entry = applied.get("components", {}).get(name, {})
         prs = [p["number"] for p in entry.get("applied", [])]
+        vendored = vendored_from_tree(name, source, entry)
         print(f"{name}: {len(prs)} pull request(s) merged onto {entry.get('base', '?')[:12]}",
               file=sys.stderr)
-        bucket(manifest, name)[name] = {
-            "upstream": f"https://github.com/angr/{name}",
-            "commit": entry.get("base", ""),
-            "committed_at": "",
-            "subject": f"rollup of {len(prs)} open pull request(s)",
-            "excluded": sorted(set(EXCLUDES.get(name, []))),
-            "sibling_sources_repointed_at_workspace": workspaced,
-            "rolled_up": prs,
-        }
+        for path, sha in vendored.items():
+            print(f"{name}/{path}: {sha[:12]} (vendored)", file=sys.stderr)
+        bucket(manifest, name)[name] = manifest_entry(
+            name,
+            commit=entry.get("base", ""),
+            committed_at="",
+            subject=f"rollup of {len(prs)} open pull request(s)",
+            workspaced=workspaced,
+            vendored=vendored,
+            rolled_up=prs,
+        )
 
     for key in ("components", "fixtures"):
         if key in manifest:
@@ -306,17 +382,14 @@ def main() -> int:
         vendored = {path: submodule_commit(src, path) for path in SUBMODULES.get(name, [])}
         for path, sha in vendored.items():
             print(f"{name}/{path}: {sha[:12]} (vendored)", file=sys.stderr)
-        entry = {
-            "upstream": f"https://github.com/angr/{name}",
-            "commit": commit,
-            "committed_at": committed,
-            "subject": subject,
-            "excluded": sorted(set(EXCLUDES.get(name, []))),
-            "sibling_sources_repointed_at_workspace": workspaced,
-        }
-        if vendored:
-            entry["vendored_submodules"] = vendored
-        bucket(manifest, name)[name] = entry
+        bucket(manifest, name)[name] = manifest_entry(
+            name,
+            commit=commit,
+            committed_at=committed,
+            subject=subject,
+            workspaced=workspaced,
+            vendored=vendored,
+        )
 
     for key in ("components", "fixtures"):
         if key in manifest:
