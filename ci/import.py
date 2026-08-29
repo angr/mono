@@ -197,10 +197,62 @@ def snapshot(name: str, src: Path, dest: Path) -> None:
     shutil.copytree(src, dest, ignore=ignore, symlinks=True)
 
 
+def from_trees(
+    trees: Path, components: list[str], manifest: dict, manifest_path: Path
+) -> int:
+    """Snapshot components from trees somebody else assembled.
+
+    The rollup skill merges each component's open pull requests onto upstream
+    head and exports the result. Those trees still have to go through the same
+    exclusions and the same `[tool.uv.sources]` rewrite an ordinary import
+    applies, or the rollup would reintroduce the twelve component `.github`
+    directories and point every sibling dependency back at GitHub. Doing it
+    here rather than in the skill keeps one implementation of the rules.
+    """
+    applied = {}
+    for candidate in ("rollup.json", "vibr.json"):
+        if (trees / candidate).exists():
+            applied = json.loads((trees / candidate).read_text())
+            break
+
+    for name in components:
+        source = trees / name
+        if not source.is_dir():
+            continue
+        snapshot(name, source, ROOT / name)
+        workspaced = use_workspace_sources(ROOT / name)
+        entry = applied.get("components", {}).get(name, {})
+        prs = [p["number"] for p in entry.get("applied", [])]
+        print(f"{name}: {len(prs)} pull request(s) merged onto {entry.get('base', '?')[:12]}",
+              file=sys.stderr)
+        manifest["components"][name] = {
+            "upstream": f"https://github.com/angr/{name}",
+            "commit": entry.get("base", ""),
+            "committed_at": "",
+            "subject": f"rollup of {len(prs)} open pull request(s)",
+            "excluded": sorted(set(EXCLUDES.get(name, []))),
+            "sibling_sources_repointed_at_workspace": workspaced,
+            "rolled_up": prs,
+        }
+
+    manifest["components"] = dict(sorted(manifest["components"].items()))
+    manifest["imported_at"] = (
+        dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+    )
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--component", action="append", dest="components")
     parser.add_argument("--cache-dir", type=Path, default=ROOT / ".import-cache")
+    parser.add_argument(
+        "--from-trees",
+        type=Path,
+        help="snapshot from an assembled directory instead of upstream, as the "
+        "mono rollup does; expects <dir>/<component> and <dir>/rollup.json",
+    )
     args = parser.parse_args()
 
     components = args.components or COMPONENTS
@@ -212,6 +264,9 @@ def main() -> int:
     manifest = {"schema": 1, "components": {}}
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
+
+    if args.from_trees:
+        return from_trees(args.from_trees, components, manifest, manifest_path)
 
     for name in components:
         src = fetch(name, args.cache_dir)
