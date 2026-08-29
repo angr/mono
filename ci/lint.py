@@ -18,6 +18,7 @@ changed files, whichever components they happen to land in.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -117,6 +118,45 @@ def component_of(path: str) -> str:
     return path.split("/", 1)[0]
 
 
+def components(tree: Path) -> set[str]:
+    """The component directories a tree's `mono.json` records."""
+    manifest_path = tree / "mono.json"
+    if not manifest_path.exists():
+        return set()
+    manifest = json.loads(manifest_path.read_text())
+    return {
+        name
+        for section in ("components", "fixtures")
+        for name in manifest.get(section, {})
+    }
+
+
+def score_root(tree: Path, path: str) -> Path:
+    """Where to run pylint on one file, so it scores as its own repository scores it.
+
+    pylint asks isort whether an import is first-party or third-party, and
+    isort answers from the working directory. Run it at the mono root and
+    `archinfo/` is a directory right there, so `import archinfo` is a
+    first-party import and any component file importing a sibling before
+    pytest picks up `C0411 wrong-import-order` -- a message its own repository
+    cannot produce, because there archinfo is an installed package like any
+    other. Four cle test files lost this ratchet on nothing else.
+
+    So each file is scored from its component's directory, which is the root
+    of the repository it came from. `ci/pre-commit.sh` extracts a component
+    into a scratch repository for the same reason: a component's tooling means
+    what it meant upstream only when the component is the root.
+
+    Everything outside a component -- `ci/` and the tree's own files -- keeps
+    scoring from the mono root, which is its repository.
+    """
+    component = component_of(path)
+    root = tree / component
+    if component in components(tree) and root.is_dir():
+        return root
+    return tree
+
+
 def skipped_component(changed: list[str], path: str) -> bool:
     mine = component_of(path)
     count = sum(1 for p in changed if component_of(p) == mine)
@@ -128,10 +168,10 @@ def skipped_component(changed: list[str], path: str) -> bool:
 def compare(changed: list[str]) -> list[tuple[str, float, float]]:
     regressions = []
     for path in changed:
-        after = score(ROOT / path, ROOT)
+        after = score(ROOT / path, score_root(ROOT, path))
         if after is None:
             continue  # deleted
-        before = score(BASE_TREE / path, BASE_TREE)
+        before = score(BASE_TREE / path, score_root(BASE_TREE, path))
         if before is None:
             # A new file has nothing to regress against, so it must be clean.
             print(f"{path}: new file, {after:.2f}/10", flush=True)
@@ -175,7 +215,8 @@ def main() -> int:
     # resolves a module's package and its siblings, and scoring
     # `cle/cle/__init__.py` on its own in an empty directory reports -28/10
     # for imports that are simply not there. The comparison only means
-    # something against the same shape of tree.
+    # something against the same shape of tree -- and both sides are scored
+    # from the same place inside it, see `score_root`.
     subprocess.run(["rm", "-rf", str(BASE_TREE)], check=True)
     git("worktree", "add", "--detach", "--quiet", str(BASE_TREE), base)
     try:
