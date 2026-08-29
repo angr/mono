@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "df4f8ba7281a76bdb212f3ca89e7e2f3a30f569b",
-      "committed_at": "2026-08-29T12:02:57+09:00",
-      "subject": "RuntimeDb: Read RTDB_BASE when the database is created (#7008)",
+      "commit": "e780d8501fd956f3776677663f8877d863eeab43",
+      "committed_at": "2026-08-29T09:13:30-07:00",
+      "subject": "PcodeLifter: Give each project its own Sleigh context (#6814)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -50,9 +50,9 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "b8ffe85710b5d4afbff406d9953b258da398fec2",
-      "committed_at": "2026-08-28T08:09:24-07:00",
-      "subject": "Report the nop and ret encodings a big-endian machine holds in memory (#371)",
+      "commit": "7e72c6caed422219d97af234f7acec96b37535c4",
+      "committed_at": "2026-08-29T07:15:13-07:00",
+      "subject": "Add ArchMIPSN32 for 64-bit MIPS with 32-bit pointers (#375)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -66,9 +66,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "c7e0d4db664a45b59c84967ac42d04f82a97b087",
-      "committed_at": "2026-08-28T08:12:18-07:00",
-      "subject": "Add a backend for bare DEX files (#783)",
+      "commit": "eac0e5540516b9199dd6a91933e80dc774ea3eac",
+      "committed_at": "2026-08-29T07:23:56-07:00",
+      "subject": "PE: read the loading environment from the optional header (#800)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -101,9 +101,9 @@
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "ab18a834ba4a5320c3415eff971092ef2b940779",
-      "committed_at": "2026-08-27T10:58:45-07:00",
-      "subject": "Mark GPL components as GPL-2.0-or-later (#577)",
+      "commit": "26549469645736c27e81223ba7cb5881e8002e20",
+      "committed_at": "2026-08-29T07:19:16-07:00",
+      "subject": "Support MIPSN32 in the lifter (#576)",
       "excluded": [
         ".gitmodules"
       ],
@@ -121,13 +121,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-08-29T04:28:34+00:00",
+  "imported_at": "2026-08-29T20:23:28+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "a87538bc248531d2a1d22434143e8b9752459bac",
-      "committed_at": "2026-08-28T08:16:37-07:00",
-      "subject": "Add Windows ARM64 and ARMNT fastfail fixtures (#191)",
+      "commit": "d4ffa2f06ee274779244b95816a0a4fa739d262c",
+      "committed_at": "2026-08-29T12:12:58-07:00",
+      "subject": "Add an i386 object whose block simplification needs more than thirty passes (#215)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
