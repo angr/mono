@@ -9,7 +9,10 @@ configuration. That is deliberate: a codebase this old does not pass pylint
 outright, and a ratchet is what moves it the right way anyway.
 
 Same gate here, over the whole tree at once -- one merge base, one list of
-changed files, whichever components they happen to land in.
+changed files, whichever components they happen to land in. Each file is
+scored from its own component's root, because pylint's answers depend on what
+is beside the working directory and the component's repository is the standard
+it is being held to.
 
     ci/lint.py                  # against origin/main
     ci/lint.py --base HEAD~1
@@ -18,6 +21,8 @@ changed files, whichever components they happen to land in.
 from __future__ import annotations
 
 import argparse
+import functools
+import json
 import re
 import subprocess
 import sys
@@ -40,7 +45,16 @@ SCORE = re.compile(r"rated at (-?[\d.]+)/10")
 # pylint prints no score for a file with nothing in it. Upstream reads that
 # as a perfect 10; this treated it as a parse failure, so every new empty
 # __init__.py -- there are 59 tracked in this tree -- failed the gate.
-NO_STATEMENTS = "0 statements analysed."
+#
+# Anchored, and that is the whole of it: this was a substring test, and
+# "30 statements analysed." contains "0 statements analysed.". So every file
+# whose statement count happened to be a multiple of ten scored a silent
+# perfect 10 -- against pylint's own report, which said otherwise. On
+# angr/mono#3 that made `cle/backends/static_archive.py` read 10.00 -> 9.81 and
+# fail the gate, when its base is 30 statements scoring 9.67 and the change
+# under review took it to 9.81. An improvement, reported as a regression. The
+# same coincidence at HEAD hides a real one.
+NO_STATEMENTS = re.compile(r"^0 statements analysed\.", re.MULTILINE)
 
 
 def git(*args: str) -> str:
@@ -70,21 +84,65 @@ def require_pylint() -> None:
         raise SystemExit("pylint does not run; the score ratchet cannot mean anything")
 
 
-def score(target: Path, cwd: Path) -> float | None:
-    """pylint score for one file, or None if it is not there."""
-    if not target.exists():
+@functools.lru_cache(maxsize=None)
+def imported_components(tree: Path) -> frozenset[str]:
+    """The top-level directories that are somebody else's repository.
+
+    From the manifest rather than a list here, because `ci/import.py` is what
+    decides -- and because the fixtures are deliberately filed under their own
+    key, while being just as much a repository of their own.
+    """
+    manifest = json.loads((tree / "mono.json").read_text(encoding="utf-8"))
+    return frozenset(
+        name for key in ("components", "fixtures") for name in manifest.get(key, {})
+    )
+
+
+def scored_from(tree: Path, path: str) -> tuple[Path, str]:
+    """Where to run pylint for one file, and the path to hand it.
+
+    At the component's own root, which is where its own repository runs it and
+    is not a cosmetic detail: pylint asks isort whether an import is first- or
+    third-party, and isort answers by looking beside the working directory. Run
+    from here, `archinfo/` is a sibling of `cle/`, so `import archinfo` in a cle
+    test reads as first-party -- and `import pytest` after it becomes
+    `C0411 wrong-import-order`, against a standard cle's own repository does not
+    apply and cannot be made to. Four cle test files scoring a clean 10.00 in
+    their own tree lost angr/mono#3's ratchet on that alone.
+
+    mono's own files -- `ci/`, and anything at the top level -- have no
+    component to be scored in and stay at the root.
+    """
+    component, _, rest = path.partition("/")
+    if rest and component in imported_components(tree):
+        return tree / component, rest
+    return tree, path
+
+
+def parse_score(stdout: str) -> float | None:
+    """The score in a pylint report, or None if it printed none."""
+    if NO_STATEMENTS.search(stdout):
+        return 10.0
+    match = SCORE.search(stdout)
+    if match is None:
         return None
+    return float(match.group(1))
+
+
+def score(tree: Path, path: str) -> float | None:
+    """pylint score for one file in one tree, or None if it is not there."""
+    if not (tree / path).exists():
+        return None
+    cwd, relative = scored_from(tree, path)
     result = subprocess.run(
-        [sys.executable, "-m", "pylint", "--rcfile", str(PYLINTRC), str(target)],
+        [sys.executable, "-m", "pylint", "--rcfile", str(PYLINTRC), relative],
         capture_output=True,
         text=True,
         check=False,
         cwd=str(cwd),
     )
-    if NO_STATEMENTS in result.stdout:
-        return 10.0
-    match = SCORE.search(result.stdout)
-    if match is None:
+    parsed = parse_score(result.stdout)
+    if parsed is None:
         # A file pylint could not parse. Upstream scores that 0, and the
         # number matters: the scale is unbounded below (a short file with a
         # few unresolvable imports scores -32), so a sentinel in the middle
@@ -96,7 +154,7 @@ def score(target: Path, cwd: Path) -> float | None:
         print(result.stdout[-2000:])
         print(result.stderr[-2000:], file=sys.stderr)
         return 0.0
-    return float(match.group(1))
+    return parsed
 
 
 def merge_base(base: str) -> str:
@@ -128,10 +186,10 @@ def skipped_component(changed: list[str], path: str) -> bool:
 def compare(changed: list[str]) -> list[tuple[str, float, float]]:
     regressions = []
     for path in changed:
-        after = score(ROOT / path, ROOT)
+        after = score(ROOT, path)
         if after is None:
             continue  # deleted
-        before = score(BASE_TREE / path, BASE_TREE)
+        before = score(BASE_TREE, path)
         if before is None:
             # A new file has nothing to regress against, so it must be clean.
             print(f"{path}: new file, {after:.2f}/10", flush=True)
