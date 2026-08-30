@@ -58,8 +58,17 @@ def require_pyright() -> None:
         raise SystemExit("pyright does not run; the badness ratchet cannot mean anything")
 
 
-def badness(paths: list[Path]) -> dict[str, float]:
-    """pyright badness per file: (errors * 10 + warnings) / lines."""
+def badness(paths: list[Path], tree: Path) -> dict[str, float]:
+    """pyright badness per file: (errors * 10 + warnings) / lines.
+
+    Run from `tree`, the same way ci/lint.py runs pylint from the tree it is
+    scoring. pyright reads its default `exclude` -- `**/node_modules`,
+    `**/__pycache__` and `**/.*` -- relative to the working directory, so from
+    the repository root the baseline worktree `.typecheck-base` matched
+    `**/.*` and pyright read none of it: `filesAnalyzed` came back 0, every
+    baseline scored 0.0000, and against zero any file carrying a diagnostic is
+    a regression. From inside that tree the same files are just files.
+    """
     if not paths:
         return {}
     result = subprocess.run(
@@ -67,6 +76,7 @@ def badness(paths: list[Path]) -> dict[str, float]:
         capture_output=True,
         text=True,
         check=False,
+        cwd=str(tree),
     )
     try:
         report = json.loads(result.stdout)
@@ -93,6 +103,16 @@ def badness(paths: list[Path]) -> dict[str, float]:
         raise SystemExit(
             f"pyright reported {unattributed} diagnostics against paths this "
             "script did not ask about; the comparison would be meaningless."
+        )
+
+    # The other half of the same silence: a file pyright declined to read
+    # produces no diagnostics and scores a clean 0.0000, which is what an
+    # excluded baseline tree looked like for as long as it was hidden.
+    analysed = int(report.get("summary", {}).get("filesAnalyzed", 0))
+    if analysed < len(paths):
+        raise SystemExit(
+            f"pyright analysed {analysed} of the {len(paths)} files it was "
+            "given; the comparison would be meaningless."
         )
 
     out = {}
@@ -127,14 +147,14 @@ def main() -> int:
         print("no Python files changed.")
         return 0
 
-    head = badness([ROOT / p for p in changed])
+    head = badness([ROOT / p for p in changed], ROOT)
 
     # Same reason as ci/lint.py: pyright needs the tree, not loose files.
     subprocess.run(["rm", "-rf", str(BASE_TREE)], check=True)
     git("worktree", "add", "--detach", "--quiet", str(BASE_TREE), base)
     try:
         base_paths = [BASE_TREE / p for p in changed if (BASE_TREE / p).exists()]
-        before = badness(base_paths)
+        before = badness(base_paths, BASE_TREE)
     finally:
         git("worktree", "remove", "--force", str(BASE_TREE))
 
