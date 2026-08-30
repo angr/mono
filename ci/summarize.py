@@ -20,7 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def counts(path: Path) -> tuple[int, int, int, int, float]:
+def counts(path: Path) -> tuple[int, int, int, int, int, float]:
     root = ET.parse(path).getroot()
     suites = [root] if root.tag == "testsuite" else list(root)
 
@@ -33,8 +33,22 @@ def counts(path: Path) -> tuple[int, int, int, int, float]:
         total("errors"),
         total("skipped"),
     )
+    # pytest writes an xfail as `<skipped type="pytest.xfail">`, so the suite's
+    # own `skipped` attribute counts it. It is reported separately here and
+    # taken back out of the skips; see ratchet() for why.
+    #
+    # `@pytest.mark.xfail(run=False)` is the exception: that shape never runs
+    # the test body, which is the thing the skip ratchet is for. pytest
+    # prefixes its junit message with `[NOTRUN]`, so it stays in the skips.
+    xfailed = sum(
+        1
+        for suite in suites
+        for skip in suite.iter("skipped")
+        if skip.get("type") == "pytest.xfail"
+        and not (skip.get("message") or "").startswith("[NOTRUN]")
+    )
     time = sum(float(s.get("time", 0)) for s in suites)
-    return tests, failures, errors, skipped, time
+    return tests, failures, errors, skipped - xfailed, xfailed, time
 
 
 # Results are tagged `<suite>-<lane>` so two platforms do not collide. The
@@ -78,6 +92,22 @@ def ratchet(per_suite: dict, path: Path, update: bool) -> int:
     So the counts are written down. Raising a budget is a deliberate edit with
     a diff, which is the whole point -- the same shape as the pylint and
     pyright ratchets, and for the same reason.
+
+    An xfail that runs is not one of these. `@pytest.mark.xfail` and
+    `@unittest.expectedFailure` execute the test body, it fails, and a
+    decorator in the tree says it was expected to -- nothing about that is
+    silent, and the diff that added it was reviewed in the component's own
+    repository. Counting it here made every component xfail a red mono until
+    somebody raised a number, which is all of the friction and none of the
+    signal. `counts()` therefore keeps those out of the skip figure this reads.
+
+    Two xfail shapes do not run the body, and they are not the same. pytest
+    labels `@pytest.mark.xfail(run=False)` with `[NOTRUN]` in the junit
+    message, so `counts()` leaves it in the skips where it belongs. Imperative
+    `pytest.xfail()` carries no such label -- pytest records it exactly as a
+    real expected failure, same type and an ordinary message -- so a test
+    switched off that way spends no skip budget and this ratchet will not see
+    it. That gap is open.
     """
     observed = {
         suite[: -len(NIX_LANE)]: int(row[3])
@@ -151,12 +181,12 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    per_suite: dict[str, list[int | float]] = defaultdict(lambda: [0, 0, 0, 0, 0.0, 0.0])
+    per_suite: dict[str, list[int | float]] = defaultdict(lambda: [0, 0, 0, 0, 0, 0.0, 0.0])
     for xml in sorted(args.results.rglob("*.xml")):
         # <suite>-<shard>.xml
         suite = xml.stem.rsplit("-", 1)[0]
         try:
-            tests, failures, errors, skipped, time = counts(xml)
+            tests, failures, errors, skipped, xfailed, time = counts(xml)
         except ET.ParseError as exc:
             # Say which file. Two lanes that write the same junit name land on
             # top of each other when the summary job downloads with
@@ -169,10 +199,11 @@ def main() -> int:
         row[1] += failures
         row[2] += errors
         row[3] += skipped
-        row[4] += time
+        row[4] += xfailed
+        row[5] += time
         # The shards run at the same time, so the suite's contribution to wall
         # time is its slowest shard, not the sum.
-        row[5] = max(row[5], time)
+        row[6] = max(row[6], time)
 
     if not per_suite:
         print("No test results found.")
@@ -182,22 +213,28 @@ def main() -> int:
 
     excluded = deselected()
 
-    print("| suite | tests | passed | failed | errors | skipped | deselected | slowest shard |")
-    print("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
-    totals = [0, 0, 0, 0, 0.0]
-    for suite, (tests, failures, errors, skipped, time, slowest) in sorted(per_suite.items()):
-        passed = tests - failures - errors - skipped
+    print(
+        "| suite | tests | passed | failed | errors | skipped | xfailed "
+        "| deselected | slowest shard |"
+    )
+    print("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    totals = [0, 0, 0, 0, 0, 0.0]
+    for suite, (tests, failures, errors, skipped, xfailed, time, slowest) in sorted(
+        per_suite.items()
+    ):
+        passed = tests - failures - errors - skipped - xfailed
         print(
-            f"| {suite} | {tests} | {passed} | {failures} | {errors} | {skipped} "
+            f"| {suite} | {tests} | {passed} | {failures} | {errors} | {skipped} | {xfailed} "
             f"| {excluded.get(base_suite(suite), 0)} | {slowest / 60:.1f} min |"
         )
-        for i, value in enumerate((tests, failures, errors, skipped)):
+        for i, value in enumerate((tests, failures, errors, skipped, xfailed)):
             totals[i] += value
-        totals[4] = max(totals[4], slowest)
-    tests, failures, errors, skipped = (int(v) for v in totals[:4])
+        totals[5] = max(totals[5], slowest)
+    tests, failures, errors, skipped, xfailed = (int(v) for v in totals[:5])
     print(
-        f"| **total** | {tests} | {tests - failures - errors - skipped} | {failures} "
-        f"| {errors} | {skipped} | {sum(excluded.values())} | {totals[4] / 60:.1f} min |"
+        f"| **total** | {tests} | {tests - failures - errors - skipped - xfailed} | {failures} "
+        f"| {errors} | {skipped} | {xfailed} | {sum(excluded.values())} "
+        f"| {totals[5] / 60:.1f} min |"
     )
 
     # Every lane, not just the budgeted one. The skip ratchet below is
@@ -209,8 +246,8 @@ def main() -> int:
     # file here is a real run.
     empty = [
         suite
-        for suite, (tests, failures, errors, skipped, _time, _slow) in per_suite.items()
-        if tests > 0 and tests - failures - errors - skipped == 0
+        for suite, (tests, failures, errors, skipped, xfailed, _time, _slow) in per_suite.items()
+        if tests > 0 and tests - failures - errors - skipped - xfailed == 0
     ]
     if empty:
         print("\nthese suites ran and skipped everything:", file=sys.stderr)

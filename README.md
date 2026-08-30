@@ -206,6 +206,21 @@ suite skips more than that. Raising a budget is an edit with a diff on it,
 which is the point. It is the same shape as the pylint and pyright ratchets,
 and it is there for the same reason.
 
+An xfail that runs does not count. pytest writes one into the junit XML as a
+skip, but it is not one: the test ran, it failed, and a decorator in the tree
+says that was expected. Nothing about it is silent, and the diff that added it
+was reviewed in the component's own repository. Counting them meant a
+component adding one xfail reddened mono until somebody raised a number here
+-- all of the friction and none of the signal -- so the summary reports xfails
+in their own column and leaves them out of the skip figure the ratchet reads.
+
+`@pytest.mark.xfail(run=False)` never runs the test body, so it stays counted
+as a skip: pytest labels it `[NOTRUN]` in the junit message and the summary
+looks for that. Imperative `pytest.xfail()` is not covered. pytest records it
+exactly as it records a real expected failure -- same type, an ordinary
+message -- so nothing here can tell the two apart, and a test switched off
+that way spends no skip budget.
+
 ```shell
 ci/summarize.py test-results --baseline ci/skips.json
 ci/summarize.py test-results --baseline ci/skips.json --update-baseline
