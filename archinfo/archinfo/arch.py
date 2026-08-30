@@ -203,11 +203,11 @@ class Arch:
                 self.ret_instruction = reverse_ends(self.ret_instruction)
                 self.nop_instruction = reverse_ends(self.nop_instruction)
 
-        if self.register_list and _pyvex is not None:
-            (_, _), max_offset = max(_pyvex.vex_ffi.guest_offsets.items(), key=lambda x: x[1])
-            max_offset += self.bits
+        if self.register_list and (_pyvex is not None or not self.vex_support):
             # Register collections
-            if isinstance(self.vex_arch, str):
+            if _pyvex is not None and isinstance(self.vex_arch, str):
+                (_, _), max_offset = max(_pyvex.vex_ffi.guest_offsets.items(), key=lambda x: x[1])
+                max_offset += self.bits
                 va = self.vex_arch[7:].lower()  # pylint: disable=unsubscriptable-object
                 for r in self.register_list:
                     if r.vex_offset is None:
@@ -387,6 +387,10 @@ class Arch:
         """
         Produce a format string for use in python's ``struct`` module to decode a single word.
 
+        ``struct`` has integer format characters for 1, 2, 4 and 8 bytes only. Any other size, the
+        3-byte word of a 24-bit architecture included, raises ``ValueError`` and has to be assembled
+        from bytes by the caller.
+
         :param int size:    The size in bytes to pack/unpack. Defaults to wordsize
         :param bool signed: Whether the data should be extracted signed/unsigned. Default unsigned
         :param str endness: The endian to use in packing/unpacking. Defaults to memory endness
@@ -412,12 +416,10 @@ class Arch:
             fmt_size = "I"
         elif size == 2:
             fmt_size = "H"
-        elif size == 3:
-            fmt_size = "Z"  # special case for 24-bit architectures like AVR8
         elif size == 1:
             fmt_size = "B"
         else:
-            raise ValueError("Invalid size: Must be a integer power of 2 less than 16")
+            raise ValueError(f"Invalid size: struct has no format character for a {size}-byte integer")
 
         if signed:
             fmt_size = fmt_size.lower()
@@ -838,7 +840,7 @@ def register_arch(regexes: List[str], bits: int, endness: Endness, my_arch: Type
     if not isinstance(regexes, list):
         raise TypeError("regexes must be a list")
     for rx in regexes:
-        if not isinstance(rx, str) and not isinstance(rx, re._pattern_type):
+        if not isinstance(rx, (str, re.Pattern)):
             raise TypeError("Each regex must be a string or compiled regular expression")
         try:
             re.compile(rx)
@@ -863,7 +865,7 @@ class ArchNotFound(Exception):
     pass
 
 
-def arch_from_id(ident: str, endness=Endness.ANY, bits: str | int = "") -> Arch:
+def arch_from_id(ident: str, endness: str = Endness.ANY, bits: str | int = "") -> Arch:
     """
     Take our best guess at the arch referred to by the given identifier, and return an instance of its class.
 

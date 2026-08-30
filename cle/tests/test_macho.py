@@ -10,8 +10,10 @@ import pytest
 
 import cle
 from cle import MachO
-from cle.backends.macho.macho_enums import LoadCommands, SectionAttributes, SectionType
+from cle.backends.backend import FunctionHintSource
+from cle.backends.macho.macho_enums import LoadCommands, MachoFiletype, SectionAttributes, SectionType
 from cle.backends.macho.section import MachOSection
+from cle.backends.macho.symbol import SYMBOL_TYPE_SECT, SymbolTableSymbol
 
 TEST_BASE = os.path.join(os.path.dirname(os.path.realpath(__file__)), os.path.join("..", "..", "binaries"))
 
@@ -274,6 +276,79 @@ def test_instruction_sections():
     assert macho.sections_map["__TEXT,__cstring"].attributes == 0
 
 
+def test_function_starts_hints():
+    machofile = os.path.join(TEST_BASE, "tests", "aarch64", "dyld_ios15.macho")
+    ld = cle.Loader(machofile, auto_load_libs=False)
+    macho = ld.main_object
+    assert isinstance(macho, cle.MachO)
+
+    hints = [h for h in macho.function_hints if h.source == FunctionHintSource.FUNCTION_STARTS]
+    assert [h.addr for h in hints] == macho.lc_function_starts
+    assert len(hints) == 36
+
+    text = macho.sections_map["__TEXT,__text"]
+    assert all(text.vaddr <= h.addr < text.vaddr + text.memsize for h in hints)
+
+
+def test_symbol_is_function():
+    machofile = os.path.join(TEST_BASE, "tests", "x86_64", "fauxware.macho")
+    ld = cle.Loader(machofile, auto_load_libs=False)
+    macho = ld.main_object
+    assert isinstance(macho, cle.MachO)
+
+    symbols = {sym.name: sym for sym in macho.symbols if isinstance(sym, SymbolTableSymbol)}
+
+    # The four symbols defined in a section that holds instructions, and nothing else.
+    assert {name for name, sym in symbols.items() if sym.is_function} == {
+        "_authenticate",
+        "_accepted",
+        "_rejected",
+        "_main",
+    }
+
+    # _sneaky is an N_SECT symbol too, but its section holds data.
+    assert symbols["_sneaky"].section is not None
+    assert symbols["_sneaky"].section.full_name == "__DATA,__data"
+    assert not symbols["_sneaky"].is_function
+
+    # __mh_execute_header names the first section of __TEXT and addresses the Mach-O header in front of it.
+    header = symbols["__mh_execute_header"]
+    assert header.sym_type == SYMBOL_TYPE_SECT
+    assert header.section is not None
+    assert header.section.full_name == "__TEXT,__text"
+    assert not header.section.contains_addr(header.rebased_addr)
+    assert not header.is_function
+
+    # An undefined symbol defines nothing here, so it names no code here either.
+    assert symbols["_printf"].is_import
+    assert symbols["_printf"].section is None
+    assert not symbols["_printf"].is_function
+
+
+def test_arm_thumb_definition_carries_the_flag_in_its_address():
+    machofile = os.path.join(TEST_BASE, "tests", "armhf", "FileProtection-05.armv7.macho")
+    ld = cle.Loader(machofile, auto_load_libs=False)
+    macho = ld.main_object
+    assert isinstance(macho, cle.MachO)
+    assert macho.arch.name == "ARMEL"
+
+    symbols = {sym.name: sym for sym in macho.symbols if isinstance(sym, SymbolTableSymbol)}
+
+    # n_value is 0x83a8 and n_desc says Thumb. ELF would have stated both in st_value.
+    main = symbols["_main"]
+    assert main.is_function
+    assert main.is_thumb_definition
+    assert main.rebased_addr == 0x83A9
+
+    # The one ARM-mode definition in this image keeps the address the file gives it.
+    helpers = symbols[" stub helpers"]
+    assert helpers.is_function
+    assert not helpers.is_thumb_definition
+    assert helpers.rebased_addr == 0xA2F0
+
+    assert sum(1 for sym in symbols.values() if sym.is_function) == 74
+
+
 def test_find_symbol():
     machofile = os.path.join(TEST_BASE, "tests", "x86_64", "fauxware.macho")
     ld = cle.Loader(machofile, auto_load_libs=False)
@@ -424,5 +499,30 @@ if __name__ == "__main__":
     test_find_symbol()
     test_zerofill_sections()
     test_instruction_sections()
+    test_function_starts_hints()
     test_zero_vmsize_segment()
     test_filesize_larger_than_vmsize()
+
+
+def test_relocatable_object():
+    """
+    A relocatable object is linked against 0 and holds every section in one unnamed segment, so its
+    base-address situation is the same as a dylib loaded as the main object. It used to be refused
+    outright as an unsupported file type.
+    """
+    for arch, name in (("aarch64", "AARCH64"), ("x86_64", "AMD64")):
+        machofile = os.path.join(TEST_BASE, "tests", arch, "relocatable_object.macho")
+        ld = cle.Loader(machofile, auto_load_libs=False)
+        obj = ld.main_object
+        assert isinstance(obj, MachO)
+        assert obj.filetype == MachoFiletype.MH_OBJECT
+        assert obj.arch.name == name
+        assert obj.mapped_base == 0
+
+        text = next(sec for sec in obj.sections if sec.name == "__text")
+        assert text.is_executable
+        assert text.memsize > 0
+
+        # The defined symbols carry real section-relative addresses; undefined externals stay at 0.
+        defined = {sym.name for sym in obj.symbols if sym.rebased_addr}
+        assert defined, "no defined symbol carries an address"
