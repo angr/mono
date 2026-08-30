@@ -29,7 +29,7 @@ use crate::ailment::ail_stmt::{AilStatement, Statement};
 use crate::ailment::const_value::ConstValue;
 use crate::ailment::enums::{ConvertType, ExpressionKind, RoundingMode, VirtualVariableCategory};
 use crate::ailment::tags::{Tags, TagsView};
-use crate::ailment::{CachedHash, CmpMode, hash_of};
+use crate::ailment::{Addr, CachedHash, CmpMode, hash_of};
 use indexmap::IndexMap;
 use serde::de::{self, EnumAccess, SeqAccess, VariantAccess, Visitor};
 use serde::ser::{SerializeStruct, SerializeTupleVariant};
@@ -166,7 +166,10 @@ impl<'py> IntoPyObject<'py> for &RoundingModeOrExpr {
 /// Layout note: operand subtrees are owned via ``Arc<AilExpression>``
 /// (one heap allocation per subtree). Variable information used to live
 /// on each variant (``variable`` / ``variable_offset``); it now lives in
-/// a side ``VariableMap`` keyed on ``ExprHeader::idx``.
+/// a side ``VariableMap``. Non-``VirtualVariable`` metadata and variable
+/// bindings are keyed by ``.idx``. ``VirtualVariable`` variable/offset
+/// state uses stable ``.varid`` defaults plus occurrence entries keyed by
+/// ``(.varid, .idx)``.
 #[derive(Clone, Debug)]
 pub enum ExprInner {
     Const {
@@ -726,7 +729,8 @@ impl OIdent {
 /// is enforced by ``extract_phi_entries`` at construction time.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PhiEntry {
-    pub src_addr: i64,
+    #[serde(with = "crate::ailment::addr_repr")]
+    pub src_addr: Addr,
     pub src_idx: Option<i64>,
     pub vvar: Option<Arc<AilExpression>>,
 }
@@ -1667,14 +1671,19 @@ impl AilExpression {
     /// fields are cloned via Python ``copy.deepcopy``.
     pub fn deep_copy_ail(&self, manager: &Bound<'_, PyAny>) -> PyResult<AilExpression> {
         let new_idx: i64 = manager.call_method0("next_atom")?.extract()?;
-        // Mirror master's TaggedObject._transfer_varmap: when the
-        // manager carries a VariableMap, copy any side-container entries
-        // (variable, variable_offset, variant, returnty, ...) from the
-        // old idx to the new one so deep-copied atoms keep their
-        // associations.
+        // Mirror master's TaggedObject._transfer_varmap: when the manager carries a VariableMap, copy side-container
+        // entries from the old idx to the new one. VirtualVariables pass their stable varid as an explicit namespace
+        // discriminator because a transformed non-VVar atom may carry the same idx.
         let vmap = manager.getattr("variable_map")?;
         if !vmap.is_none() {
-            vmap.call_method1("transfer", (self.header.idx, new_idx))?;
+            match &self.inner {
+                ExprInner::VirtualVariable { varid, .. } => {
+                    vmap.call_method1("transfer", (self.header.idx, new_idx, *varid))?;
+                }
+                _ => {
+                    vmap.call_method1("transfer", (self.header.idx, new_idx))?;
+                }
+            }
         }
         let new_header = ExprHeader::new(
             new_idx,
@@ -4980,10 +4989,13 @@ fn extract_phi_entries(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<P
                 ),
             ));
         }
-        let src_addr: i64 = src_tuple.get_item(0)?.extract().map_err(|_| {
+        let src_addr: Addr = src_tuple.get_item(0)?.extract().map_err(|_| {
             phi_validation_error(
                 py,
-                &format!("Phi.src_and_vvars[{}] src_addr must be int", idx),
+                &format!(
+                    "Phi.src_and_vvars[{}] src_addr must be an address (an int in [0, 2**64))",
+                    idx
+                ),
             )
         })?;
         let src_idx_obj = src_tuple.get_item(1)?;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# pylint:disable=missing-class-docstring
+# pylint:disable=missing-class-docstring,protected-access
 """Test cases for SpillingCFGGraph and SpillingCFGNodeDict functionality."""
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import pickle
 import unittest
 
 import angr
+from angr.knowledge_plugins.cfg.cfg_model import CFGModel
 from angr.knowledge_plugins.cfg.cfg_node import CFGNode
 from tests.common import bin_location
 
@@ -178,6 +179,45 @@ class TestSpillingCFGGraph(unittest.TestCase):
                 break
 
 
+class TestSpillingCFGAddressIndex(unittest.TestCase):
+    """Test cases for the address index that SpillingCFG keeps alongside its nodes."""
+
+    SRC_ADDR = 0x10
+    DST_ADDR = 0x20
+    SUCCESSOR_ADDR = 0x14
+
+    def _model_with_nodes(self) -> tuple[CFGModel, CFGNode, CFGNode]:
+        model = CFGModel("CFGFast")
+        src = CFGNode(self.SRC_ADDR, 4, model, block_id=self.SRC_ADDR)
+        dst = CFGNode(self.DST_ADDR, 4, model, block_id=self.DST_ADDR)
+        model.graph.add_node(src)
+        model.graph.add_node(dst)
+        return model, src, dst
+
+    def test_add_edge_indexes_a_removed_node_by_address(self):
+        """An edge that reintroduces a removed node must put it back into the address index."""
+        model, src, dst = self._model_with_nodes()
+
+        model.graph.remove_node(src)
+        assert not model.has_node_addr(self.SRC_ADDR)
+
+        model.graph.add_edge(src, dst, jumpkind="Ijk_Boring")
+
+        assert model.has_node_addr(self.SRC_ADDR)
+        assert list(model.nodes_by_addr(self.SRC_ADDR)) == [src]
+        assert model.get_any_node(self.SRC_ADDR) is src
+
+    def test_add_edge_indexes_a_never_added_node_by_address(self):
+        """An edge is the only insertion path for the successor node that CFGFast._shrink_node() creates."""
+        model, src, _ = self._model_with_nodes()
+        successor = CFGNode(self.SUCCESSOR_ADDR, 4, model, block_id=self.SUCCESSOR_ADDR)
+
+        model.graph.add_edge(src, successor, jumpkind="Ijk_Boring")
+
+        assert model.has_node_addr(self.SUCCESSOR_ADDR)
+        assert model.get_any_node(self.SUCCESSOR_ADDR) is successor
+
+
 class TestSpillingCFGGraphWithSpilling(unittest.TestCase):
     """Test cases for SpillingCFGGraph with spilling enabled."""
 
@@ -264,6 +304,44 @@ class TestSpillingCFGGraphWithSpilling(unittest.TestCase):
         for node in copied.graph.nodes():
             assert node is not None
             break
+
+    def test_copy_holds_one_transaction_at_a_time(self):
+        """
+        Copying a spilled store writes it back out into a new sub-database, and that write may have to grow the
+        LMDB map. Growing the map remaps the whole environment, so the copy has to close its read transaction
+        before writing anything.
+        """
+        proj = angr.Project(self.bin_path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast()
+        original = cfg.model
+
+        # spill as much as the eviction thresholds allow
+        for spilling_dict in (original.graph._nodes, original.graph._graph._adj, original.graph._graph._pred):
+            spilling_dict._cache_limit = 0
+            spilling_dict._db_batch_size = 1
+            spilling_dict._evict_lru()
+        assert original.graph._nodes.spilled_count > 0
+        assert original.graph._graph._adj._spilled_keys
+
+        rtdb = proj.kb.rtdb
+        original_transaction_opened = rtdb._transaction_opened
+        open_counts = []
+
+        def transaction_opened():
+            original_transaction_opened()
+            open_counts.append(rtdb._open_txns)
+
+        rtdb._transaction_opened = transaction_opened
+        try:
+            copied = original.copy()
+        finally:
+            del rtdb._transaction_opened
+
+        assert open_counts, "copy() read nothing back out of LMDB"
+        assert max(open_counts) == 1, "copy() opened a second transaction before closing the first"
+        assert len(copied.graph) == len(original.graph)
+        # reading the copied nodes back proves the spilled records landed in the new sub-database intact
+        assert {node.addr for node in copied.graph.nodes()} == {node.addr for node in original.graph.nodes()}
 
 
 class TestCFGModelIntegration(unittest.TestCase):

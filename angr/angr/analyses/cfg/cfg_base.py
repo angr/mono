@@ -222,6 +222,9 @@ class CFGBase(Analysis):
         # a dict of mapping between function addresses and sets of jobs (include both future jobs and pending jobs)
         # a set is used to speed up the job removal procedure
         self._jobs_to_analyze_per_function = defaultdict(set)
+        # the subset of keys of _jobs_to_analyze_per_function whose job set is empty, maintained by
+        # _register_analysis_job() and _deregister_analysis_job()
+        self._functions_without_jobs = set()
         # addresses of functions that have been completely recovered (i.e. all of its blocks are identified) so far
         self._completed_functions = set()
 
@@ -231,6 +234,7 @@ class CFGBase(Analysis):
 
         self._function_addresses_from_symbols = self._load_func_addrs_from_symbols()
         self._function_addresses_from_eh_frame = self._load_func_addrs_from_eh_frame()
+        self._function_addresses_from_exception_directory = self._load_func_addrs_from_exception_directory()
         self._function_addr_and_names_from_hints = self._load_func_addr_and_names_from_hints()
 
         # Cache if an object has executable sections or not
@@ -353,6 +357,7 @@ class CFGBase(Analysis):
         """
 
         self._jobs_to_analyze_per_function = defaultdict(set)
+        self._functions_without_jobs = set()
         self._completed_functions = set()
 
     def _function_completed(self, func_addr: int):
@@ -868,9 +873,20 @@ class CFGBase(Analysis):
                         memory_regions.append((region_addr, region_addr + region_size))
 
             elif isinstance(b, Blob):
-                # a blob is entirely executable
-                tpl = (b.min_addr, b.max_addr + 1)
-                memory_regions.append(tpl)
+                if all(segment.is_executable for segment in b.segments):
+                    # a raw image carries no permissions and every segment answers the permissive default,
+                    # so the blob is entirely executable
+                    tpl = (b.min_addr, b.max_addr + 1)
+                    memory_regions.append(tpl)
+                else:
+                    # the blob was cut out of something that recorded its permissions, such as a core dump
+                    for segment in b.segments:
+                        if not segment.is_executable:
+                            continue
+                        # a segment can be longer than the bytes the blob actually holds
+                        max_mapped_addr = min(segment.min_addr + min(segment.memsize, segment.filesize), b.max_addr + 1)
+                        if max_mapped_addr > segment.min_addr:
+                            memory_regions.append((segment.min_addr, max_mapped_addr))
 
             elif isinstance(b, NamedRegion):
                 # NamedRegions have no content! Ignore
@@ -1082,12 +1098,27 @@ class CFGBase(Analysis):
         :rtype:     set
         """
 
-        addrs = set()
-        if (isinstance(self._binary, ELF) and self._binary.has_dwarf_info) or isinstance(self._binary, PE):
-            for function_hint in self._binary.function_hints:
-                if function_hint.source == FunctionHintSource.EH_FRAME:
-                    addrs.add(function_hint.addr)
-        return addrs
+        if isinstance(self._binary, PE) and not hasattr(FunctionHintSource, "EXCEPTION_DIRECTORY"):
+            return set()
+
+        return {
+            function_hint.addr
+            for function_hint in self._binary.function_hints
+            if function_hint.source == FunctionHintSource.EH_FRAME
+        }
+
+    def _load_func_addrs_from_exception_directory(self):
+        exception_directory_source = getattr(FunctionHintSource, "EXCEPTION_DIRECTORY", None)
+        if exception_directory_source is None:
+            if not isinstance(self._binary, PE):
+                return set()
+            exception_directory_source = FunctionHintSource.EH_FRAME
+
+        return {
+            function_hint.addr
+            for function_hint in self._binary.function_hints
+            if function_hint.source == exception_directory_source
+        }
 
     def _load_func_addr_and_names_from_hints(self) -> set[tuple[int, str | None]]:
         """
@@ -1097,8 +1128,9 @@ class CFGBase(Analysis):
         """
 
         addrs_and_names = set()
+        exception_directory_source = getattr(FunctionHintSource, "EXCEPTION_DIRECTORY", None)
         for function_hint in self._binary.function_hints:
-            if function_hint.source != FunctionHintSource.EH_FRAME:
+            if function_hint.source not in {FunctionHintSource.EH_FRAME, exception_directory_source}:
                 addrs_and_names.add((function_hint.addr, function_hint.name))
         return addrs_and_names
 
@@ -1578,6 +1610,7 @@ class CFGBase(Analysis):
         """
 
         self._jobs_to_analyze_per_function[func_addr].add(job)
+        self._functions_without_jobs.discard(func_addr)
 
     def _deregister_analysis_job(self, func_addr, job):
         """
@@ -1588,25 +1621,23 @@ class CFGBase(Analysis):
         :return:              None
         """
 
-        self._jobs_to_analyze_per_function[func_addr].discard(job)
+        jobs = self._jobs_to_analyze_per_function[func_addr]
+        jobs.discard(job)
+        if not jobs:
+            self._functions_without_jobs.add(func_addr)
 
     def _get_finished_functions(self):
         """
         Obtain all functions of which we have finished analyzing. As _jobs_to_analyze_per_function is a defaultdict(),
         if a function address shows up in it with an empty job list, we consider we have exhausted all jobs of this
         function (both current jobs and pending jobs), thus the analysis of this function is done.
+        _functions_without_jobs holds exactly those addresses.
 
         :return: a list of function addresses of that we have finished analysis.
         :rtype:  list
         """
 
-        finished_func_addrs = []
-        for func_addr, all_jobs in self._jobs_to_analyze_per_function.items():
-            if not all_jobs:
-                # great! we have finished analyzing this function!
-                finished_func_addrs.append(func_addr)
-
-        return finished_func_addrs
+        return list(self._functions_without_jobs)
 
     def _cleanup_analysis_jobs(self, finished_func_addrs=None):
         """
@@ -1624,6 +1655,9 @@ class CFGBase(Analysis):
         for func_addr in finished_func_addrs:
             if func_addr in self._jobs_to_analyze_per_function:
                 del self._jobs_to_analyze_per_function[func_addr]
+        # rebuilt, not discarded in place, so that the set does not keep a hash table sized to its
+        # high-water mark for the rest of the analysis
+        self._functions_without_jobs = self._functions_without_jobs.difference(finished_func_addrs)
 
     def _make_completed_functions(self):
         """
@@ -1685,7 +1719,7 @@ class CFGBase(Analysis):
                     self.kb.functions[func_addr].is_alignment = True
                     continue
 
-    def make_functions(self):
+    def make_functions(self, additional_function_addrs: set[int] | None = None):
         """
         Revisit the entire control flow graph, create Function instances accordingly, and correctly put blocks into
         each function.
@@ -1699,6 +1733,7 @@ class CFGBase(Analysis):
             - Tail call optimizations are detected.
             - PLT stubs are aligned by 16.
 
+        :param additional_function_addrs: Function starts supplied by an analysis-specific authoritative source.
         :return: None
         """
 
@@ -1754,7 +1789,10 @@ class CFGBase(Analysis):
         # Any function addresses that appear as symbols won't be removed
         predetermined_function_addrs = called_function_addrs
         node_addrs_set = set(self.model.node_addrs)
-        for saddr in self._function_addresses_from_symbols:
+        authoritative_function_addrs = self._function_addresses_from_symbols.copy()
+        if additional_function_addrs:
+            authoritative_function_addrs |= additional_function_addrs
+        for saddr in authoritative_function_addrs:
             if saddr in predetermined_function_addrs:
                 continue
             if saddr in node_addrs_set:
@@ -3142,7 +3180,15 @@ class CFGBase(Analysis):
         all_targets = set()
         idx: int
         jump: IndirectJump
-        for idx, jump in enumerate(self._indirect_jumps_to_resolve):
+        # IndirectJump has no __hash__, so the set iterates its members in the order their objects happen to sit
+        # in memory. Resolving one jump occupies bytes and builds blocks that the next resolver reads, so that
+        # order decides the answer. self.indirect_jumps records every jump in the order the scan reached it;
+        # follow that, and fall back to the address for anything not registered there.
+        discovered = {id(ij): order for order, ij in enumerate(self.indirect_jumps.values())}
+        pending = sorted(
+            self._indirect_jumps_to_resolve, key=lambda ij: (discovered.get(id(ij), len(discovered)), ij.addr)
+        )
+        for idx, jump in enumerate(pending):
             if self._low_priority:
                 self._release_gil(idx, 50, 0.000001)
             all_targets |= self._process_one_indirect_jump(jump)

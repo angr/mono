@@ -12,11 +12,25 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard
 
 import capstone
 import networkx
+from archinfo.arch_arm import is_arm_arch
 
 from angr import ailment
 from angr.ailment import AILBlockRewriter, Assignment, Block, Statement
 from angr.ailment.block_walker import AILBlockViewer
-from angr.ailment.expression import Array, Call, FunctionLikeMacro, Let, RustEnum, Struct, VirtualVariable
+from angr.ailment.expression import (
+    Array,
+    Call,
+    Expression,
+    FunctionLikeMacro,
+    Let,
+    RustEnum,
+    Struct,
+    Tmp,
+    VirtualVariable,
+)
+from angr.ailment.expression import (
+    Register as AILRegister,
+)
 from angr.analyses.analysis import Analysis, register_analysis
 from angr.analyses.cfg.cfg_base import CFGBase
 from angr.analyses.decompiler.block_simplifier import BlockSimplifier, PeepholeOptimizationBundle
@@ -25,9 +39,10 @@ from angr.analyses.decompiler.optimization_pass_registry import name_to_pass, pa
 from angr.analyses.s_liveness import SLivenessAnalysis
 from angr.analyses.s_reaching_definitions import SReachingDefinitions
 from angr.analyses.s_reaching_definitions.s_rda_model import SRDAModel
-from angr.analyses.stack_pointer_tracker import OffsetVal, Register
+from angr.analyses.stack_pointer_tracker import TOP, OffsetVal, Register
 from angr.analyses.typehoon import Typehoon
 from angr.analyses.typehoon.simple_solver import SimpleSolver
+from angr.block import Block as VEXBlock
 from angr.calling_conventions import (
     SimCCUsercall,
     SimComboArg,
@@ -36,10 +51,11 @@ from angr.calling_conventions import (
     SimRegArg,
     SimStackArg,
     SimStructArg,
+    is_stack_probe,
 )
 from angr.code_location import ExternalCodeLocation
 from angr.codenode import BlockNode, FuncNode
-from angr.errors import AngrDecompilationComplexityError, AngrDecompilationError
+from angr.errors import AngrDecompilationComplexityError, AngrDecompilationError, SimTranslationError
 from angr.knowledge_base import KnowledgeBase
 from angr.knowledge_plugins.cfg.memory_data import MemoryDataSort
 from angr.knowledge_plugins.functions import Function
@@ -83,6 +99,7 @@ from angr.utils.ail_serialization import (
     simvar_from_bytes_polymorphic,
     simvar_to_bytes_polymorphic,
 )
+from angr.utils.constants import DEFAULT_STATEMENT
 from angr.utils.graph import GraphUtils
 from angr.utils.ssa import is_phi_assignment
 from angr.utils.types import dereference_simtype_by_lib
@@ -245,6 +262,94 @@ class _VLABufferBinder(AILBlockViewer):
         return super()._handle_VirtualVariable(expr_idx, expr, stmt_idx, stmt, block)
 
 
+class _ITStateDependencyWalker(AILBlockViewer):
+    """Follow local temporary definitions to find an initial-block ITSTATE read."""
+
+    def __init__(self, tmp_definitions: dict[int, Expression], itstate_offset: int, entry_addr: int):
+        super().__init__()
+        self._tmp_definitions = tmp_definitions
+        self._itstate_offset = itstate_offset
+        self._entry_addr = entry_addr
+        self._visiting_tmp_indices: set[int] = set()
+        self.depends_on_itstate = False
+
+    def _handle_Register(
+        self, expr_idx: int, expr: AILRegister, stmt_idx: int, stmt: Statement | None, block: Block | None
+    ) -> None:
+        if expr.reg_offset == self._itstate_offset and expr.tags.get("ins_addr") == self._entry_addr:
+            self.depends_on_itstate = True
+
+    def _handle_Tmp(self, expr_idx: int, expr: Tmp, stmt_idx: int, stmt: Statement | None, block: Block | None) -> None:
+        if self.depends_on_itstate or expr.tmp_idx in self._visiting_tmp_indices:
+            return
+        definition = self._tmp_definitions.get(expr.tmp_idx)
+        if definition is None:
+            return
+
+        self._visiting_tmp_indices.add(expr.tmp_idx)
+        self._handle_expr(0, definition, stmt_idx, stmt, block)
+        self._visiting_tmp_indices.remove(expr.tmp_idx)
+
+
+def _remove_thumb_entry_itstate_guard(
+    block: VEXBlock, statements: list[Statement], itstate_offset: int
+) -> list[Statement]:
+    """Remove LibVEX's synthetic guard around the first instruction of an initial Thumb block, if present."""
+
+    instruction_addrs = block.instruction_addrs
+    if not instruction_addrs or instruction_addrs[0] != block.addr:
+        return statements
+
+    next_instruction_addr = instruction_addrs[1] if len(instruction_addrs) > 1 else block.addr + block.size
+    tmp_definitions = {}
+    new_statements = []
+    for stmt in statements:
+        if (
+            isinstance(stmt, ailment.Stmt.Assignment)
+            and isinstance(stmt.dst, ailment.Expr.Tmp)
+            and stmt.tags.get("ins_addr") == block.addr
+        ):
+            tmp_definitions[stmt.dst.tmp_idx] = stmt.src
+
+        if (
+            isinstance(stmt, ailment.Stmt.ConditionalJump)
+            and stmt.tags.get("ins_addr") == block.addr
+            and isinstance(stmt.true_target, ailment.Expr.Const)
+            and stmt.true_target.value == next_instruction_addr
+        ):
+            dependency_walker = _ITStateDependencyWalker(tmp_definitions, itstate_offset, block.addr)
+            dependency_walker.walk_expression(stmt.condition, stmt=stmt, block=None)
+            if dependency_walker.depends_on_itstate:
+                continue
+
+        new_statements.append(stmt)
+    return new_statements
+
+
+def _is_function_entry_fallthrough_block(graph: networkx.DiGraph, function_addr: int, block_node: BlockNode) -> bool:
+    """Return whether a block is on the unique contiguous fall-through chain from the function entry."""
+
+    current = block_node
+    visited = {current}
+    while current.addr != function_addr:
+        predecessors = list(graph.predecessors(current))
+        if len(predecessors) != 1:
+            return False
+        predecessor = predecessors[0]
+        edge = graph.get_edge_data(predecessor, current)
+        if (
+            type(predecessor) is not BlockNode
+            or predecessor.addr + predecessor.size != current.addr
+            or edge.get("type") != "transition"
+            or edge.get("stmt_idx") != DEFAULT_STATEMENT
+            or predecessor in visited
+        ):
+            return False
+        visited.add(predecessor)
+        current = predecessor
+    return True
+
+
 class Clinic(Analysis, Serializable):
     """
     A Clinic deals with AILments: it lifts a function to AIL and runs the decompiler's simplification pipeline on it.
@@ -328,8 +433,9 @@ class Clinic(Analysis, Serializable):
         # True once _recover_and_link_variables has populated kb.dec_variables for this function this run
         self._variables_recovered = False
         # VariableMap is a side container that holds variable/variable_offset/custom_string/reference_values and the
-        # sibling reference_variable/reference_variable_offset for AIL atoms, keyed by their .idx. It supersedes
-        # storing this information directly on AIL Statement/Expression objects.
+        # sibling reference_variable/reference_variable_offset for AIL atoms. Variable associations use a separate
+        # VirtualVariable namespace; other metadata is keyed by .idx. It supersedes storing this information directly
+        # on AIL Statement/Expression objects.
         self.variable_map: VariableMap = variable_map if variable_map is not None else VariableMap()
         self.externs: set[SimMemoryVariable] = set()
         self.data_refs: dict[int, list[DataRefDesc]] = {}  # data address to data reference description
@@ -1427,8 +1533,11 @@ class Clinic(Analysis, Serializable):
         ) or self.function.prototype_source < PrototypeSource.CCA_DECOMPILER:
             old_proto = self.function.prototype
             old_source = self.function.prototype_source
+            old_proto_libname = self.function.prototype_libname
+            preserve_existing_prototype = old_proto is not None and old_source >= PrototypeSource.CCA_DECOMPILER
 
-            self.function.prototype = None  # clear it
+            if not preserve_existing_prototype:
+                self.function.prototype = None  # clear it
             self.function.ran_cca = False  # also clear the ran_cca bit so CCCA runs again
             self.project.analyses.CompleteCallingConventions(
                 fail_fast=self._fail_fast,  # type: ignore
@@ -1438,7 +1547,11 @@ class Clinic(Analysis, Serializable):
                 func_graphs={self.function.addr: func_graph} if func_graph is not None else None,
             )
 
-            if (
+            if preserve_existing_prototype:
+                self.function.prototype = old_proto
+                self.function.prototype_source = old_source
+                self.function.prototype_libname = old_proto_libname
+            elif (
                 old_source >= PrototypeSource.CCA_LOW
                 and old_proto is not None
                 and self.function.prototype is not None
@@ -1458,7 +1571,7 @@ class Clinic(Analysis, Serializable):
             return self._cross_insn_opt_for_large_blocks and block_size >= self._cross_insn_opt_min_block_size
 
         regs = {self.project.arch.sp_offset}
-        initial_reg_values = {
+        initial_reg_values: dict[int | None, OffsetVal | None] = {
             self.project.arch.sp_offset: OffsetVal(
                 Register(self.project.arch.sp_offset, self.project.arch.bits), self._sp_shift
             )
@@ -1470,7 +1583,14 @@ class Clinic(Analysis, Serializable):
             )
 
         regs |= self._find_regs_compared_against_sp(self._func_graph)
-        regs |= self._find_regs_saving_sp(self._func_graph)
+        if is_arm_arch(self.project.arch):
+            # StackPointerTracker normalizes a copy of an unnormalized function before traversing it. Do not prove
+            # saved-SP provenance against a different graph in that case.
+            saved_sp_regs = self._find_regs_saving_sp(self.function.graph) if self.function.normalized else set()
+            initial_reg_values.update(dict.fromkeys(saved_sp_regs, TOP))
+        else:
+            saved_sp_regs = self._find_regs_saving_sp(self._func_graph)
+        regs |= saved_sp_regs
 
         spt = self.project.analyses.StackPointerTracker(
             self.function,
@@ -1563,6 +1683,30 @@ class Clinic(Analysis, Serializable):
                 self._ail_manager.next_atom(), dflag, forward, ins_addr=block.addr
             )
             converted.statements.insert(0, dflag_assignment)
+        elif (
+            block.thumb is True
+            and "itstate" in self.project.arch.registers
+            and self._func_graph is not None
+            and _is_function_entry_fallthrough_block(self._func_graph, self.function.addr, block_node)
+        ):
+            itstate_offset, itstate_size = self.project.arch.registers["itstate"]
+            # LibVEX may infer stale ITSTATE from bytes before context-free lifts of the function's initial blocks.
+            # Remove only guards that skip their first instruction; genuine IT blocks later in the function remain.
+            converted.statements = _remove_thumb_entry_itstate_guard(block, converted.statements, itstate_offset)
+
+            itstate = ailment.Expr.Register(
+                self._ail_manager.next_atom(),
+                itstate_offset,
+                itstate_size * self.project.arch.byte_width,
+                ins_addr=block.addr,
+            )
+            cleared = ailment.Expr.Const(
+                self._ail_manager.next_atom(), 0, itstate_size * self.project.arch.byte_width, ins_addr=block.addr
+            )
+            itstate_assignment = ailment.Stmt.Assignment(
+                self._ail_manager.next_atom(), itstate, cleared, ins_addr=block.addr
+            )
+            converted.statements.insert(0, itstate_assignment)
 
         return converted
 
@@ -1717,6 +1861,7 @@ class Clinic(Analysis, Serializable):
         """
         Rewrite tail jumps to functions as call statements.
         """
+        function_block_addrs = {block.addr for block in ail_graph}
         for block in list(ail_graph.nodes()):
             if ail_graph.out_degree[block] > 1:
                 continue
@@ -1737,7 +1882,11 @@ class Clinic(Analysis, Serializable):
                 continue
 
             for slot_name, target in slots:
-                if not isinstance(target, ailment.Const) or not self.kb.functions.contains_addr(target.value):
+                if (
+                    not isinstance(target, ailment.Const)
+                    or target.value in function_block_addrs
+                    or not self.kb.functions.contains_addr(target.value)
+                ):
                     continue
 
                 target_func = self.kb.functions.get_by_addr(target.value)
@@ -1805,6 +1954,15 @@ class Clinic(Analysis, Serializable):
             if not self.kb.functions.contains_addr(target):
                 continue
             target_func = self.kb.functions.get_by_addr(target)
+            if is_stack_probe(target_func) and last_stmt.fp_ret_expr is not None:
+                block.statements[-1] = ailment.Stmt.SideEffectStatement(
+                    last_stmt.idx,
+                    last_stmt.expr,
+                    ret_expr=last_stmt.ret_expr,
+                    fp_ret_expr=None,
+                    **last_stmt.tags,
+                )
+                continue
             if target_func.name == "_security_check_cookie" and self.project.arch.name in {"X86", "AMD64"}:
                 arg = SimRegArg("ecx", 32) if self.project.arch.bits == 32 else SimRegArg("rcx", 64)
                 arg_offset, arg_bits = self.project.arch.registers[arg.reg_name]
@@ -2703,8 +2861,8 @@ class Clinic(Analysis, Serializable):
 
         # combo-register argument vvars only appear inside Reference expressions (created by
         # _rewrite_combo_reg_param_references), which variable recovery does not track, so no accesses were recorded
-        # for them; link them to their argument variables directly. the variable map is keyed by expression idx and
-        # every occurrence in the graph is the same expression object, so one call covers all of them.
+        # for them; link them to their argument variables directly. Every occurrence in the graph is the same
+        # expression object, so one occurrence association (and its stable varid default) covers all of them.
         if arg_vvars is not None:
             for vvar, var in arg_vvars.values():
                 if vvar.parameter_category == ailment.Expr.VirtualVariableCategory.COMBO_REGISTER:
@@ -4066,7 +4224,192 @@ class Clinic(Analysis, Serializable):
         # Unless that register is tracked, the tracker cannot resolve sp after the restore and reports
         # the whole function as inconsistent, leaking raw sp virtual variables into the output. Track
         # any register that both receives a copy of sp and is later used to restore it.
-        # TODO: Implement this function for architectures beyond amd64
+        if is_arm_arch(self.project.arch):
+            if not self.project.arch.capstone_support:
+                return set()
+
+            entry_nodes = [
+                node for node in func_graph if (node.addr, getattr(node, "idx", None)) == self.entry_node_addr
+            ]
+            if len(entry_nodes) != 1:
+                return set()
+
+            entry_node = entry_nodes[0]
+            if func_graph.in_degree(entry_node) != 0:
+                return set()
+
+            reachable_nodes = networkx.descendants(func_graph, entry_node) | {entry_node}
+            if len(reachable_nodes) != func_graph.number_of_nodes():
+                return set()
+
+            endpoint_nodes = {node for node in reachable_nodes if func_graph.out_degree(node) == 0}
+            if not endpoint_nodes:
+                return set()
+            nodes_reaching_endpoints = endpoint_nodes.copy()
+            endpoint_worklist = list(endpoint_nodes)
+            while endpoint_worklist:
+                node = endpoint_worklist.pop()
+                for predecessor in func_graph.predecessors(node):
+                    if predecessor not in nodes_reaching_endpoints:
+                        nodes_reaching_endpoints.add(predecessor)
+                        endpoint_worklist.append(predecessor)
+            if nodes_reaching_endpoints != reachable_nodes:
+                return set()
+
+            copies_by_node = defaultdict(list)
+            writes_by_node = defaultdict(list)
+            affine_adjustments_by_node = defaultdict(set)
+            for node in reachable_nodes:
+                if not isinstance(node, BlockNode):
+                    return set()
+
+                try:
+                    block = self.project.factory.block(
+                        node.addr, size=node.size, thumb=node.thumb, cross_insn_opt=False
+                    )
+                    capstone_block = block.capstone
+                except (AttributeError, capstone.CsError, SimTranslationError):
+                    return set()
+                if node.size and (
+                    not capstone_block.insns or sum(insn.size for insn in capstone_block.insns) != node.size
+                ):
+                    return set()
+                # Per-block Thumb decoding cannot reconstruct IT state inherited from a predecessor.
+                if any(insn.id == capstone.arm.ARM_INS_IT for insn in capstone_block.insns):
+                    return set()
+
+                try:
+                    vex_block = block.vex
+                except (AttributeError, SimTranslationError):
+                    return set()
+                capstone_insn_addrs = tuple(insn.address for insn in capstone_block.insns)
+                if (
+                    vex_block.instructions != len(capstone_block.insns)
+                    or tuple(vex_block.instruction_addresses) != capstone_insn_addrs
+                    or vex_block.size != node.size
+                    or vex_block.jumpkind == "Ijk_NoDecode"
+                ):
+                    return set()
+
+                for insn_idx, insn in enumerate(capstone_block.insns):
+                    try:
+                        read_regs, written_regs = insn.regs_access()
+                    except (AttributeError, capstone.CsError):
+                        return set()
+                    read_regs = set(read_regs)
+                    written_regs = set(written_regs)
+                    writes_by_node[node].append((insn_idx, written_regs))
+
+                    if insn.cc != capstone.arm.ARM_CC_AL:
+                        continue
+                    operands = insn.operands
+
+                    # ARM epilogues may adjust a frame pointer immediately before copying it back into sp. Only admit
+                    # the exact two-operand ADDS-immediate form used by the real supported epilogue.
+                    # Restricting their placement to endpoint blocks is handled by the candidate proof below.
+                    if (
+                        insn.id == capstone.arm.ARM_INS_ADD
+                        and insn.update_flags
+                        and not insn.writeback
+                        and len(operands) == 2
+                    ):
+                        adjusted_reg = None
+                        if operands[0].type == capstone.arm.ARM_OP_REG and operands[1].type == capstone.arm.ARM_OP_IMM:
+                            adjusted_reg = operands[0].reg
+
+                        if (
+                            adjusted_reg is not None
+                            and adjusted_reg in read_regs
+                            and adjusted_reg in written_regs
+                            and all(
+                                operand.shift.type == capstone.arm.ARM_SFT_INVALID
+                                for operand in operands
+                                if operand.type == capstone.arm.ARM_OP_REG
+                            )
+                        ):
+                            affine_adjustments_by_node[node].add((insn_idx, adjusted_reg))
+
+                    if insn.id == capstone.arm.ARM_INS_MOV and len(operands) == 2:
+                        dst, src = operands
+                    elif (
+                        insn.id == capstone.arm.ARM_INS_ADD
+                        and len(operands) == 3
+                        and operands[2].type == capstone.arm.ARM_OP_IMM
+                        and operands[2].imm == 0
+                    ):
+                        dst, src, _ = operands
+                    else:
+                        continue
+
+                    if dst.type != capstone.arm.ARM_OP_REG or src.type != capstone.arm.ARM_OP_REG:
+                        continue
+                    if any(operand.shift.type != capstone.arm.ARM_SFT_INVALID for operand in (dst, src)):
+                        continue
+                    if dst.reg not in written_regs:
+                        continue
+                    copies_by_node[node].append((insn_idx, dst.reg, src.reg))
+
+            candidate_regs = {
+                capstone.arm.ARM_REG_R4: "r4",
+                capstone.arm.ARM_REG_R5: "r5",
+                capstone.arm.ARM_REG_R6: "r6",
+                capstone.arm.ARM_REG_R7: "r7",
+                capstone.arm.ARM_REG_R8: "r8",
+                capstone.arm.ARM_REG_R9: "r9",
+                capstone.arm.ARM_REG_R10: "r10",
+                capstone.arm.ARM_REG_R11: "r11",
+            }
+            sp_reg = capstone.arm.ARM_REG_SP
+            saves_by_reg = defaultdict(list)
+            restores_by_reg_and_node = defaultdict(lambda: defaultdict(list))
+            for node, copies in copies_by_node.items():
+                for insn_idx, dst_reg, src_reg in copies:
+                    if src_reg == sp_reg:
+                        saves_by_reg[dst_reg].append((node, insn_idx))
+                    if dst_reg == sp_reg:
+                        restores_by_reg_and_node[src_reg][node].append(insn_idx)
+
+            saved_sp_regs = set()
+            for candidate_reg, reg_name in candidate_regs.items():
+                saves = saves_by_reg[candidate_reg]
+                if len(saves) != 1 or saves[0][0] is not entry_node:
+                    continue
+
+                restores_by_node = restores_by_reg_and_node[candidate_reg]
+                if set(restores_by_node) != endpoint_nodes or any(
+                    len(insn_indices) != 1 for insn_indices in restores_by_node.values()
+                ):
+                    continue
+
+                save_idx = saves[0][1]
+                restore_by_endpoint = {node: insn_indices[0] for node, insn_indices in restores_by_node.items()}
+                if entry_node in endpoint_nodes and save_idx >= restore_by_endpoint[entry_node]:
+                    continue
+
+                clobbered = False
+                for node, writes in writes_by_node.items():
+                    for insn_idx, written_regs in writes:
+                        if candidate_reg not in written_regs:
+                            continue
+                        if node is entry_node and insn_idx <= save_idx:
+                            continue
+                        if node in endpoint_nodes and insn_idx >= restore_by_endpoint[node]:
+                            continue
+                        if node in endpoint_nodes and (insn_idx, candidate_reg) in affine_adjustments_by_node[node]:
+                            continue
+                        clobbered = True
+                        break
+                    if clobbered:
+                        break
+                if clobbered:
+                    continue
+
+                if reg_name in self.project.arch.registers:
+                    saved_sp_regs.add(self.project.arch.registers[reg_name][0])
+
+            return saved_sp_regs
+
+        # TODO: Implement this function for architectures beyond amd64 and ARM
         if self.project.arch.name != "AMD64":
             return set()
 

@@ -35,6 +35,21 @@ if TYPE_CHECKING:
 l = logging.getLogger(__name__)
 
 
+def _soot_addr_to_dict(addr: SootAddressDescriptor) -> dict:
+    return {
+        "class_name": addr.method.class_name,
+        "name": addr.method.name,
+        "params": addr.method.params,
+        "block_idx": addr.block_idx,
+        "stmt_idx": addr.stmt_idx,
+    }
+
+
+def _soot_addr_from_dict(d: dict) -> SootAddressDescriptor:
+    method = SootMethodDescriptor(d["class_name"], d["name"], tuple(d["params"]))
+    return SootAddressDescriptor(method, d["block_idx"], d["stmt_idx"])
+
+
 class DirtyDict[DK, DV](UserDict[DK, DV]):
     """
     A simple dict subclass that tracks whether it has been modified since creation or last reset.
@@ -252,6 +267,30 @@ class SpillingAdjDict(MutableMapping):
             "stmt_idx": stmt_idx if stmt_idx != -1 else None,
         }
 
+    @staticmethod
+    def _serialize_soot_edge_data(edge_data: dict) -> bytes:
+        """Serialize an edge attribute dict whose ins_addr is a Soot address."""
+        jk = cfg_jumpkind_to_pb(edge_data.get("jumpkind"))
+        ins_addr = edge_data.get("ins_addr")
+        return json_encode(
+            {
+                "jumpkind": primitives_pb2.Edge.UnknownJumpkind if jk is None else jk,
+                "ins_addr": None if ins_addr is None else _soot_addr_to_dict(ins_addr),
+                "stmt_idx": edge_data.get("stmt_idx"),
+            }
+        )
+
+    @staticmethod
+    def _deserialize_soot_edge_data(data: bytes) -> dict:
+        """Deserialize an edge attribute dict whose ins_addr is a Soot address."""
+        d = json_decode(data)
+        ins_addr = d["ins_addr"]
+        return {
+            "jumpkind": cfg_jumpkind_from_pb(d["jumpkind"]),
+            "ins_addr": None if ins_addr is None else _soot_addr_from_dict(ins_addr),
+            "stmt_idx": d["stmt_idx"],
+        }
+
     def _serialize_inner_dict(self, inner_dict: DirtyDict[K, dict]) -> bytes:
         """Serialize an inner adjacency dict to bytes.
 
@@ -266,6 +305,7 @@ class SpillingAdjDict(MutableMapping):
         """
         buf = bytearray()
         buf.extend(struct.pack("<I", len(inner_dict)))
+        serialize_edge_data = self._serialize_soot_edge_data if self.addr_type == "soot" else self._serialize_edge_data
         for dst_key, edge_data in inner_dict.items():
             match self.addr_type:
                 case "int":
@@ -290,19 +330,12 @@ class SpillingAdjDict(MutableMapping):
                 case "soot":
                     # dst_key: SOOTNODE_K
                     assert isinstance(dst_key, SootAddressDescriptor)
-                    d = {
-                        "class_name": dst_key.method.class_name,
-                        "name": dst_key.method.name,
-                        "params": dst_key.method.params,
-                        "block_idx": dst_key.block_idx,
-                        "stmt_idx": dst_key.stmt_idx,
-                    }
-                    key_bytes = json_encode(d)
+                    key_bytes = json_encode(_soot_addr_to_dict(dst_key))
 
                 case _:
                     raise TypeError(f"Unsupported addr_type {self.addr_type}")
 
-            proto_bytes = SpillingAdjDict._serialize_edge_data(edge_data)
+            proto_bytes = serialize_edge_data(edge_data)
             buf.extend(struct.pack("<H", len(key_bytes)))
             buf.extend(key_bytes)
             buf.extend(struct.pack("<I", len(proto_bytes)))
@@ -317,6 +350,9 @@ class SpillingAdjDict(MutableMapping):
         offset += 4
 
         inner_dict: DirtyDict[K, dict] = DirtyDict()
+        deserialize_edge_data = (
+            self._deserialize_soot_edge_data if self.addr_type == "soot" else self._deserialize_edge_data
+        )
         for _ in range(num_entries):
             key_len = struct.unpack_from("<H", data, offset)[0]
             offset += 2
@@ -346,9 +382,7 @@ class SpillingAdjDict(MutableMapping):
                     dst_key = (block_id_obj, size, looping_times)
 
                 case "soot":
-                    d = json_decode(key_bytes)
-                    method = SootMethodDescriptor(d["class_name"], d["name"], d["params"])
-                    dst_key = SootAddressDescriptor(method, d["block_idx"], d["stmt_idx"])
+                    dst_key = _soot_addr_from_dict(json_decode(key_bytes))
 
                 case _:
                     raise TypeError(f"Unsupported addr_type {self.addr_type}")
@@ -358,7 +392,7 @@ class SpillingAdjDict(MutableMapping):
             proto_bytes = data[offset : offset + proto_len]
             offset += proto_len
 
-            edge_data = SpillingAdjDict._deserialize_edge_data(proto_bytes)
+            edge_data = deserialize_edge_data(proto_bytes)
             inner_dict[dst_key] = edge_data
         inner_dict.dirty = False
 
@@ -385,6 +419,33 @@ class SpillingAdjDict(MutableMapping):
                 break
             except lmdb.MapFullError:
                 self.rtdb.increase_lmdb_map_size()
+
+    def _bulk_import_serialized(self, items: list[tuple[K, bytes]]) -> None:
+        """
+        Write already-serialized inner dicts straight into the LMDB backing store and register them as spilled,
+        without deserializing them. The bytes must be in the format that _save_to_lmdb() writes.
+        """
+        if not items or self.rtdb is None:
+            return
+
+        self._init_lmdb()
+        assert self._edgesdb is not None
+
+        with self._db_store_lock:
+            while True:
+                try:
+                    with self.rtdb.begin_txn(self._edgesdb, write=True) as txn:
+                        for key, value in items:
+                            txn.put(repr(key).encode("utf-8"), value)
+                    break
+                except lmdb.MapFullError:
+                    self.rtdb.increase_lmdb_map_size()
+
+            for key, _ in items:
+                # LMDB now holds the authoritative copy of these entries
+                self._data.pop(key, None)
+                self._lru_order.pop(key, None)
+                self._spilled_keys.add(key)
 
     def _load_from_lmdb(self, key: K) -> DirtyDict[K, dict] | None:
         if self._edgesdb is None or self.rtdb is None:
@@ -485,6 +546,12 @@ class SpillingAdjDict(MutableMapping):
     #
 
     def copy(self) -> SpillingAdjDict:
+        """
+        Copy this adjacency store, including whatever it has spilled to LMDB.
+
+        The cached entries are copied in memory. The spilled ones are copied as raw records into a fresh
+        sub-database of the same environment, without being deserialized.
+        """
         new_dict = SpillingAdjDict(
             self.addr_type,
             rtdb=self.rtdb,
@@ -498,20 +565,17 @@ class SpillingAdjDict(MutableMapping):
             new_dict._data[key] = DirtyDict({k: dict(v) for k, v in inner_dict.items()}, dirty=True)
             new_dict._lru_order[key] = None
 
-        # Copy spilled data from LMDB
+        # Copy spilled data from LMDB, a batch at a time. Each batch is read, the read transaction is closed, and
+        # only then is the batch written back out: the write may have to grow the map, which remaps the whole
+        # environment.
         if self._spilled_keys and self._edgesdb is not None and self.rtdb is not None:
-            new_dict._init_lmdb()
-            assert new_dict._edgesdb is not None
-            with (
-                self.rtdb.begin_txn(self._edgesdb) as src_txn,
-                self.rtdb.begin_txn(new_dict._edgesdb, write=True) as dst_txn,
-            ):
-                for key in self._spilled_keys:
-                    lmdb_key = repr(key).encode("utf-8")
-                    value = src_txn.get(lmdb_key)
-                    if value is not None:
-                        dst_txn.put(lmdb_key, value)
-                        new_dict._spilled_keys.add(key)
+            spilled = list(self._spilled_keys)
+            batch_size = max(self._db_batch_size, 1)
+            for start in range(0, len(spilled), batch_size):
+                batch = spilled[start : start + batch_size]
+                with self._db_load_lock, self.rtdb.begin_txn(self._edgesdb) as src_txn:
+                    records = [(key, src_txn.get(repr(key).encode("utf-8"))) for key in batch]
+                new_dict._bulk_import_serialized([(key, value) for key, value in records if value is not None])
 
         new_dict._eviction_enabled = True
         return new_dict

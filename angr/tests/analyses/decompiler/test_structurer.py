@@ -7,13 +7,17 @@ __package__ = __package__ or "tests.analyses.decompiler"  # pylint:disable=redef
 import os
 import unittest
 
+import archinfo
+import claripy
 import networkx
 
 import angr
 import angr.analyses.decompiler
-from angr.ailment import Manager
+from angr.ailment import Block, Manager
 from angr.analyses import Decompiler
+from angr.analyses.decompiler.condition_processor import ConditionProcessor
 from angr.analyses.decompiler.decompilation_options import get_structurer_option
+from angr.analyses.decompiler.structurer_nodes import CodeNode, SequenceNode
 from angr.analyses.decompiler.structuring import DreamStructurer
 from tests.common import bin_location, load_project_with_scoped_cfg, print_decompilation_result
 
@@ -47,6 +51,48 @@ def D(*edge):
 
 
 class TestStructurer(unittest.TestCase):
+    def test_dream_does_not_replace_reaching_condition_with_concrete_guard(self):
+        arch = archinfo.ArchAMD64()
+        condition_processor = ConditionProcessor(arch, Manager(arch=arch))
+        structurer = object.__new__(DreamStructurer)
+        structurer.cond_proc = condition_processor
+
+        block = Block(0x1000, 1)
+        reaching_condition = claripy.Or(claripy.BoolS("first"), claripy.BoolS("second"))
+        for guarding_condition in (claripy.true(), claripy.false()):
+            with self.subTest(guarding_condition=guarding_condition):
+                condition_processor.guarding_conditions = {block: guarding_condition}
+                code_node = CodeNode(block, reaching_condition)
+                sequence = SequenceNode(block.addr, nodes=[code_node])
+
+                structurer._replace_complex_reaching_conditions(sequence)
+
+                self.assertIs(code_node.reaching_condition, reaching_condition)
+
+    def test_dream_replaces_reaching_condition_with_simpler_symbolic_guard(self):
+        arch = archinfo.ArchAMD64()
+        condition_processor = ConditionProcessor(arch, Manager(arch=arch))
+        structurer = object.__new__(DreamStructurer)
+        structurer.cond_proc = condition_processor
+
+        first = claripy.BoolS("first")
+        second = claripy.BoolS("second")
+        third = claripy.BoolS("third")
+        reaching_condition = claripy.Or(
+            claripy.And(first, second), claripy.And(first, claripy.Not(second)), claripy.And(first, third)
+        )
+        guarding_condition = first
+        self.assertFalse(claripy.Solver().satisfiable(extra_constraints=(reaching_condition != guarding_condition,)))
+
+        block = Block(0x1000, 1)
+        condition_processor.guarding_conditions = {block: guarding_condition}
+        code_node = CodeNode(block, reaching_condition)
+        sequence = SequenceNode(block.addr, nodes=[code_node])
+
+        structurer._replace_complex_reaching_conditions(sequence)
+
+        self.assertIs(code_node.reaching_condition, guarding_condition)
+
     def test_region_identifier_0(self):
         g = networkx.DiGraph()
 
@@ -333,12 +379,29 @@ class TestStructurer(unittest.TestCase):
         # it should not raise any exceptions
         assert dec.codegen is not None and dec.codegen.text is not None
 
+    def test_pe_authoritative_function_start_decompilation(self):
+        path = os.path.join(test_location, "x86", "windows", "eh-frame-occupied-start.exe")
+        proj = angr.Project(path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True, eh_frame=False, function_starts={0x40100A})
+
+        self.assertIn(0x40100A, cfg.kb.functions)
+        for structurer in ("SAILR", "Phoenix"):
+            with self.subTest(structurer=structurer):
+                dec = proj.analyses[Decompiler].prep(fail_fast=True)(
+                    0x40100A,
+                    cfg=cfg.model,
+                    options=[(get_structurer_option(), structurer)],
+                )
+                assert dec.codegen is not None and dec.codegen.text is not None
+                self.assertIn("return 42;", dec.codegen.text)
+
     def test_phoenix_switch_cases_address_loaded_from_memory_node_a_being_region_head(self):
         proj = angr.Project(
             os.path.join(
                 test_location, "x86_64", "windows", "7995a0325b446c462bdb6ae10b692eee2ecadd8e888e9d7729befe4412007afb"
             )
         )
+        assert len(proj.loader.main_object.function_hints) == 4219
         cfg = proj.analyses.CFGFast(
             normalize=True,
             regions=[(0x1400326C0, 0x1400326C0 + 0x1000)],
@@ -350,6 +413,20 @@ class TestStructurer(unittest.TestCase):
         # exception unwind table
         assert not cfg.kb.functions.contains_addr(0x140032FD3)
         assert not cfg.kb.functions.contains_addr(0x140032D1B)
+        # One unoccupied native PE unwind start is consumed when hints are enabled. Older CLE versions classify these
+        # records as EH_FRAME; both classifications must preserve the same low-confidence behavior.
+        assert cfg.kb.functions.contains_addr(0x140033290)
+
+        proj_without_hints = angr.Project(proj.filename, auto_load_libs=False)
+        cfg_without_hints = proj_without_hints.analyses.CFGFast(
+            normalize=True,
+            regions=[(0x1400326C0, 0x1400326C0 + 0x1000)],
+            start_at_entry=False,
+            eh_frame=False,
+        )
+        assert not cfg_without_hints.kb.functions.contains_addr(0x140033290)
+        assert not cfg_without_hints.kb.functions.contains_addr(0x140032FD3)
+        assert not cfg_without_hints.kb.functions.contains_addr(0x140032D1B)
 
         dec = proj.analyses[Decompiler].prep(fail_fast=True)(0x1400326C0, cfg=cfg.model)
         # it should not raise any exceptions
