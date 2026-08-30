@@ -139,6 +139,8 @@ class SimLinux(SimUserland):
         # https://www.linux-mips.org/wiki/WhatsWrongWithO32N32N64
         elif self.arch.name == "MIPS32":
             syscall_abis = ["mips-o32"]
+        elif self.arch.name == "MIPSN32":
+            syscall_abis = ["mips-n32"]
         elif self.arch.name == "MIPS64":
             syscall_abis = ["mips-n32", "mips-n64"]
         elif self.arch.name == "PPC32":
@@ -395,8 +397,13 @@ class SimLinux(SimUserland):
                     # a pointer to the dynamic linker's destructor routine, to be called at exit
                     state.registers.store(reg, self._loader_destructor)
                 elif val == "toc":
-                    if self.project.loader.main_object.is_ppc64_abiv1:
-                        state.registers.store(reg, self.project.loader.main_object.ppc64_initial_rtoc)
+                    main_object = self.project.loader.main_object
+                    if (
+                        isinstance(main_object, MetaELF)
+                        and main_object.is_ppc64_abiv1
+                        and main_object.ppc64_initial_rtoc is not None
+                    ):
+                        state.registers.store(reg, main_object.ppc64_initial_rtoc)
                 elif val == "entry":
                     state.registers.store(reg, state.registers.load("pc"))
                 elif val == "thread_pointer" and self.project.loader.tls.threads:

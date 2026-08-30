@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "e780d8501fd956f3776677663f8877d863eeab43",
-      "committed_at": "2026-08-29T09:13:30-07:00",
-      "subject": "PcodeLifter: Give each project its own Sleigh context (#6814)",
+      "commit": "acfcdecb02bed4b46b0035b893d65b509de1752a",
+      "committed_at": "2026-08-29T21:30:30-07:00",
+      "subject": "CCodeGen: emit the class-key of a C++ class definition once (#6981)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -66,9 +66,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "eac0e5540516b9199dd6a91933e80dc774ea3eac",
-      "committed_at": "2026-08-29T07:23:56-07:00",
-      "subject": "PE: read the loading environment from the optional header (#800)",
+      "commit": "929991dbb31fb5eae7767d674c82c683ba6ea3b8",
+      "committed_at": "2026-08-29T17:33:42-07:00",
+      "subject": "ELF: Resolve MIPS n32 and O64 from e_flags (#795)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -121,13 +121,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-08-29T20:23:28+00:00",
+  "imported_at": "2026-08-30T07:30:20+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "d4ffa2f06ee274779244b95816a0a4fa739d262c",
-      "committed_at": "2026-08-29T12:12:58-07:00",
-      "subject": "Add an i386 object whose block simplification needs more than thirty passes (#215)",
+      "commit": "45819e52da4b643383109eca2885a18c182486e2",
+      "committed_at": "2026-08-29T18:15:09-07:00",
+      "subject": "Add MIPS n32 and O64 fixtures (#206)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
