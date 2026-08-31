@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import struct
 import sys
 import timeit
 import unittest
 
 import cffi
+import pytest
 
 import cle
 
@@ -116,6 +118,96 @@ def test_clemory_contains():
     assert clemory.min_addr == 0
     assert clemory.max_addr == 70
     assert clemory.consecutive is True
+
+
+def test_remove_backer():
+    clemory = cle.Clemory(None, root=True)
+    clemory.add_backer(0, b"A")
+    clemory.add_backer(10, b"BB")
+    clemory.add_backer(20, b"CCC")
+
+    # The search used to bisect right, landing one past the backer being removed, so no removal ever found its target.
+    clemory.remove_backer(0)
+    assert [start for start, _ in clemory.backers()] == [10, 20]
+    clemory.remove_backer(20)
+    assert list(clemory.backers()) == [(10, bytearray(b"BB"))]
+    assert clemory.min_addr == 10
+    assert clemory.max_addr == 12
+
+    # Only the address a backer starts at identifies it.
+    with pytest.raises(ValueError):
+        clemory.remove_backer(11)
+
+    # Emptying a clemory leaves it in the state a freshly constructed one is in.
+    clemory.remove_backer(10)
+    assert not list(clemory.backers())
+    assert clemory.min_addr == 0
+    assert clemory.max_addr == 0
+    assert clemory.consecutive is True
+    assert 10 not in clemory
+
+
+def test_split_backer():
+    clemory = cle.Clemory(None, root=True)
+    clemory.add_backer(0, b"ABCDEFGH")
+
+    # Splitting removes the backer and re-adds the two halves, so it only works once removal does.
+    clemory.split_backer(4)
+
+    assert list(clemory.backers()) == [(0, bytearray(b"ABCD")), (4, bytearray(b"EFGH"))]
+    assert clemory.load(0, 8) == b"ABCDEFGH"
+
+
+def test_add_backer_overwrite():
+    clemory = cle.Clemory(None, root=True)
+    clemory.add_backer(0, b"ABCDEFGH")
+
+    # Overwriting splits the backer around the new data and drops what the new data replaces, both of which need
+    # removal to work.
+    clemory.add_backer(2, b"xy", overwrite=True)
+
+    assert clemory.load(0, 8) == b"ABxyEFGH"
+
+
+def test_clemory_malformed_format():
+    # a format string struct cannot parse is a format error, not an out-of-bounds access, and
+    # classifying it must not raise struct.error out of the handler doing the classification
+    clemory = cle.Clemory(None, root=True)
+    clemory.add_backer(0, b"A" * 4)
+
+    with pytest.raises(struct.error) as excinfo:
+        clemory.unpack(0, "<Z")
+    assert excinfo.value.__context__ is None
+
+    with pytest.raises(struct.error) as excinfo:
+        clemory.pack(0, "<Z", 1)
+    assert excinfo.value.__context__ is None
+
+    # a format struct can parse that runs off the end of the backer is still a KeyError
+    with pytest.raises(KeyError):
+        clemory.unpack(2, "<I")
+    with pytest.raises(KeyError):
+        clemory.pack(2, "<I", 1)
+
+
+def test_clemory_read_only_view_malformed_format():
+    clemory = cle.Clemory(None, root=True)
+    clemory.add_backer(0, b"A" * 4)
+    view = cle.ClemoryReadOnlyView(None, clemory)
+
+    with pytest.raises(struct.error) as excinfo:
+        view.unpack(0, "<Z")
+    assert excinfo.value.__context__ is None
+    with pytest.raises(KeyError):
+        view.unpack(2, "<I")
+
+    # and again now that the backer the reads above found is cached, which is a separate handler
+    assert view.unpack(0, "<H") == (0x4141,)
+    with pytest.raises(struct.error) as excinfo:
+        view.unpack(0, "<Z")
+    assert excinfo.value.__context__ is None
+    with pytest.raises(KeyError):
+        view.unpack(2, "<I")
 
 
 def main():

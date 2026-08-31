@@ -64,6 +64,13 @@ if TYPE_CHECKING:
 l = logging.getLogger(name=__name__)
 
 
+# The CLE function hint sources CFGBase takes as function starts on their own. It is an allowlist
+# rather than "every source but .eh_frame" so that a source CLE adds later is left alone until angr
+# has decided what its entries mean: a linker's function-start table records the data atoms a
+# producer placed among its functions, and seeding those puts function heads on data.
+DEFINITE_FUNCTION_HINT_SOURCES = frozenset({FunctionHintSource.EXPORT_TABLE, FunctionHintSource.EXTERNAL_EH_FRAME})
+
+
 class CFGBase(Analysis):
     """
     The base class for control flow graphs.
@@ -222,6 +229,9 @@ class CFGBase(Analysis):
         # a dict of mapping between function addresses and sets of jobs (include both future jobs and pending jobs)
         # a set is used to speed up the job removal procedure
         self._jobs_to_analyze_per_function = defaultdict(set)
+        # the subset of keys of _jobs_to_analyze_per_function whose job set is empty, maintained by
+        # _register_analysis_job() and _deregister_analysis_job()
+        self._functions_without_jobs = set()
         # addresses of functions that have been completely recovered (i.e. all of its blocks are identified) so far
         self._completed_functions = set()
 
@@ -232,6 +242,7 @@ class CFGBase(Analysis):
         self._function_addresses_from_symbols = self._load_func_addrs_from_symbols()
         self._function_addresses_from_eh_frame = self._load_func_addrs_from_eh_frame()
         self._function_addr_and_names_from_hints = self._load_func_addr_and_names_from_hints()
+        self._function_addresses_from_function_starts = self._load_func_addrs_from_function_starts()
 
         # Cache if an object has executable sections or not
         self._object_to_executable_sections = {}
@@ -353,6 +364,7 @@ class CFGBase(Analysis):
         """
 
         self._jobs_to_analyze_per_function = defaultdict(set)
+        self._functions_without_jobs = set()
         self._completed_functions = set()
 
     def _function_completed(self, func_addr: int):
@@ -868,9 +880,20 @@ class CFGBase(Analysis):
                         memory_regions.append((region_addr, region_addr + region_size))
 
             elif isinstance(b, Blob):
-                # a blob is entirely executable
-                tpl = (b.min_addr, b.max_addr + 1)
-                memory_regions.append(tpl)
+                if all(segment.is_executable for segment in b.segments):
+                    # a raw image carries no permissions and every segment answers the permissive default,
+                    # so the blob is entirely executable
+                    tpl = (b.min_addr, b.max_addr + 1)
+                    memory_regions.append(tpl)
+                else:
+                    # the blob was cut out of something that recorded its permissions, such as a core dump
+                    for segment in b.segments:
+                        if not segment.is_executable:
+                            continue
+                        # a segment can be longer than the bytes the blob actually holds
+                        max_mapped_addr = min(segment.min_addr + min(segment.memsize, segment.filesize), b.max_addr + 1)
+                        if max_mapped_addr > segment.min_addr:
+                            memory_regions.append((segment.min_addr, max_mapped_addr))
 
             elif isinstance(b, NamedRegion):
                 # NamedRegions have no content! Ignore
@@ -1098,9 +1121,30 @@ class CFGBase(Analysis):
 
         addrs_and_names = set()
         for function_hint in self._binary.function_hints:
-            if function_hint.source != FunctionHintSource.EH_FRAME:
+            if function_hint.source in DEFINITE_FUNCTION_HINT_SOURCES:
                 addrs_and_names.add((function_hint.addr, function_hint.name))
         return addrs_and_names
+
+    def _load_func_addrs_from_function_starts(self) -> set[int]:
+        """
+        Get the addresses that a linker's function-start table records.
+
+        Mach-O's LC_FUNCTION_STARTS names every atom ld64 placed in an executable section. That
+        includes the data atoms a producer emits among its functions - a Haskell closure's info
+        table, a Swift offset table - so these addresses are candidates and not function starts.
+        Mach-O is the only backend that records this table, and asking any other one for it would
+        make every format depend on a Mach-O load command.
+
+        :return:    A set of addresses that may be functions.
+        """
+
+        if not isinstance(self._binary, MachO):
+            return set()
+        return {
+            function_hint.addr
+            for function_hint in self._binary.function_hints
+            if function_hint.source == FunctionHintSource.FUNCTION_STARTS
+        }
 
     #
     # Analyze function features
@@ -1578,6 +1622,7 @@ class CFGBase(Analysis):
         """
 
         self._jobs_to_analyze_per_function[func_addr].add(job)
+        self._functions_without_jobs.discard(func_addr)
 
     def _deregister_analysis_job(self, func_addr, job):
         """
@@ -1588,25 +1633,23 @@ class CFGBase(Analysis):
         :return:              None
         """
 
-        self._jobs_to_analyze_per_function[func_addr].discard(job)
+        jobs = self._jobs_to_analyze_per_function[func_addr]
+        jobs.discard(job)
+        if not jobs:
+            self._functions_without_jobs.add(func_addr)
 
     def _get_finished_functions(self):
         """
         Obtain all functions of which we have finished analyzing. As _jobs_to_analyze_per_function is a defaultdict(),
         if a function address shows up in it with an empty job list, we consider we have exhausted all jobs of this
         function (both current jobs and pending jobs), thus the analysis of this function is done.
+        _functions_without_jobs holds exactly those addresses.
 
         :return: a list of function addresses of that we have finished analysis.
         :rtype:  list
         """
 
-        finished_func_addrs = []
-        for func_addr, all_jobs in self._jobs_to_analyze_per_function.items():
-            if not all_jobs:
-                # great! we have finished analyzing this function!
-                finished_func_addrs.append(func_addr)
-
-        return finished_func_addrs
+        return list(self._functions_without_jobs)
 
     def _cleanup_analysis_jobs(self, finished_func_addrs=None):
         """
@@ -1624,6 +1667,9 @@ class CFGBase(Analysis):
         for func_addr in finished_func_addrs:
             if func_addr in self._jobs_to_analyze_per_function:
                 del self._jobs_to_analyze_per_function[func_addr]
+        # rebuilt, not discarded in place, so that the set does not keep a hash table sized to its
+        # high-water mark for the rest of the analysis
+        self._functions_without_jobs = self._functions_without_jobs.difference(finished_func_addrs)
 
     def _make_completed_functions(self):
         """
@@ -3142,7 +3188,15 @@ class CFGBase(Analysis):
         all_targets = set()
         idx: int
         jump: IndirectJump
-        for idx, jump in enumerate(self._indirect_jumps_to_resolve):
+        # IndirectJump has no __hash__, so the set iterates its members in the order their objects happen to sit
+        # in memory. Resolving one jump occupies bytes and builds blocks that the next resolver reads, so that
+        # order decides the answer. self.indirect_jumps records every jump in the order the scan reached it;
+        # follow that, and fall back to the address for anything not registered there.
+        discovered = {id(ij): order for order, ij in enumerate(self.indirect_jumps.values())}
+        pending = sorted(
+            self._indirect_jumps_to_resolve, key=lambda ij: (discovered.get(id(ij), len(discovered)), ij.addr)
+        )
+        for idx, jump in enumerate(pending):
             if self._low_priority:
                 self._release_gil(idx, 50, 0.000001)
             all_targets |= self._process_one_indirect_jump(jump)

@@ -6,8 +6,11 @@ import claripy
 from cle import AT
 
 import angr
+from angr.engines.failure import is_failure_jumpkind
 
 l = logging.getLogger(name=__name__)
+
+_MAIN_PROTOTYPE = "int main(int argc, char **argv, char **envp)"
 
 
 class __libc_start_main(angr.SimProcedure):
@@ -149,7 +152,7 @@ class __libc_start_main(angr.SimProcedure):
                 self.init,
                 (self.argc[31:0], self.argv, self.envp),
                 "after_init",
-                prototype="int main(int argc, char **argv, char **envp)",
+                prototype=_MAIN_PROTOTYPE,
             )
         else:
             obj = self.project.loader.main_object
@@ -170,7 +173,7 @@ class __libc_start_main(angr.SimProcedure):
                 addr,
                 (self.argc[31:0], self.argv, self.envp),
                 "inside_init",
-                prototype="int main(int argc, char **argv, char **envp)",
+                prototype=_MAIN_PROTOTYPE,
             )
 
     def after_init(self, main, argc, argv, init, fini, exit_addr=0):
@@ -178,7 +181,7 @@ class __libc_start_main(angr.SimProcedure):
             self.main,
             (self.argc[31:0], self.argv, self.envp),
             "after_main",
-            prototype="int main(int argc, char **argv, char **envp)",
+            prototype=_MAIN_PROTOTYPE,
         )
 
     def after_main(self, main, argc, argv, init, fini, exit_addr=0):
@@ -241,11 +244,13 @@ class __libc_start_main(angr.SimProcedure):
         # Execute each block
         state = blank_state
         for b in blocks:
+            # the engine dispatches hooks on the state's instruction pointer, not on the block it is handed
+            state.regs.ip = b.addr
             irsb = self.project.factory.default_engine.process(state, irsb=b, force_addr=b.addr)
-            if irsb.successors:
-                state = irsb.successors[0]
-            else:
+            succ = next((s for s in irsb.successors if not is_failure_jumpkind(s.history.jumpkind)), None)
+            if succ is None:
                 break
+            state = succ
 
         cc = angr.default_cc(
             self.arch.name, platform=self.project.simos.name if self.project.simos is not None else None
@@ -256,7 +261,12 @@ class __libc_start_main(angr.SimProcedure):
 
         # skip invalid results
         result = [
-            {"address": main, "jumpkind": "Ijk_Call", "namehint": "main"},
+            {
+                "address": main,
+                "jumpkind": "Ijk_Call",
+                "namehint": "main",
+                "prototype_hint": _MAIN_PROTOTYPE,
+            },
         ]
         if init.concrete and init.concrete_value != 0:
             init_item = {"address": init, "jumpkind": "Ijk_Call", "namehint": "init"}
