@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "acfcdecb02bed4b46b0035b893d65b509de1752a",
-      "committed_at": "2026-08-29T21:30:30-07:00",
-      "subject": "CCodeGen: emit the class-key of a C++ class definition once (#6981)",
+      "commit": "4964e66dee654c6071451b06a3c6886a61d06399",
+      "committed_at": "2026-08-30T13:03:59-07:00",
+      "subject": "Speed up more slow tests. (#7043)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -58,9 +58,9 @@
     },
     "claripy": {
       "upstream": "https://github.com/angr/claripy",
-      "commit": "6ff4486278af191304ae8188ed6faa643cf43087",
-      "committed_at": "2026-08-24T12:21:21-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#741)",
+      "commit": "b6f454286709afcdd3d34d03e7375140db8d851b",
+      "committed_at": "2026-08-30T13:04:25-07:00",
+      "subject": "Z3: Avoid re-adding constraints; do not assert already added constraints in cloned solvers. (#743)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -121,13 +121,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-08-30T07:30:20+00:00",
+  "imported_at": "2026-08-31T05:15:02+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "45819e52da4b643383109eca2885a18c182486e2",
-      "committed_at": "2026-08-29T18:15:09-07:00",
-      "subject": "Add MIPS n32 and O64 fixtures (#206)",
+      "commit": "981989f741dad616983a685f66a5566d2aed5bcf",
+      "committed_at": "2026-08-30T22:13:48-07:00",
+      "subject": "Add an s390x ELF whose EXRL target sits outside the code buffer (#222)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
