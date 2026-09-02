@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "4964e66dee654c6071451b06a3c6886a61d06399",
-      "committed_at": "2026-08-30T13:03:59-07:00",
-      "subject": "Speed up more slow tests. (#7043)",
+      "commit": "d20a366936cf437628f25dfe65706ebb359a4ce3",
+      "committed_at": "2026-09-01T11:07:34-07:00",
+      "subject": "cfg: use memory endness in ArmElfFastResolver._resolve_put (#7058)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -17,9 +17,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "aab96b51c95f6a4842ed912061fc46dfb8b22626",
-      "committed_at": "2026-08-24T12:21:44-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#1724)",
+      "commit": "5a7ac4a7d13fc9bd5b62c08d1630e5538a881afe",
+      "committed_at": "2026-09-01T10:40:42-07:00",
+      "subject": "Use cmake<4 for keystone-engine (#1727)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -50,25 +50,25 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "7e72c6caed422219d97af234f7acec96b37535c4",
-      "committed_at": "2026-08-29T07:15:13-07:00",
-      "subject": "Add ArchMIPSN32 for 64-bit MIPS with 32-bit pointers (#375)",
+      "commit": "68528685dda3f45697cbc16e1416493d4d38890f",
+      "committed_at": "2026-09-01T09:20:47-07:00",
+      "subject": "Treat an unqualified PowerPC identifier as big-endian (#380)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "claripy": {
       "upstream": "https://github.com/angr/claripy",
-      "commit": "b6f454286709afcdd3d34d03e7375140db8d851b",
-      "committed_at": "2026-08-30T13:04:25-07:00",
-      "subject": "Z3: Avoid re-adding constraints; do not assert already added constraints in cloned solvers. (#743)",
+      "commit": "71020429d255a7169d56cfae84e77d26ab372fa1",
+      "committed_at": "2026-08-31T11:51:11-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#744)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "929991dbb31fb5eae7767d674c82c683ba6ea3b8",
-      "committed_at": "2026-08-29T17:33:42-07:00",
-      "subject": "ELF: Resolve MIPS n32 and O64 from e_flags (#795)",
+      "commit": "2f7657fda2a657ec76a201d5c63245c6262f60b7",
+      "committed_at": "2026-08-31T11:51:05-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#803)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -93,17 +93,17 @@
     },
     "pysoot": {
       "upstream": "https://github.com/angr/pysoot",
-      "commit": "60e02181532bf1a5ddb487bb372a2f4aaf8e2680",
-      "committed_at": "2026-08-27T10:01:45-07:00",
-      "subject": "Lift a bare DEX (#56)",
+      "commit": "d42f9afbeea43389eb2deaf41b22077d2d7cd4f4",
+      "committed_at": "2026-08-31T11:52:00-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#57)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "26549469645736c27e81223ba7cb5881e8002e20",
-      "committed_at": "2026-08-29T07:19:16-07:00",
-      "subject": "Support MIPSN32 in the lifter (#576)",
+      "commit": "74cb12ee3ab872f96f98a7c3ccef26cdaf739dc4",
+      "committed_at": "2026-08-31T11:51:08-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#580)",
       "excluded": [
         ".gitmodules"
       ],
@@ -121,7 +121,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-08-31T05:15:02+00:00",
+  "imported_at": "2026-09-02T04:35:56+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",

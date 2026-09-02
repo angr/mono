@@ -23,7 +23,7 @@ except ImportError:
 
 
 class ArchPPC64(Arch):
-    def __init__(self, endness=Endness.LE):
+    def __init__(self, endness=Endness.BE):
         super().__init__(endness)
         if endness == Endness.BE:
             self.pcode_id = "PowerPC:BE:64:default"
@@ -35,7 +35,7 @@ class ArchPPC64(Arch):
             self.function_epilogs = {
                 rb"[\x00-\xff]{2}\x03\xa6([\x00-\xff]{4}){0,6}\x4e\x80\x00\x20"  # mtlr reg; ... ; blr
             }
-            self.triplet = "powerpc-linux-gnu"
+            self.triplet = "powerpc64-linux-gnu"
         else:
             self.pcode_id = "PowerPC:LE:64:default"
         self.argument_register_positions = (
@@ -83,6 +83,7 @@ class ArchPPC64(Arch):
     bits = 64
     vex_arch = "VexArchPPC64"
     name = "PPC64"
+    default_endness = Endness.BE
     qemu_name = "ppc64"
     ida_processor = "ppc64"
     triplet = "powerpc64le-linux-gnu"
@@ -400,4 +401,5 @@ class ArchPPC64(Arch):
 
 
 register_arch([r".*p\w*pc.*be"], 64, Endness.BE, ArchPPC64)
+register_arch([r".*p\w*pc\d*[-_]?(?:el|le)($|[^a-z])"], 64, Endness.LE, ArchPPC64)
 register_arch([r".*p\w*pc.*"], 64, Endness.ANY, ArchPPC64)

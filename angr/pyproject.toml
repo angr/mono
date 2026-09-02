@@ -124,6 +124,9 @@ pyvex = { workspace = true }
 cle = { workspace = true }
 claripy = { workspace = true }
 pysoot = { workspace = true }
+[tool.uv.extra-build-dependencies]
+keystone-engine = ["cmake<4"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"
