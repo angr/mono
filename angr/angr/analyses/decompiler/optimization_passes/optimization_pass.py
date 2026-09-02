@@ -18,8 +18,9 @@ from angr.analyses.decompiler.block_simplifier import BlockSimplifier, PeepholeO
 from angr.analyses.decompiler.condition_processor import ConditionProcessor
 from angr.analyses.decompiler.counters import ControlFlowStructureCounter
 from angr.analyses.decompiler.goto_manager import Goto, GotoManager
+from angr.analyses.decompiler.structurer_nodes import IncompleteSwitchCaseHeadStatement
 from angr.analyses.decompiler.structuring import RecursiveStructurer, SAILRStructurer
-from angr.analyses.decompiler.utils import add_labels, is_empty_node, remove_edges_in_ailgraph
+from angr.analyses.decompiler.utils import add_labels, copy_graph, is_empty_node, remove_edges_in_ailgraph
 
 if TYPE_CHECKING:
     from angr.analyses.decompiler.region_identifier import RegionIdentifier, RegionOverlay
@@ -67,6 +68,18 @@ class OptimizationPassStage(Enum):
     BEFORE_REGION_IDENTIFICATION = 9
     DURING_REGION_IDENTIFICATION = 10
     AFTER_STRUCTURING = 11
+
+
+class StructuringOptimizationPassResult(Enum):
+    """The outcome of one structuring optimization attempt.
+
+    STOP and RETRY leave ``out_graph`` unchanged; RETRY consumes an iteration before trying another candidate.
+    UPDATED reports a graph mutation that the base class must verify.
+    """
+
+    STOP = 0
+    RETRY = 1
+    UPDATED = 2
 
 
 class BaseOptimizationPass:
@@ -218,7 +231,7 @@ class OptimizationPass(BaseOptimizationPass):
         seen = set()
 
         if start_node is None:
-            start_node = self._get_block(self._func.addr)
+            start_node = self._get_block(self.entry_node_addr[0], idx=self.entry_node_addr[1])
         if start_node is None:
             return
 
@@ -537,8 +550,24 @@ class StructuringOptimizationPass(OptimizationPass):
         self._initial_structure_counter = None
         self._current_structure_counter = None
 
-    def _analyze(self, cache=None) -> bool:
+    def _analyze(self, cache=None) -> bool | StructuringOptimizationPassResult:
         raise NotImplementedError
+
+    def _requires_structurability_check(self) -> bool:
+        return (
+            self._require_structurable_graph
+            or self._require_gotos
+            or self._prevent_new_gotos
+            or self._must_improve_rel_quality
+        )
+
+    @staticmethod
+    def _normalize_analyze_result(result: object) -> StructuringOptimizationPassResult:
+        if isinstance(result, bool):
+            return StructuringOptimizationPassResult.UPDATED if result else StructuringOptimizationPassResult.STOP
+        if isinstance(result, StructuringOptimizationPassResult):
+            return result
+        raise TypeError(f"Unexpected structuring optimization pass result {result!r}")
 
     def analyze(self):
         try:
@@ -555,12 +584,12 @@ class StructuringOptimizationPass(OptimizationPass):
         if not ret:
             return
 
-        # only initialize self._goto_manager if this optimization requires a structurable graph or gotos
+        # initialize structuring-derived state only when a configured check consumes it
         initial_structurable: bool | None = None
-        if self._require_structurable_graph or self._require_gotos or self._prevent_new_gotos:
+        if self._requires_structurability_check():
             initial_structurable = self._graph_is_structurable(self._graph, initial=True)
 
-        if self._require_structurable_graph and initial_structurable is False:
+        if initial_structurable is False:
             return
 
         if self._require_gotos:
@@ -574,8 +603,8 @@ class StructuringOptimizationPass(OptimizationPass):
         if self._max_opt_iters > 1:
             self._fixed_point_analyze(cache=cache)
         else:
-            updates = self._analyze(cache=cache)
-            if not updates:
+            result = self._normalize_analyze_result(self._analyze(cache=cache))
+            if result is not StructuringOptimizationPassResult.UPDATED:
                 self.out_graph = None
 
         # analysis is complete, no out_graph means it failed somewhere along the way
@@ -587,7 +616,7 @@ class StructuringOptimizationPass(OptimizationPass):
             self.out_graph = add_labels(self.out_graph, self.manager)
 
         if (
-            self._require_structurable_graph
+            self._requires_structurability_check()
             and self._max_opt_iters <= 1
             and not self._graph_is_structurable(self.out_graph, readd_labels=False)
         ):
@@ -628,21 +657,26 @@ class StructuringOptimizationPass(OptimizationPass):
 
             # backup the graph before the optimization
             if self._recover_structure_fails and self.out_graph is not None:
-                self._prev_graph = networkx.DiGraph(self.out_graph)
+                self._prev_graph = copy_graph(self.out_graph)
 
             # run the optimization, output applied to self.out_graph
-            changes = self._analyze(cache=cache)
-            if not changes:
+            result = self._normalize_analyze_result(self._analyze(cache=cache))
+            if result is StructuringOptimizationPassResult.STOP:
                 break
+            if result is StructuringOptimizationPassResult.RETRY:
+                continue
 
-            had_any_changes = True
-            # check if the graph is structurable
-            if not self._graph_is_structurable(self.out_graph, readd_labels=self._readd_labels):
+            # update structuring-derived state and reject invalid graphs when any configured check depends on it
+            if self._requires_structurability_check() and not self._graph_is_structurable(
+                self.out_graph, readd_labels=self._readd_labels
+            ):
                 if self._recover_structure_fails:
                     self.out_graph = self._prev_graph
                 else:
                     self.out_graph = None
-                    break
+                break
+
+            had_any_changes = True
 
         if not had_any_changes:
             self.out_graph = None
@@ -690,18 +724,22 @@ class StructuringOptimizationPass(OptimizationPass):
         Run region identification, structuring, and region simplification on ``graph`` to determine whether it is
         structurable or not.
         """
+        probe_manager = self._manager_for_structurability_probe()
+        graph = self._deepcopy_ail_graph_for_probe(graph, probe_manager)
         if readd_labels:
-            graph = add_labels(graph, self.manager)
+            graph = add_labels(graph, probe_manager)
 
         remove_edges_in_ailgraph(graph, self._edges_to_remove)
+
+        probe_cond_proc = ConditionProcessor(self.project.arch, probe_manager)
 
         ri = self.project.analyses[angr.analyses.decompiler.RegionIdentifier].prep(kb=self.kb)(
             self._func,
             graph=graph,
-            ail_manager=self.manager,
+            ail_manager=probe_manager,
             # never update the graph in-place, we need to keep the original graph for later use
             update_graph=False,
-            cond_proc=self._ri.cond_proc,
+            cond_proc=probe_cond_proc,
             force_loop_single_exit=False,
             expose_loop_head_backedges=True,
             entry_node_addr=self.entry_node_addr,
@@ -715,7 +753,7 @@ class StructuringOptimizationPass(OptimizationPass):
             rs = self.project.analyses[RecursiveStructurer].prep(kb=self.kb)(
                 ri.region,
                 cond_proc=ri.cond_proc,
-                ail_manager=self.manager,
+                ail_manager=probe_manager,
                 func=self._func,
                 structurer_cls=SAILRStructurer,
             )
@@ -728,12 +766,55 @@ class StructuringOptimizationPass(OptimizationPass):
             return False, ri, None, None
 
         rs = self.project.analyses.RegionSimplifier(
-            self._func, rs.result, self.manager, arg_vvars=self._arg_vvars, kb=self.kb
+            self._func, rs.result, probe_manager, arg_vvars=self._arg_vvars, kb=self.kb
         )
         if not rs or rs.goto_manager is None or rs.result is None:
             return False, ri, None, None
 
         return True, ri, rs.goto_manager, rs.result
+
+    def _manager_for_structurability_probe(self) -> Manager:
+        manager = Manager(name=self.manager.name, arch=self.manager.arch)
+        manager.atom_ctr = self.manager.atom_ctr
+        manager.variable_map = self.manager.variable_map.copy() if self.manager.variable_map is not None else None
+        return manager
+
+    @staticmethod
+    def _deepcopy_ail_graph_for_probe(
+        graph: networkx.DiGraph[ailment.Block], manager: Manager
+    ) -> networkx.DiGraph[ailment.Block]:
+        """Deep-copy AIL nodes because topology-only graph copies do not isolate statement mutations."""
+        assert all(isinstance(node, ailment.Block) for node in graph), "structurability probes require AIL Blocks"
+        copies_by_identity: dict[int, ailment.Block] = {}
+
+        def _copy_block(block: ailment.Block) -> ailment.Block:
+            block_id = id(block)
+            if block_id in copies_by_identity:
+                return copies_by_identity[block_id]
+
+            block_copy = block.deep_copy(manager)
+            copies_by_identity[block_id] = block_copy
+            for original_stmt, copied_stmt in zip(block.statements, block_copy.statements, strict=True):
+                if isinstance(original_stmt, IncompleteSwitchCaseHeadStatement):
+                    assert isinstance(copied_stmt, IncompleteSwitchCaseHeadStatement)
+                    copied_stmt.case_addrs = [
+                        (
+                            _copy_block(case_block) if case_block is not None else None,
+                            case_value,
+                            target_addr,
+                            target_idx,
+                            next_addr,
+                        )
+                        for case_block, case_value, target_addr, target_idx, next_addr in original_stmt.case_addrs
+                    ]
+            return block_copy
+
+        graph_copy = networkx.DiGraph()
+        node_mapping = {node: _copy_block(node) for node in graph.nodes}
+        graph_copy.add_nodes_from(node_mapping.values())
+        for src, dst, data in graph.edges(data=True):
+            graph_copy.add_edge(node_mapping[src], node_mapping[dst], **data)
+        return graph_copy
 
     def _apply_structurability_result(
         self,

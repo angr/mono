@@ -42,6 +42,8 @@ if TYPE_CHECKING:
 
 l = logging.getLogger(name=__name__)
 
+_GETTEXT_MESSAGE_ARG_INDEX = {"gettext": 0, "dcgettext": 1}
+
 
 class CallSiteMaker:
     """
@@ -270,7 +272,9 @@ class CallSiteMaker:
         new_stmts = self.block.statements[:-1]
 
         # remove the statement that stores the return address
-        if self.project.arch.call_pushes_ret:
+        # The marker keeps a later CallSiteMaker pass from mistaking an earlier live write for the removed assignment.
+        return_addr_assignment_removed = call_expr.tags.get("return_addr_assignment_removed", False)
+        if not return_addr_assignment_removed and self.project.arch.call_pushes_ret:
             # check if the last statement is storing the return address onto the top of the stack
             for stmt_idx_r, the_stmt in enumerate(reversed(new_stmts)):
                 stmt_idx = len(new_stmts) - 1 - stmt_idx_r
@@ -291,16 +295,16 @@ class CallSiteMaker:
                     if varid is not None:
                         self.removed_vvar_ids.add(varid)
                     new_stmts = new_stmts[:stmt_idx] + new_stmts[stmt_idx + 1 :]
+                    return_addr_assignment_removed = True
                     break
-        else:
+        elif not return_addr_assignment_removed:
             # if there is an lr register...
-            lr_offset = None
-            if archinfo.arch_arm.is_arm_arch(self.project.arch) or self.project.arch.name in {"PPC32", "PPC64"}:
-                lr_offset = self.project.arch.registers["lr"][0]
-            elif self.project.arch.name in {"MIPS32", "MIPS64"}:
+            lr_offset = self.project.arch.lr_offset
+            if lr_offset is None and self.project.arch.name in {"MIPS32", "MIPS64"}:
                 lr_offset = self.project.arch.registers["ra"][0]
             # remove the assignment to the lr register
-            if lr_offset is not None:
+            if lr_offset is not None and self.block.original_size is not None:
+                expected_return_addr = self.block.addr + self.block.original_size
                 for stmt_idx_r, the_stmt in enumerate(reversed(new_stmts)):
                     stmt_idx = len(new_stmts) - 1 - stmt_idx_r
                     if isinstance(the_stmt, Stmt.SideEffectStatement):
@@ -317,10 +321,13 @@ class CallSiteMaker:
                         varid = the_stmt.dst.varid
                     else:
                         continue
+                    if not isinstance(the_stmt.src, Expr.Const) or the_stmt.src.value != expected_return_addr:
+                        continue
                     # found it
                     new_stmts = new_stmts[:stmt_idx] + new_stmts[stmt_idx + 1 :]
                     if varid is not None:
                         self.removed_vvar_ids.add(varid)
+                    return_addr_assignment_removed = True
                     break
 
         # calculate stack offsets for arguments that are put on the stack. these offsets will be consumed by
@@ -386,6 +393,8 @@ class CallSiteMaker:
 
         tags = call_expr.tags.copy()
         tags.pop("arg_vvars", None)
+        if return_addr_assignment_removed:
+            tags["return_addr_assignment_removed"] = True
         if func is not None:
             tags["is_prototype_guessed"] = func.is_prototype_guessed
         new_call = Expr.Call(
@@ -564,8 +573,37 @@ class CallSiteMaker:
 
         return s
 
+    def _find_format_string(self, value: Expr.Expression, resolved_vvars: set[int] | None = None) -> bytes | None:
+        if isinstance(value, Const) and isinstance(value.value, int):
+            return self._load_string(value.value) or None
+
+        if isinstance(value, Expr.VirtualVariable):
+            if self._reaching_definitions is None:
+                return None
+            if resolved_vvars is None:
+                resolved_vvars = set()
+            if value.varid in resolved_vvars:
+                return None
+            resolved_vvars.add(value.varid)
+            resolved = SRDAView(self._reaching_definitions).get_vvar_value(value)
+            if resolved is None or isinstance(resolved, Expr.Phi):
+                return None
+            return self._find_format_string(resolved, resolved_vvars)
+
+        if isinstance(value, Expr.Call) and value.args:
+            target = self._get_call_target(value)
+            if target is None or target not in self.kb.functions:
+                return None
+            callee = self.kb.functions[target]
+            message_arg_idx = _GETTEXT_MESSAGE_ARG_INDEX.get(callee.name)
+            if message_arg_idx is None or len(value.args) <= message_arg_idx:
+                return None
+            return self._find_format_string(value.args[message_arg_idx], resolved_vvars)
+
+        return None
+
     def _determine_variadic_arguments(self, func: Function, cc: SimCC, call_expr: Expr.Call) -> list[SimType]:
-        if "printf" in func.name or "scanf" in func.name:
+        if "printf" in func.name or "scanf" in func.name or func.name == "syslog":
             return self._determine_variadic_arguments_for_format_strings(func, cc, call_expr)
         return []
 
@@ -610,14 +648,12 @@ class CallSiteMaker:
                 l.warning("Unexpected type of argument type %s.", arg_loc.__class__)
                 continue
 
-            if not isinstance(value, Const) and call_expr.args is not None and len(call_expr.args) > fmt_arg_idx:
-                value = call_expr.args[fmt_arg_idx]
-            if isinstance(value, Const) and isinstance(value.value, int):
-                value = value.value
-            if isinstance(value, int):
-                fmt_str = self._load_string(value)
-                if fmt_str:
-                    break
+            if value is not None:
+                fmt_str = self._find_format_string(value)
+            if not fmt_str and call_expr.args is not None and len(call_expr.args) > fmt_arg_idx:
+                fmt_str = self._find_format_string(call_expr.args[fmt_arg_idx])
+            if fmt_str:
+                break
 
         if not fmt_str:
             return []

@@ -1,6 +1,7 @@
 # pylint:disable=missing-class-docstring
 from __future__ import annotations
 
+import copy
 from collections import OrderedDict
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -74,7 +75,16 @@ class MultiNode:
 
 
 class BaseNode:
-    __slots__ = ()
+    __slots__ = ("_hash",)
+
+    def __hash__(self):
+        # cached on first use: addr is edited in place during structuring, and a node that changed hash
+        # while sitting in a set would become unreachable in it
+        try:
+            return self._hash
+        except AttributeError:
+            self._hash = hash((type(self), self.addr))  # pylint:disable=attribute-defined-outside-init
+            return self._hash
 
     @staticmethod
     def test_empty_node(node):
@@ -99,7 +109,7 @@ class BaseNode:
 
         return True
 
-    addr: int | None
+    addr: int | None  # pylint:disable=declare-non-slot
 
     def dbg_repr(self, indent=0):
         return " " * indent + f"## dbg_repr not implemented for {type(self).__name__}"
@@ -465,6 +475,18 @@ class IncompleteSwitchCaseHeadStatement(_IncompleteSwitchCaseHeadStatementBase):
 
     def _hash_core(self):
         return stable_hash((IncompleteSwitchCaseHeadStatement, self.idx, self.switch_variable, self._case_addrs_str))
+
+    def deep_copy(self, manager):
+        new_idx = manager.next_atom()
+        if manager.variable_map is not None:
+            manager.variable_map.transfer(self, new_idx)
+        return IncompleteSwitchCaseHeadStatement(
+            new_idx,
+            self.switch_variable.deep_copy(manager),
+            list(self.case_addrs),
+            peephole_optimized=self.peephole_optimized,
+            **copy.deepcopy(self.tags),
+        )
 
     def replace(self, old_expr, new_expr):  # pylint:disable=unused-argument
         return self

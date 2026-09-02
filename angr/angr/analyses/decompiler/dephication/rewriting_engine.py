@@ -110,6 +110,8 @@ class SimEngineDephiRewriting(SimEngineNostmtAIL[None, Expression | None, Statem
                 oident=stmt.dst.oident,
                 **stmt.dst.tags,
             )
+            if self.variable_map is not None:
+                self.variable_map.transfer(stmt.dst, new_dst)
 
         # ensure we do not generate vvar_A = vvar_A or var_A = var_A (even if lhs and rhs are different vvars, they
         # can be mapped to the same variable)
@@ -288,7 +290,7 @@ class SimEngineDephiRewriting(SimEngineNostmtAIL[None, Expression | None, Statem
 
     def _handle_expr_VirtualVariable(self, expr: VirtualVariable) -> VirtualVariable | None:
         if expr.varid in self.vvar_to_vvar:
-            return VirtualVariable(
+            new_expr = VirtualVariable(
                 expr.idx,
                 self.vvar_to_vvar[expr.varid],
                 expr.bits,
@@ -296,6 +298,9 @@ class SimEngineDephiRewriting(SimEngineNostmtAIL[None, Expression | None, Statem
                 oident=expr.oident,
                 **expr.tags,
             )
+            if self.variable_map is not None:
+                self.variable_map.transfer(expr, new_expr)
+            return new_expr
         return None
 
     def _handle_stmt_Return(self, stmt):
@@ -449,10 +454,18 @@ class SimEngineDephiRewriting(SimEngineNostmtAIL[None, Expression | None, Statem
             else:
                 new_operands.append(o)
 
+        guard_in = expr.guard
         new_guard = None
-        if expr.guard is not None:
-            new_guard = self._expr(expr.guard)
+        if guard_in is not None:
+            new_guard = self._expr(guard_in)
             if new_guard is not None:
+                updated = True
+
+        maddr_in = expr.maddr
+        new_maddr = None
+        if maddr_in is not None:
+            new_maddr = self._expr(maddr_in)
+            if new_maddr is not None:
                 updated = True
 
         if updated:
@@ -460,9 +473,9 @@ class SimEngineDephiRewriting(SimEngineNostmtAIL[None, Expression | None, Statem
                 expr.idx,
                 expr.callee,
                 new_operands,
-                guard=new_guard,
+                guard=new_guard if new_guard is not None else guard_in,
                 mfx=expr.mfx,
-                maddr=expr.maddr,
+                maddr=new_maddr if new_maddr is not None else maddr_in,
                 msize=expr.msize,
                 bits=expr.bits,
                 **expr.tags,
@@ -503,6 +516,7 @@ class SimEngineDephiRewriting(SimEngineNostmtAIL[None, Expression | None, Statem
     def _unreachable(self, *args, **kwargs):
         assert False
 
+    _handle_binop_default = _unreachable
     _handle_binop_Add = _unreachable
     _handle_binop_AddF = _unreachable
     _handle_binop_AddV = _unreachable
@@ -565,6 +579,7 @@ class SimEngineDephiRewriting(SimEngineNostmtAIL[None, Expression | None, Statem
     _handle_unop_BitwiseNeg = _unreachable
     _handle_unop_Dereference = _unreachable
     _handle_unop_Neg = _unreachable
+    _handle_unop_default = _unreachable
     _handle_unop_Not = _unreachable
     _handle_unop_Reference = _unreachable
     _handle_unop_Clz = _unreachable

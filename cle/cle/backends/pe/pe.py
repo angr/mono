@@ -43,6 +43,23 @@ EFI_SUBSYSTEMS = frozenset(
     )
 )
 
+# .NET's ReadyToRun compiler exclusive-ors the COFF machine type with a constant naming the
+# target operating system when an image is published for something other than Windows, so that
+# the Windows loader refuses a file that is not for it. These are the values of
+# IMAGE_FILE_MACHINE_NATIVE_OS_OVERRIDE in the .NET runtime's src/coreclr/inc/pedecoder.h.
+READYTORUN_OS_OVERRIDES = {
+    "apple": 0x4644,
+    "freebsd": 0xADC4,
+    "linux": 0x7B79,
+    "netbsd": 0x1993,
+    "openbsd": 0xADC5,
+    "solaris": 0x1992,
+}
+
+IMAGE_COR20_HEADER_SIZE = 72
+IMAGE_COR20_MANAGED_NATIVE_HEADER_OFFSET = 64
+READYTORUN_SIGNATURE = b"RTR\0"
+
 log = logging.getLogger(name=__name__)
 
 
@@ -58,6 +75,61 @@ def image_os(optional_header: Any) -> str:
     """
 
     return "uefi" if optional_header.Subsystem in EFI_SUBSYSTEMS else "windows"
+
+
+def machine_type_name(pe: pefile.PE) -> str:
+    """
+    Name the COFF machine type of a PE the way archinfo expects it, undoing the operating system
+    override a .NET ReadyToRun image carries when it was published for a target other than
+    Windows.
+    """
+    assert pe.FILE_HEADER is not None
+    machine = pe.FILE_HEADER.Machine
+    if machine not in pefile.MACHINE_TYPE:
+        native = _readytorun_machine_type(pe)
+        if native is not None:
+            machine, target_os = native
+            log.info(
+                "ReadyToRun image published for %s: machine type %#x is %s overridden for that target",
+                target_os,
+                pe.FILE_HEADER.Machine,
+                pefile.MACHINE_TYPE[machine],
+            )
+    return pefile.MACHINE_TYPE.get(machine, hex(machine))
+
+
+def _readytorun_machine_type(pe: pefile.PE) -> tuple[int, str] | None:
+    """
+    Return the real machine type and the target operating system of a ReadyToRun image whose
+    COFF machine type carries an operating system override, or None for any other image.
+
+    A ReadyToRun image is a managed assembly whose CLR header points at a native header
+    beginning with the ReadyToRun signature.
+    """
+    assert pe.OPTIONAL_HEADER is not None
+    # NumberOfRvaAndSizes may be smaller than the sixteen directories the format defines, so the
+    # CLR header's directory is not always present in the array pefile parsed.
+    index = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR"]
+    if index >= len(pe.OPTIONAL_HEADER.DATA_DIRECTORY):
+        return None
+    com_dd = pe.OPTIONAL_HEADER.DATA_DIRECTORY[index]
+    if not com_dd.VirtualAddress or com_dd.Size < IMAGE_COR20_HEADER_SIZE:
+        return None
+    try:
+        cor20 = pe.get_data(com_dd.VirtualAddress, IMAGE_COR20_HEADER_SIZE)
+        native_header_rva = struct.unpack_from("<I", cor20, IMAGE_COR20_MANAGED_NATIVE_HEADER_OFFSET)[0]
+        if not native_header_rva:
+            return None
+        if pe.get_data(native_header_rva, len(READYTORUN_SIGNATURE)) != READYTORUN_SIGNATURE:
+            return None
+    except (pefile.PEFormatError, struct.error):
+        return None
+
+    for target_os, override in READYTORUN_OS_OVERRIDES.items():
+        machine = pe.FILE_HEADER.Machine ^ override
+        if machine and machine in pefile.MACHINE_TYPE:
+            return machine, target_os
+    return None
 
 
 class PE(Backend):
@@ -123,8 +195,7 @@ class PE(Backend):
         self.os = image_os(self._pe.OPTIONAL_HEADER)
 
         if self._arch is None:
-            machine_type = self._pe.FILE_HEADER.Machine
-            self.set_arch(archinfo.arch_from_id(pefile.MACHINE_TYPE.get(machine_type, hex(machine_type))))
+            self.set_arch(archinfo.arch_from_id(machine_type_name(self._pe)))
 
         self.mapped_base = self.linked_base = self._pe.OPTIONAL_HEADER.ImageBase
 
@@ -178,12 +249,14 @@ class PE(Backend):
         self.linking = "dynamic" if self.deps else "static"
         self.jmprel = self._get_jmprel()
         mapped_image = self._get_memory_mapped_image()
-        if self.max_addr - self.min_addr < len(mapped_image):
+        # max_addr is the last address the object covers, not one past it.
+        mapped_size = self.max_addr - self.min_addr + 1
+        if mapped_size < len(mapped_image):
             # we are loading more bytes than max_addr would allow (there is data at the end of the file that is not
             # covered by any sections), so we need to truncate mapped_image.
             # this is actually caused by PE.get_memory_mapped_image() not passing ignore_padding=True to
             # section.get_data().
-            mapped_image = mapped_image[: self.max_addr - self.min_addr]
+            mapped_image = mapped_image[:mapped_size]
         self.memory.add_backer(0, mapped_image)
 
         if debug_symbols or self.loader._load_debug_info:
@@ -191,12 +264,7 @@ class PE(Backend):
             if pdb_path:
                 self.load_symbols_from_pdb(pdb_path)
 
-        self.is_dotnet = (
-            self._pe.OPTIONAL_HEADER.DATA_DIRECTORY[
-                pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR"]
-            ].VirtualAddress
-            != 0
-        )
+        self.is_dotnet = self._meta_dd("IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR") is not None
 
     _pefile_cache = {}
 
@@ -226,7 +294,7 @@ class PE(Backend):
 
         assert pe.FILE_HEADER is not None
 
-        arch = archinfo.arch_from_id(pefile.MACHINE_TYPE[pe.FILE_HEADER.Machine])  # pylint:disable=no-member
+        arch = archinfo.arch_from_id(machine_type_name(pe))
         return arch == obj.arch
 
     #
@@ -299,6 +367,7 @@ class PE(Backend):
 
         mapped_data_lst: list[bytes] = [self._pe.header]
         mapped_data_len = len(self._pe.header)
+        image_end = mapped_data_len
         for sec in self._pe.sections:
             if sec.Misc_VirtualSize == 0 and sec.SizeOfRawData == 0:
                 # skip empty sections
@@ -338,6 +407,16 @@ class PE(Backend):
             sec_data = sec.get_data()
             mapped_data_lst.append(sec_data)
             mapped_data_len += len(sec_data)
+
+            if size == sec.SizeOfRawData:
+                # a section is mapped over its whole virtual size, and the part of it the file holds no raw data for
+                # is zero. A section the file cuts short is not this case: those bytes are unknown, not zero.
+                image_end = max(image_end, va_adj + sec.Misc_VirtualSize)
+
+        if mapped_data_len < image_end:
+            # the padding that precedes a section is what backs the previous one's virtual size, so the last section
+            # of all has nothing to back its own
+            mapped_data_lst.append(b"\x00" * (image_end - mapped_data_len))
 
         return b"".join(mapped_data_lst)
 
@@ -507,10 +586,22 @@ class PE(Backend):
         ptr_size = 8 if is_64 else 4
         return pe, base, is_64, ptr_size
 
-    def _meta_dd(self, name: str) -> pefile.Structure | None:
-        """Return a data directory entry if it has a nonzero VirtualAddress and Size, else None."""
+    def _meta_dd(self, name: str):
+        """
+        Return the named data directory entry if the image has one with a nonzero VirtualAddress and Size.
+
+        The return type is inferred rather than declared: pefile fills a data directory entry in from the format
+        string it parsed, so the pefile.Structure this used to promise declares neither VirtualAddress nor Size and
+        hides both from every caller.
+        """
         idx = pefile.DIRECTORY_ENTRY[name]
-        dd = self._pe.OPTIONAL_HEADER.DATA_DIRECTORY[idx]
+        data_directory = self._pe.OPTIONAL_HEADER.DATA_DIRECTORY
+        # NumberOfRvaAndSizes may be smaller than the 16 directories the format defines - EFI stub images
+        # commonly declare 6 - so pefile parses a short DATA_DIRECTORY. A directory past the end is absent,
+        # which means the same thing a zero VirtualAddress means.
+        if idx >= len(data_directory):
+            return None
+        dd = data_directory[idx]
         if dd.VirtualAddress and dd.Size:
             return dd
         return None
