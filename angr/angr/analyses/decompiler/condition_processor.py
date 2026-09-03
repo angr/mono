@@ -25,6 +25,7 @@ from .structurer_nodes import (
     ConditionNode,
     ContinueNode,
     EmptyBlockNotice,
+    IncompleteSwitchCaseHeadStatement,
     IncompleteSwitchCaseNode,
     LoopNode,
     MultiNode,
@@ -95,17 +96,22 @@ class AILExprIdAnnotation(claripy.Annotation):
 #
 
 
-def _op_with_unified_size(op, conv: Callable, operand0, operand1, ins_addr: int, ail_manager: Manager):
-    # ensure operand1 is of the same size as operand0
+def _op_with_unified_size(
+    op, conv: Callable, operand0, operand1, ins_addr: int, ail_manager: Manager, *, signed: bool = False
+):
     if isinstance(operand1, ailment.Expr.Const):
         # amazing - we do the easy thing here
         return op(conv(operand0, nobool=True, ins_addr=ins_addr), operand1.value)
     if operand1.bits == operand0.bits:
         return op(conv(operand0, nobool=True, ins_addr=ins_addr), conv(operand1, ins_addr=ins_addr))
-    # extension is required
-    assert operand1.bits < operand0.bits
-    operand1 = ailment.Expr.Convert(ail_manager.next_atom(), operand1.bits, operand0.bits, False, operand1)
-    return op(conv(operand0, nobool=True, ins_addr=ins_addr), conv(operand1, nobool=True, ins_addr=ins_addr))
+    # Claripy requires both shift operands to have the same width, while an AIL
+    # shift's result has the left operand's width.
+    if operand1.bits < operand0.bits:
+        operand1 = ailment.Expr.Convert(ail_manager.next_atom(), operand1.bits, operand0.bits, False, operand1)
+        return op(conv(operand0, nobool=True, ins_addr=ins_addr), conv(operand1, nobool=True, ins_addr=ins_addr))
+    operand0_wide = ailment.Expr.Convert(ail_manager.next_atom(), operand0.bits, operand1.bits, signed, operand0)
+    result = op(conv(operand0_wide, nobool=True, ins_addr=ins_addr), conv(operand1, nobool=True, ins_addr=ins_addr))
+    return claripy.Extract(operand0.bits - 1, 0, result)
 
 
 def _dummy_bvs(condition, condition_mapping, name_suffix="", must_bool=False):
@@ -224,7 +230,7 @@ _ail2claripy_op_mapping = {
         operator.lshift, conv, expr.operands[0], expr.operands[1], ia, am
     ),
     "Sar": lambda expr, conv, _, ia, am: _op_with_unified_size(
-        operator.rshift, conv, expr.operands[0], expr.operands[1], ia, am
+        operator.rshift, conv, expr.operands[0], expr.operands[1], ia, am, signed=True
     ),
     "Concat": lambda expr, conv, _, ia, *args: claripy.Concat(
         *[conv(operand, ins_addr=ia) for operand in expr.operands]
@@ -753,6 +759,38 @@ class ConditionProcessor:
 
     EXC_COUNTER = 1000
 
+    @staticmethod
+    def _is_unconditional_hcl_edge(src_block: ailment.Block, dst_block) -> bool:
+        """
+        Check whether every way out of a head-controlled-loop block reaches ``dst_block``.
+        """
+        terminal_stmt = src_block.statements[-1]
+        dst_is_indexed = isinstance(dst_block, (ailment.Block, MultiNode))
+        if (
+            not isinstance(terminal_stmt, ailment.Stmt.Jump)
+            or not isinstance(terminal_stmt.target, ailment.Expr.Const)
+            or terminal_stmt.target.value != dst_block.addr
+            or (dst_is_indexed and terminal_stmt.target_idx != dst_block.idx)
+        ):
+            return False
+
+        for stmt in src_block.statements[:-1]:
+            if isinstance(stmt, (ailment.Stmt.Jump, ailment.Stmt.Return, IncompleteSwitchCaseHeadStatement)):
+                return False
+            if not isinstance(stmt, ailment.Stmt.ConditionalJump):
+                continue
+            for target, target_idx in (
+                (stmt.true_target, stmt.true_target_idx),
+                (stmt.false_target, stmt.false_target_idx),
+            ):
+                if target is not None and (
+                    not isinstance(target, ailment.Expr.Const)
+                    or target.value != dst_block.addr
+                    or (dst_is_indexed and target_idx != dst_block.idx)
+                ):
+                    return False
+        return True
+
     def _extract_predicate(self, src_block, dst_block, edge_type) -> claripy.ast.Bool:
         if edge_type == "exception":
             # TODO: THIS IS ABSOLUTELY A HACK. AT THIS MOMENT YOU SHOULD NOT ATTEMPT TO MAKE SENSE OF EXCEPTION EDGES.
@@ -782,6 +820,8 @@ class ConditionProcessor:
 
         # sometimes the last statement is the conditional jump. sometimes it's the first statement of the block
         if isinstance(src_block, ailment.Block) and src_block.statements and is_head_controlled_loop_block(src_block):
+            if self._is_unconditional_hcl_edge(src_block, dst_block):
+                return claripy.true()
             last_stmt = next(
                 iter(stmt for stmt in src_block.statements[:-1] if isinstance(stmt, ailment.Stmt.ConditionalJump)), None
             )

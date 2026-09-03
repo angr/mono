@@ -64,6 +64,25 @@ if TYPE_CHECKING:
 l = logging.getLogger(name=__name__)
 
 
+def _conflicting_decodings(arch: archinfo.Arch, node: CFGNode, other: CFGNode) -> bool:
+    """
+    Check if node and other overlap and decode the bytes they share into different instructions. Breaking node where
+    other starts would then cut an instruction in half, so normalization has to leave both of them alone: one of the
+    two decodings is wrong, and normalize() cannot tell which one.
+    """
+
+    node_addr = get_real_address_if_arm(arch, node.addr)
+    other_addr = get_real_address_if_arm(arch, other.addr)
+    if not node_addr <= other_addr < node_addr + node.size:
+        return False
+    node_ins = [get_real_address_if_arm(arch, addr) for addr in node.instruction_addrs]
+    other_ins = [get_real_address_if_arm(arch, addr) for addr in other.instruction_addrs]
+    if not node_ins or not other_ins or other_addr not in node_ins[1:]:
+        return True
+    shared = node_ins[node_ins.index(other_addr) :]
+    return shared[: len(other_ins)] != other_ins[: len(shared)]
+
+
 class CFGBase(Analysis):
     """
     The base class for control flow graphs.
@@ -227,6 +246,9 @@ class CFGBase(Analysis):
         # a dict of mapping between function addresses and sets of jobs (include both future jobs and pending jobs)
         # a set is used to speed up the job removal procedure
         self._jobs_to_analyze_per_function = defaultdict(set)
+        # the subset of keys of _jobs_to_analyze_per_function whose job set is empty, maintained by
+        # _register_analysis_job() and _deregister_analysis_job()
+        self._functions_without_jobs = set()
         # addresses of functions that have been completely recovered (i.e. all of its blocks are identified) so far
         self._completed_functions = set()
 
@@ -358,6 +380,7 @@ class CFGBase(Analysis):
         """
 
         self._jobs_to_analyze_per_function = defaultdict(set)
+        self._functions_without_jobs = set()
         self._completed_functions = set()
 
     def _function_completed(self, func_addr: int):
@@ -873,9 +896,20 @@ class CFGBase(Analysis):
                         memory_regions.append((region_addr, region_addr + region_size))
 
             elif isinstance(b, Blob):
-                # a blob is entirely executable
-                tpl = (b.min_addr, b.max_addr + 1)
-                memory_regions.append(tpl)
+                if all(segment.is_executable for segment in b.segments):
+                    # a raw image carries no permissions and every segment answers the permissive default,
+                    # so the blob is entirely executable
+                    tpl = (b.min_addr, b.max_addr + 1)
+                    memory_regions.append(tpl)
+                else:
+                    # the blob was cut out of something that recorded its permissions, such as a core dump
+                    for segment in b.segments:
+                        if not segment.is_executable:
+                            continue
+                        # a segment can be longer than the bytes the blob actually holds
+                        max_mapped_addr = min(segment.min_addr + min(segment.memsize, segment.filesize), b.max_addr + 1)
+                        if max_mapped_addr > segment.min_addr:
+                            memory_regions.append((segment.min_addr, max_mapped_addr))
 
             elif isinstance(b, NamedRegion):
                 # NamedRegions have no content! Ignore
@@ -1296,7 +1330,8 @@ class CFGBase(Analysis):
 
     def normalize(self):
         """
-        Normalize the CFG, making sure that there are no overlapping basic blocks.
+        Normalize the CFG, making sure that there are no overlapping basic blocks. self.normalized is set only if
+        every overlapping block was split; blocks that cannot be split leave the CFG unnormalized.
 
         Note that this method will not alter transition graphs of each function in self.kb.functions. You may call
         normalize() on each Function object to normalize their transition graphs.
@@ -1306,6 +1341,7 @@ class CFGBase(Analysis):
 
         graph = self.graph
 
+        unsplittable_pairs = 0
         smallest_nodes = {}  # indexed by end address of the node
         end_addr_to_node = {}  # a dictionary from node key to node *if* only one node exists for the key
         end_addr_to_nodes = defaultdict(list)  # a dictionary from node key to nodes *if* more than one node exist
@@ -1347,13 +1383,14 @@ class CFGBase(Analysis):
                 smallest_node = all_nodes[0]  # take the one that has the highest address
                 other_nodes = all_nodes[1:]
 
-                self._normalize_core(
+                unsplittable_pairs += self._normalize_core(
                     graph, callstack_key, smallest_node, other_nodes, smallest_nodes, end_addr_to_nodes
                 )
 
                 del end_addr_to_nodes[key_to_find]
-                # make sure the smallest node is stored in end_addresses
-                smallest_nodes[key_to_find] = smallest_node
+                # make sure the smallest node is stored in smallest_nodes under its own end address: the corner case
+                # below re-queues nodes that end at different addresses under the same key
+                smallest_nodes[smallest_node.addr + smallest_node.size, callstack_key] = smallest_node
 
                 # corner case
                 # sometimes two overlapping blocks may not end at the instruction. this might happen when one of the
@@ -1375,18 +1412,16 @@ class CFGBase(Analysis):
                                 break
                             next_node = lst[i + 1]
                             if node is not next_node and node.addr <= next_node.addr < node.addr + node.size:
-                                # umm, those nodes are overlapping, but they must have different end addresses
+                                # umm, those nodes are overlapping
                                 nodekey_a = node.addr + node.size, callstack_key
                                 nodekey_b = next_node.addr + next_node.size, callstack_key
-                                if nodekey_a == nodekey_b:
-                                    # error handling: this will only happen if we have completely overlapping nodes
-                                    # caused by different jumps (one of the jumps is probably incorrect), which usually
-                                    # indicates an error in CFG recovery. we print a warning and skip this node
-                                    l.warning(
-                                        "Found completely overlapping nodes %s. It usually indicates an error in CFG "
-                                        "recovery. Skip.",
+                                if _conflicting_decodings(self.project.arch, node, next_node):
+                                    l.debug(
+                                        "Cannot break %s where %s starts: they decode into different instructions.",
                                         node,
+                                        next_node,
                                     )
+                                    unsplittable_pairs += 1
                                     continue
 
                                 if nodekey_a in smallest_nodes and nodekey_b in smallest_nodes:
@@ -1400,7 +1435,13 @@ class CFGBase(Analysis):
                                 smallest_nodes.pop(nodekey_a, None)
                                 smallest_nodes.pop(nodekey_b, None)
 
-        self.normalized = True
+        if unsplittable_pairs:
+            l.warning(
+                "%d pairs of overlapping nodes decode into different instructions and could not be split. It usually "
+                "indicates an error in CFG recovery.",
+                unsplittable_pairs,
+            )
+        self.normalized = not unsplittable_pairs
 
     def _normalize_core(
         self,
@@ -1410,12 +1451,23 @@ class CFGBase(Analysis):
         other_nodes,
         smallest_nodes,
         end_addr_to_nodes,
-    ):
+    ) -> int:
+        smallest_addr = get_real_address_if_arm(self.project.arch, smallest_node.addr)
+        unsplittable_pairs = 0
+        splittable_nodes = []
+        for n in other_nodes:
+            if get_real_address_if_arm(self.project.arch, n.addr) != smallest_addr and _conflicting_decodings(
+                self.project.arch, n, smallest_node
+            ):
+                l.debug("Cannot break %s where %s starts: they decode into different instructions.", n, smallest_node)
+                unsplittable_pairs += 1
+                continue
+            splittable_nodes.append(n)
+        other_nodes = splittable_nodes
+
         # Break other nodes
         for n in other_nodes:
-            new_size = get_real_address_if_arm(self.project.arch, smallest_node.addr) - get_real_address_if_arm(
-                self.project.arch, n.addr
-            )
+            new_size = smallest_addr - get_real_address_if_arm(self.project.arch, n.addr)
             if new_size == 0:
                 # This node has the same size as the smallest one. Don't touch it.
                 continue
@@ -1567,6 +1619,8 @@ class CFGBase(Analysis):
                 if n.addr in self.indirect_jumps:
                     del self.indirect_jumps[n.addr]
 
+        return unsplittable_pairs
+
     #
     # Job management
     #
@@ -1583,6 +1637,7 @@ class CFGBase(Analysis):
         """
 
         self._jobs_to_analyze_per_function[func_addr].add(job)
+        self._functions_without_jobs.discard(func_addr)
 
     def _deregister_analysis_job(self, func_addr, job):
         """
@@ -1593,25 +1648,23 @@ class CFGBase(Analysis):
         :return:              None
         """
 
-        self._jobs_to_analyze_per_function[func_addr].discard(job)
+        jobs = self._jobs_to_analyze_per_function[func_addr]
+        jobs.discard(job)
+        if not jobs:
+            self._functions_without_jobs.add(func_addr)
 
     def _get_finished_functions(self):
         """
         Obtain all functions of which we have finished analyzing. As _jobs_to_analyze_per_function is a defaultdict(),
         if a function address shows up in it with an empty job list, we consider we have exhausted all jobs of this
         function (both current jobs and pending jobs), thus the analysis of this function is done.
+        _functions_without_jobs holds exactly those addresses.
 
         :return: a list of function addresses of that we have finished analysis.
         :rtype:  list
         """
 
-        finished_func_addrs = []
-        for func_addr, all_jobs in self._jobs_to_analyze_per_function.items():
-            if not all_jobs:
-                # great! we have finished analyzing this function!
-                finished_func_addrs.append(func_addr)
-
-        return finished_func_addrs
+        return list(self._functions_without_jobs)
 
     def _cleanup_analysis_jobs(self, finished_func_addrs=None):
         """
@@ -1629,6 +1682,9 @@ class CFGBase(Analysis):
         for func_addr in finished_func_addrs:
             if func_addr in self._jobs_to_analyze_per_function:
                 del self._jobs_to_analyze_per_function[func_addr]
+        # rebuilt, not discarded in place, so that the set does not keep a hash table sized to its
+        # high-water mark for the rest of the analysis
+        self._functions_without_jobs = self._functions_without_jobs.difference(finished_func_addrs)
 
     def _make_completed_functions(self):
         """
@@ -3147,7 +3203,15 @@ class CFGBase(Analysis):
         all_targets = set()
         idx: int
         jump: IndirectJump
-        for idx, jump in enumerate(self._indirect_jumps_to_resolve):
+        # IndirectJump has no __hash__, so the set iterates its members in the order their objects happen to sit
+        # in memory. Resolving one jump occupies bytes and builds blocks that the next resolver reads, so that
+        # order decides the answer. self.indirect_jumps records every jump in the order the scan reached it;
+        # follow that, and fall back to the address for anything not registered there.
+        discovered = {id(ij): order for order, ij in enumerate(self.indirect_jumps.values())}
+        pending = sorted(
+            self._indirect_jumps_to_resolve, key=lambda ij: (discovered.get(id(ij), len(discovered)), ij.addr)
+        )
+        for idx, jump in enumerate(pending):
             if self._low_priority:
                 self._release_gil(idx, 50, 0.000001)
             all_targets |= self._process_one_indirect_jump(jump)
