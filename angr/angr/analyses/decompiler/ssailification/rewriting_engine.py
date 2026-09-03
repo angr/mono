@@ -522,10 +522,18 @@ class SimEngineSSARewriting(
             else:
                 new_operands.append(operand)
 
+        guard_in = expr.guard
         new_guard = None
-        if expr.guard is not None:
-            new_guard = self._expr(expr.guard)
+        if guard_in is not None:
+            new_guard = self._expr(guard_in)
             if new_guard is not None:
+                updated = True
+
+        maddr_in = expr.maddr
+        new_maddr = None
+        if maddr_in is not None:
+            new_maddr = self._expr(maddr_in)
+            if new_maddr is not None:
                 updated = True
 
         if updated:
@@ -533,9 +541,9 @@ class SimEngineSSARewriting(
                 expr.idx,
                 expr.callee,
                 new_operands,
-                guard=new_guard,
+                guard=new_guard if new_guard is not None else guard_in,
                 mfx=expr.mfx,
-                maddr=expr.maddr,
+                maddr=new_maddr if new_maddr is not None else maddr_in,
                 msize=expr.msize,
                 bits=expr.bits,
                 **expr.tags,
@@ -830,6 +838,7 @@ class SimEngineSSARewriting(
     def _unreachable(self, *args, **kwargs):
         assert False
 
+    _handle_binop_Default = _unreachable
     _handle_binop_Add = _unreachable
     _handle_binop_AddF = _unreachable
     _handle_binop_AddV = _unreachable
@@ -892,6 +901,7 @@ class SimEngineSSARewriting(
     _handle_unop_BitwiseNeg = _unreachable
     _handle_unop_Dereference = _unreachable
     _handle_unop_Neg = _unreachable
+    _handle_unop_Default = _unreachable
     _handle_unop_Not = _unreachable
     _handle_unop_Reference = _unreachable
     _handle_unop_Clz = _unreachable

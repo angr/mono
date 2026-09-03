@@ -8,14 +8,23 @@ import io
 import logging
 import os
 import random
+import struct
+import tempfile
 import unittest
+from unittest import mock
 
 import archinfo
+from archinfo.arch_arm import is_arm_arch
+from elftools.elf.elffile import ELFFile
 
 import angr
+from angr.analyses.cfg.cfg_fast import CFGFast
 from angr.analyses.cfg.indirect_jump_resolvers import mips_elf_fast
-from angr.codenode import FuncNode
+from angr.codenode import BlockNode, FuncNode
 from angr.knowledge_plugins.cfg import CFGModel, CFGNode
+from angr.knowledge_plugins.cfg.indirect_jump import IndirectJump
+from angr.knowledge_plugins.cfg.memory_data import MemoryDataSort
+from angr.utils.constants import DEFAULT_STATEMENT
 from tests.common import bin_location, broken
 
 l = logging.getLogger("angr.tests.test_cfgfast")
@@ -111,6 +120,18 @@ class TestCfgfast(unittest.TestCase):
         function_features = {}
 
         self.cfg_fast_functions_check("x86_64", "cfg_0_pe", functions, function_features)
+
+    def test_printable_string_that_reaches_the_end_of_a_region(self):
+        # The last 32 bytes of .text are newlib's blanks[16] + zeroes[16]; .text ends at
+        # 0x8007484, where .ARM.exidx begins, so this string is not null-terminated.
+        path = os.path.join(test_location, "armel", "libopencm3_adc-dac-printf.elf")
+        proj = angr.Project(path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True, data_references=True)
+
+        data = cfg.model.memory_data[0x8007464]
+        assert data.sort == MemoryDataSort.String
+        assert data.size == 32
+        assert data.content == b" " * 16 + b"0" * 16
 
     def test_arm_function_merge(self):
         # function 0x7bb88 is created due to a data hint in another block. this function should be merged with the
@@ -488,6 +509,34 @@ class TestCfgfast(unittest.TestCase):
     #
 
     # For test cases for jump table resolver, please refer to test_jumptables.py
+
+    def test_pending_indirect_jumps_are_resolved_in_discovery_order(self):
+        # pylint:disable=protected-access
+        # resolving one indirect jump builds blocks and occupies bytes that the next resolver reads, so the order
+        # they come out of the pending collection decides the answer and must not depend on where their objects
+        # happen to sit in memory
+        path = os.path.join(test_location, "x86_64", "fauxware")
+        proj = angr.Project(path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast()
+
+        addresses = [0x400000 + ((index * 0x2801) % 0x10000) for index in range(64)]
+        assert addresses != sorted(addresses)
+        cfg.indirect_jumps.clear()
+        for addr in addresses:
+            cfg.indirect_jumps[addr] = IndirectJump(addr, addr, 0x400000, "Ijk_Boring", DEFAULT_STATEMENT)
+        cfg._indirect_jumps_to_resolve = set(cfg.indirect_jumps.values())
+
+        resolved = []
+
+        def record(jump, func_graph_complete=True):  # pylint:disable=unused-argument
+            resolved.append(jump.addr)
+            return set()
+
+        cfg._process_one_indirect_jump = record
+        cfg._process_unresolved_indirect_jumps()
+
+        assert resolved == addresses
+        assert not cfg._indirect_jumps_to_resolve
 
     def test_resolve_x86_elf_pic_plt(self):
         path = os.path.join(test_location, "i386", "fauxware_pie")
@@ -1002,6 +1051,83 @@ class TestCfgfast(unittest.TestCase):
         for addr in not_separate_functions:
             assert addr not in cfg.kb.functions, f"{hex(addr)} should not be a separate function"
 
+    def test_x86_ud2_is_not_scanned_into(self):
+        # VEX does not decode ud2 under 32-bit x86, so _generate_cfgnode has to recognize it from the
+        # bytes after the block it could decode. It looked for them in the lifted block, which by then
+        # holds exactly the bytes VEX consumed, so the check never fired: one byte was marked
+        # undecodable and the linear scan seeded a function on the second byte of the ud2.
+        path = os.path.join(test_location, "i386", "ld-linux.so.2")
+        proj = angr.Project(path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+
+        assert proj.loader.memory.load(0x41211E, 2) == b"\x0f\x0b"
+        assert cfg.model.get_any_node(0x41211F) is None
+        assert 0x41211F not in cfg.kb.functions
+        # the block before the ud2 keeps every instruction it had
+        node = cfg.model.get_any_node(0x412114)
+        assert node is not None
+        assert list(node.instruction_addrs) == [0x412114, 0x41211A, 0x41211C]
+
+    @staticmethod
+    def _nodes_ending_mid_instruction(proj: angr.Project, model: CFGModel) -> set[tuple[int, int]]:
+        # address and size of every node whose last instruction runs past the end of the node. Instruction addresses
+        # at or past the end of a node are not part of it: VEX records one there for an instruction it could not
+        # decode.
+        truncated = set()
+        for n in model.nodes():
+            if n.is_simprocedure:
+                continue
+            end_addr = n.addr + n.size
+            covered = [i for i in n.instruction_addrs if i < end_addr]
+            if not covered:
+                continue
+            last_addr = covered[-1]
+            last_size = proj.factory.block(last_addr, num_inst=1).size
+            assert last_size is not None
+            if last_addr + last_size > end_addr:
+                truncated.add((n.addr, n.size))
+        return truncated
+
+    def test_normalize_keeps_blocks_whose_decodings_conflict(self):
+        # 0x16808 holds three ARM instructions that a Thumb decoding of the same bytes overlaps. normalize() used to
+        # break the ARM block two bytes into its first instruction to make room for the Thumb block.
+        path = os.path.join(test_location, "armel", "sha224sum")
+        proj = angr.Project(path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+
+        node = cfg.model.get_any_node(0x16808)
+        assert node is not None
+        assert node.size == 12
+        assert list(node.instruction_addrs) == [0x16808, 0x1680C, 0x16810]
+
+        # block recovery can end a node in the middle of an instruction on its own, so the nodes that come out of
+        # normalization are compared against the ones recovery produces when normalize() never runs
+        recovery_proj = angr.Project(path, auto_load_libs=False)
+        recovered = recovery_proj.analyses.CFGFast(normalize=False)
+        cut_by_normalization = self._nodes_ending_mid_instruction(proj, cfg.model) - self._nodes_ending_mid_instruction(
+            recovery_proj, recovered.model
+        )
+        assert not cut_by_normalization, (
+            f"normalize() cut instructions in half at {sorted(hex(addr) for addr, _ in cut_by_normalization)}"
+        )
+
+    def test_normalize_reports_unnormalized_cfg_when_blocks_cannot_be_split(self):
+        # the packed code decodes some bytes in more than one way, so normalize() cannot remove every overlap here
+        path = os.path.join(test_location, "i386", "packed_elf32")
+        proj = angr.Project(path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+
+        # the block at 0xc0154a ends at 0xc01555, and so does a block starting at 0xc01553, three bytes into the
+        # six-byte instruction at 0xc0154f. normalize() used to break the first block there.
+        node = cfg.model.get_any_node(0xC0154A)
+        assert node is not None
+        assert node.size == 11
+        assert list(node.instruction_addrs) == [0xC0154A, 0xC0154C, 0xC0154F]
+
+        nodes = sorted((n for n in cfg.model.nodes() if not n.is_simprocedure), key=lambda n: n.addr)
+        assert any(a.addr < b.addr < a.addr + a.size for a, b in zip(nodes, nodes[1:]))
+        assert not cfg.normalized
+
     @staticmethod
     def _blob_project(data: bytes, arch: str | archinfo.Arch = "AMD64") -> angr.Project:
         return angr.Project(
@@ -1027,7 +1153,7 @@ class TestCfgfast(unittest.TestCase):
         # scan used to cover it with thousands of one-block functions that drop_bad_functions() threw away again
         rng = random.Random(0xDEADBEEF)
         proj = self._blob_project(bytes(rng.getrandbits(8) for _ in range(32768)))
-        cfg = proj.analyses.CFGFast(normalize=True, nodecode_threshold=0.3)
+        cfg = proj.analyses.CFGFast(normalize=True)
 
         assert len(cfg.kb.functions) < 150, f"32 KB of random data produced {len(cfg.kb.functions)} functions"
 
@@ -1140,6 +1266,273 @@ class TestCfgfast(unittest.TestCase):
         assert block_size(4096, repeating_byte_run_threshold=0) == 99
         # nops are exempt at any length: a nop run is transparent, execution really does flow through it
         assert block_size(4096, filler=b"\x90") is not None
+
+    def test_fresh_model_rebuilds_function_graphs(self):
+        project = angr.Project(os.path.join(test_location, "armel", "libsoap.so"), auto_load_libs=False)
+        original_post_analysis = CFGFast._post_analysis  # pylint: disable=protected-access
+        observed_block_sizes = []
+
+        def observe_before_normalization(cfg):
+            function = cfg.functions[0x4066C8]
+            observed_block_sizes.append(
+                sorted(node.size for node in function.graph if isinstance(node, BlockNode) and node.addr == 0x4066EC)
+            )
+            return original_post_analysis(cfg)
+
+        with mock.patch.object(CFGFast, "_post_analysis", observe_before_normalization):
+            for _ in range(2):
+                cfg = project.analyses.CFGFast(
+                    normalize=True,
+                    regions=[(0x4066C8, 0x40676C)],
+                    function_starts=[0x4066C8],
+                )
+                self.assertTrue(cfg.functions[0x4066C8].normalized)
+
+        self.assertEqual(observed_block_sizes, [[28], [28]])
+
+    def test_fresh_model_invalidates_function_graph_caches(self):
+        project = angr.Project(os.path.join(test_location, "armel", "libsoap.so"), auto_load_libs=False)
+        function_addr = 0x4066C8
+        first = project.analyses.CFGFast(
+            normalize=False,
+            regions=[(function_addr, 0x406710)],
+            function_starts=[function_addr],
+        )
+        function = first.functions[function_addr]
+        first_complexity = function.cyclomatic_complexity
+        original_post_analysis = CFGFast._post_analysis  # pylint: disable=protected-access
+        observed = {}
+
+        def observe_rebuilt_graph(cfg):
+            rebuilt_function = cfg.functions[function_addr]
+            observed["same_function"] = rebuilt_function is function
+            observed["formula"] = (
+                rebuilt_function.transition_graph.number_of_edges()
+                - rebuilt_function.transition_graph.number_of_nodes()
+                + 2
+            )
+            observed["complexity"] = rebuilt_function.cyclomatic_complexity
+            return original_post_analysis(cfg)
+
+        with mock.patch.object(CFGFast, "_post_analysis", observe_rebuilt_graph):
+            project.analyses.CFGFast(
+                normalize=False,
+                regions=[(function_addr, 0x40676C)],
+                function_starts=[function_addr],
+            )
+
+        self.assertTrue(observed["same_function"])
+        self.assertNotEqual(first_complexity, observed["formula"])
+        self.assertEqual(observed["complexity"], observed["formula"])
+
+    def test_cfgfast_relocatable_object_with_alignment_hole(self):
+        # GitHub issue #6766. A relocatable object has no segments, so cle maps it one section at a time and
+        # aligns each section the way a linker would. That leaves a hole in front of every section whose
+        # alignment reaches past the end of the one before it. The hole sits inside the object's own
+        # min_addr/max_addr span with nothing behind it, so a call that is the last instruction of a section
+        # returns into unmapped memory. CFGFast recorded the hole as that call's return site and later died
+        # turning it into a code snippet: "No bytes in memory for block starting at ...".
+        #
+        # x86_64/decompiler/uname.o from the angr/binaries repository already has that layout, but the call
+        # that ends .text.startup goes to an external symbol, which angr hooks and therefore already knows
+        # returns. Shrinking .text.startup so it stops right after "call print_element" instead -- one field
+        # of one section header, no other byte touched -- reproduces the real shape: a section that ends on a
+        # call to a local function whose returning status is only settled after the scan.
+        section_name = ".text.startup"
+        call_site = 0x400C32
+
+        path = os.path.join(test_location, "x86_64", "decompiler", "uname.o")
+        pristine = angr.Project(path, auto_load_libs=False)
+        section = pristine.loader.main_object.sections_map[section_name]
+        call = pristine.factory.block(call_site)
+        assert call.vex.jumpkind == "Ijk_Call"
+        (callee,) = call.vex.constant_jump_targets
+        assert pristine.loader.main_object.min_addr <= callee < pristine.loader.main_object.max_addr
+
+        with open(path, "rb") as fixture:
+            elf = ELFFile(fixture)
+            index = next(i for i, s in enumerate(elf.iter_sections()) if s.name == section_name)
+            # sh_size is at offset 0x20 of an Elf64_Shdr
+            size_field = elf["e_shoff"] + index * elf["e_shentsize"] + 0x20
+            fixture.seek(0)
+            patched = bytearray(fixture.read())
+        struct.pack_into("<Q", patched, size_field, call.addr + call.size - section.vaddr)
+
+        with tempfile.TemporaryDirectory() as directory:
+            binary = os.path.join(directory, "uname.o")
+            with open(binary, "wb") as fp:
+                fp.write(patched)
+            proj = angr.Project(binary, auto_load_libs=False)
+
+            section = proj.loader.main_object.sections_map[section_name]
+            hole = section.vaddr + section.memsize
+            assert hole == call.addr + call.size
+            assert proj.loader.main_object.min_addr < hole < proj.loader.main_object.max_addr
+            assert hole not in proj.loader.memory
+
+            cfg = proj.analyses.CFGFast(normalize=True)
+
+            call_node = cfg.model.get_any_node(call_site)
+            assert call_node is not None
+            caller = cfg.kb.functions.get_by_addr(call_node.function_address)
+            assert call_site in set(caller.get_call_sites())
+            assert caller.get_call_return(call_site) is None
+            assert cfg.model.get_any_node(hole, anyaddr=True) is None
+            assert all(node.addr != hole for node in caller.transition_graph)
+
+    def test_function_ending_in_an_undefined_instruction_is_kept(self):
+        # split-rust is stripped, so no symbol names these three functions, and the ud2 that ends each one is
+        # reached by a jump inside the function rather than as the fall-through of a call. Each is a real
+        # 200-300 byte function that drop_bad_functions() deletes outright, reading the ud2 that rustc emits
+        # for an unreachable path as the function running into data.
+        proj = angr.Project(os.path.join(test_location, "x86_64", "split-rust"), auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+
+        for addr in (0x501610, 0x5019B0, 0x501B20):
+            assert addr in cfg.kb.functions, f"{addr:#x} was dropped"
+            assert cfg.model.get_any_node(addr) is not None, f"no block covers {addr:#x}"
+
+    def test_msvc_function_ending_in_a_noreturning_call_is_kept(self):
+        # each of these five ends in a call MSVC treats as non-returning, and the block CFGFast recovers past
+        # that call is the single int3 MSVC leaves there. drop_bad_functions() used to read the run of int3
+        # padding that follows as the function running into data and delete the whole function; the image's own
+        # exception directory names all five.
+        proj = angr.Project(os.path.join(test_location, "x86_64", "windows", "ipnathlp.dll"), auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+
+        for addr in (0x180004D20, 0x18001A3EC, 0x18001FDFC, 0x180024064, 0x180024080):
+            assert addr in cfg.kb.functions, f"{addr:#x} was dropped"
+            assert cfg.model.get_any_node(addr) is not None, f"no block covers {addr:#x}"
+        # the one-block int3 the linear scan picked up out of the padding is still not a function
+        assert 0x180004681 not in cfg.kb.functions
+
+    def test_ppc64_function_ending_in_a_noreturning_call_is_kept(self):
+        # rejected(): puts() and then exit(). Its .opd descriptor at 0x10010e20 puts it at 0x100007bc with a
+        # size of 60, so all three blocks below are inside it. GCC emits the TOC restore after the bl to exit()
+        # and pads the rest of the section with zeroes, so the block past that call runs into bytes that do not
+        # decode -- which said nothing about the function, and cost it all three blocks.
+        proj = angr.Project(os.path.join(test_location, "ppc64", "fauxware"), auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+
+        assert 0x100007BC in cfg.kb.functions
+        assert {0x100007BC, 0x100007DC, 0x100007E8} <= cfg.kb.functions[0x100007BC].block_addrs_set
+
+    def test_function_starting_inside_an_instruction_is_the_one_dropped(self):
+        # 0x4249f4 is where the prologue scan landed inside the `mov dword ptr [esp + 0x50], edx` at 0x4249f1,
+        # so drop_bad_functions() collects it. The deletion then ran on the wrong address and took 0x424cc0,
+        # an ordinary `push edi; call ...` entry, with it.
+        path = os.path.join(
+            test_location,
+            "x86_64",
+            "windows",
+            "50e5f670700243535f8ff558831dbbc314b215092f523355aa7a1c26205ece37",
+        )
+        proj = angr.Project(path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+
+        assert 0x4249F4 not in cfg.kb.functions
+        assert 0x424CC0 in cfg.kb.functions
+
+    def test_cfg_does_not_decode_an_object_cle_invented(self):
+        # cle##externs holds no file content, so an address in it that nothing is hooked at is
+        # zero fill: decoding it yields blocks until the object runs out. Packing the objects
+        # together puts it directly above the image, which is where this blob's recovery runs off
+        # the end into it.
+        path = os.path.join(test_location, "armel", "i2c_api.o")
+        proj = angr.Project(
+            path,
+            auto_load_libs=False,
+            main_opts={"backend": "blob", "arch": "ARMEL", "base_addr": 0x1000},
+            rebase_granularity=1,
+        )
+        extern = proj.loader.extern_object
+        assert extern.min_addr == proj.loader.main_object.max_addr + 1
+
+        cfg = proj.analyses.CFGFast(normalize=True)
+
+        image = [n for n in cfg.model.nodes() if n.addr <= proj.loader.main_object.max_addr]
+        invented = [
+            n for n in cfg.model.nodes() if extern.min_addr <= n.addr <= extern.max_addr and not proj.is_hooked(n.addr)
+        ]
+        assert image
+        assert not invented, f"{len(invented)} blocks decoded out of {extern}: {invented[:3]}"
+
+    def test_dropping_a_bad_function_keeps_the_blocks_another_function_owns(self):
+        # drop_bad_functions() drops 0x46cd99: it does not return, it has three blocks, and the last of them
+        # has no successors and is followed by alignment padding. That last block is 0x46cdb0, the fall-through
+        # of the call at 0x46cdab, and it is also the entire body of core::slice::iter::Iter::size_hint, which
+        # the binary's own symbol table names. Removing the dropped function's CFG nodes took the named
+        # function with it.
+        proj = angr.Project(os.path.join(test_location, "x86_64", "decompiler", "fmt_rust"), auto_load_libs=False)
+        cfg = proj.analyses.CFGFast()
+
+        assert 0x46CD99 not in cfg.kb.functions
+        assert cfg.model.get_any_node(0x46CD99) is None
+        assert 0x46CDB0 in cfg.kb.functions
+        assert cfg.kb.functions.get_by_addr(0x46CDB0).block_addrs_set == {0x46CDB0}
+        assert cfg.model.get_any_node(0x46CDB0) is not None
+
+    def test_arm_overlapping_blocks_survive_a_rescan_that_drops_blocks(self):
+        # _remove_redundant_overlapping_blocks() walks a snapshot of the graph's node keys, and rescans the leftover
+        # of every block it truncates. That rescan invalidates decoding assumptions and drops the blocks that rest on
+        # them, so a key in the snapshot can stop naming a node of the graph before the walk reaches it.
+        proj = angr.Project(os.path.join(test_location, "armel", "libc.so.6"), auto_load_libs=False)
+        cfg = proj.analyses.CFGFast()
+
+        assert len(cfg.kb.functions) > 1000, f"CFGFast recovered only {len(cfg.kb.functions)} functions"
+
+    def test_riscv_scanning_resumes_after_an_undecodable_instruction(self):
+        # VEX cannot lift the feq.s at 0x402390. The scan must resume after all four of its bytes; resuming at the
+        # next halfword instead recovers 0x402392, two bytes into that instruction, as an instruction of its own.
+        proj = angr.Project(os.path.join(test_location, "riscv", "autotalent-autotalent.so"), auto_load_libs=False)
+        cfg = proj.analyses.CFGFast()
+        ins_addrs = {ins_addr for node in cfg.model.nodes() for ins_addr in node.instruction_addrs}
+
+        assert 0x402392 not in ins_addrs, "0x402392 is two bytes into the instruction at 0x402390"
+        assert 0x402394 in ins_addrs, "the scan did not resume at 0x402394"
+
+    def test_symbol_exemption_covers_the_blocks_removal_deletes(self):
+        # Removing a function deletes every block of it, not just its entry, so the exemption above is tested
+        # against the blocks: a static function the scan merged into its neighbour, or a symbol-named tail the
+        # boundary pass has not split yet, is named evidence that removal destroys just as completely.
+        proj = angr.Project(os.path.join(test_location, "x86_64", "fauxware"), auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+
+        func = cfg.kb.functions["main"]
+        blocks: list[tuple[int, int]] = []
+        for block_addr in func.block_addrs_set:
+            node = cfg.model.get_any_node(block_addr)
+            if node is None or not node.size:
+                continue
+            assert isinstance(node.addr, int)
+            blocks.append((node.addr, node.size))
+        blocks.sort()
+        assert len(blocks) > 1
+        entry_addr = blocks[0][0]
+        last_addr, last_size = blocks[-1]
+
+        names_a_symbol = cfg._body_names_a_symbol  # pylint:disable=protected-access
+        assert not names_a_symbol(func, [])
+        assert names_a_symbol(func, [entry_addr])
+        # Named only in the last block: what the entry test cannot see and removal deletes anyway.
+        assert names_a_symbol(func, [last_addr])
+        assert names_a_symbol(func, [last_addr + last_size - 1])
+        # Just outside the body on either side.
+        assert not names_a_symbol(func, [entry_addr - 1])
+        assert not names_a_symbol(func, [last_addr + last_size])
+
+    def test_cfgfast_on_a_pcode_arm_architecture(self):
+        # is_arm_arch() answers True for a p-code ARM language as well as for the three VEX ARM architectures,
+        # so CFGFast runs its ARM handling for one, and everything that handling reads has to be answerable.
+        path = os.path.join(test_location, "armel", "fauxware")
+        proj = angr.Project(path, arch=archinfo.ArchPcode("ARM:LE:32:v7"), auto_load_libs=False)
+        assert is_arm_arch(proj.arch)
+
+        cfg = proj.analyses.CFGFast(normalize=True)
+
+        for name in ("main", "authenticate", "accepted", "rejected"):
+            assert name in cfg.kb.functions, f"{name} was not recovered"
+            assert cfg.kb.functions[name].block_addrs_set, f"{name} was recovered with no blocks"
 
 
 if __name__ == "__main__":

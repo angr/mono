@@ -1,6 +1,7 @@
 # pylint:disable=missing-class-docstring,too-many-boolean-expressions,unused-argument,no-self-use,protected-access
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import struct
@@ -1048,15 +1049,37 @@ class CStatements(CStatement):
         self.addr = addr
 
     def c_repr_chunks(self, indent=0, asexpr=False):
+        yield from self._c_repr_chunks(indent=indent, asexpr=asexpr, terminate_trailing_label=True)
+
+    def _c_repr_chunks(self, indent=0, asexpr=False, *, terminate_trailing_label):
         indent_str = self.indent_str(indent)
         if self.codegen.display_block_addrs:
             yield indent_str, None
             yield f"/* Block {hex(self.addr) if self.addr is not None else 'unknown'} */", None
             yield "\n", None
         for stmt in self.statements:
-            yield from stmt.c_repr_chunks(indent=indent, asexpr=asexpr)
+            if isinstance(stmt, CStatements):
+                # CStatements may be a transparent sequence nested inside another sequence. A label at the end of
+                # the inner sequence still labels the next statement in the outer sequence.
+                yield from stmt._c_repr_chunks(indent=indent, asexpr=asexpr, terminate_trailing_label=False)
+            else:
+                yield from stmt.c_repr_chunks(indent=indent, asexpr=asexpr)
             if asexpr:
                 yield ", ", None
+        if not asexpr and terminate_trailing_label and isinstance(self._last_nonempty_statement(), CLabel):
+            # A C label prefixes a statement; it is not a complete statement itself. Finish it only at the boundary
+            # of the enclosing sequence, after looking through transparent nested sequences.
+            yield indent_str, None
+            yield ";\n", None
+
+    def _last_nonempty_statement(self) -> CStatement | None:
+        for stmt in reversed(self.statements):
+            if isinstance(stmt, CStatements):
+                stmt = stmt._last_nonempty_statement()
+                if stmt is None:
+                    continue
+            return stmt
+        return None
 
 
 class CAILBlock(CStatement):
@@ -2133,11 +2156,18 @@ class CUnaryOp(CExpression):
         if handler is not None:
             yield from handler()
         else:
-            yield f"UnaryOp {self.op}", self
+            yield from self._c_repr_chunks_opfirst(self.op)
 
     #
     # Handlers
     #
+
+    def _c_repr_chunks_opfirst(self, op):
+        yield op, self
+        paren = CClosingObject("(")
+        yield "(", paren
+        yield from CExpression._try_c_repr_chunks(self.operand)
+        yield ")", paren
 
     def _c_repr_chunks_not(self):
         yield "!", self
@@ -2625,8 +2655,15 @@ class CConstant(CExpression):
         return self._type
 
     @staticmethod
-    def str_to_c_str(_str, prefix: str = "", maxlen: int | None = None) -> str:
+    def str_to_c_str(_str: str | bytes, prefix: str = "", maxlen: int | None = None) -> str:
+        if isinstance(_str, bytes):
+            # bytes that do not decode stay bytes, so that repr() escapes them as \xNN below
+            with contextlib.suppress(UnicodeDecodeError):
+                _str = _str.decode("utf-8")
+
         repr_str = repr(_str)
+        if isinstance(_str, bytes):
+            repr_str = repr_str[1:]  # drop the b prefix
         base_str = repr_str[1:-1]
 
         if maxlen is not None and len(base_str) > maxlen:
@@ -2640,13 +2677,13 @@ class CConstant(CExpression):
     def c_repr_chunks(self, indent=0, asexpr=False):
         def _default_output(v) -> str | None:
             if isinstance(v, MemoryData) and v.sort == MemoryDataSort.String and v.content is not None:
-                return CConstant.str_to_c_str(v.content.decode("utf-8"), maxlen=self.codegen.max_str_len)
+                return CConstant.str_to_c_str(v.content, maxlen=self.codegen.max_str_len)
             if isinstance(v, Function):
                 return get_cpp_function_name(v.demangled_name)
             if isinstance(v, str):
                 return CConstant.str_to_c_str(v, maxlen=self.codegen.max_str_len)
             if isinstance(v, bytes):
-                return CConstant.str_to_c_str(v.replace(b"\x00", b"").decode("utf-8"), maxlen=self.codegen.max_str_len)
+                return CConstant.str_to_c_str(v.replace(b"\x00", b""), maxlen=self.codegen.max_str_len)
             return None
 
         if self.collapsed:
@@ -2678,13 +2715,11 @@ class CConstant(CExpression):
                 if isinstance(self._type, SimTypePointer) and isinstance(self._type.pts_to, SimTypeChar):
                     refval = self.reference_values[self._type]
                     if isinstance(refval, MemoryData):
-                        v = refval.content.decode("utf-8") if refval.content else f"<unknown@{refval.addr:#x}>"
-                    elif isinstance(refval, bytes):
-                        v = refval.decode("latin1")
+                        v = refval.content or f"<unknown@{refval.addr:#x}>"
                     else:
-                        # it must be a string
+                        # it must be raw bytes or a string
                         v = refval
-                        assert isinstance(v, str)
+                        assert isinstance(v, (bytes, str))
                     yield CConstant.str_to_c_str(v, maxlen=self.codegen.max_str_len), self
                     return
 
@@ -4254,7 +4289,7 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
         self,
         expr: Expr.Const,
         type_=None,
-        reference_values: dict[SimType | str, str | bytes | int | float | Function | CExpression] | None = None,
+        reference_values: dict[SimType, str | bytes | int | float | Function | CExpression] | None = None,
         variable=None,
         likely_signed=True,
         **kwargs,
@@ -4357,16 +4392,14 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
             elif function_pointer:
                 self._function_pointers.add(expr_reference_variable)
 
-        var_access = None
         if variable is not None and not reference_values:
+            # _variable() records the variable as in use, which CFunction reads to emit declarations and
+            # CFunctionCall reads to disambiguate call target names
             cvar = self._variable(variable, None)
             offset = self._variable_map.reference_variable_offset(expr)
             var_access = self._access_constant_offset_reference(self._get_variable_reference(cvar), offset, None)
-
-        if var_access is not None:
             if expr.value >= self.min_data_addr:
                 return var_access
-            reference_values["offset"] = var_access
         return CConstant(expr.value, type_, reference_values=reference_values, tags=expr.tags, codegen=self)
 
     def _handle_Expr_UnaryOp(self, expr, type_: SimType | None = None, **kwargs):
@@ -4437,7 +4470,10 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
         # do we need an intermediate cast?
         if orig_child_signed != expr.is_signed and expr.to_bits > expr.from_bits and child.type is not None:
             # this is a problem. sign-extension only happens when the SOURCE of the cast is signed
-            child_ty = self.default_simtype_from_bits(child.type.size, expr.is_signed)
+            child_size = child.type.size
+            child_ty = self.default_simtype_from_bits(
+                expr.from_bits if child_size is None else child_size, expr.is_signed
+            )
             child = CTypeCast(None, child_ty, child, codegen=self)
 
         return CTypeCast(None, dst_type.with_arch(self.project.arch), child, tags=expr.tags, codegen=self)

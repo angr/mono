@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import pickle
 import unittest
+from typing import cast
 
 import archinfo
 import pypcode
@@ -12,6 +13,7 @@ from pyvex.enums import irop_enums_to_ints
 
 import angr
 from angr import ailment
+from angr.ailment.expression import DirtyExpression
 from angr.engines.pcode.lifter import IRSB as PCodeIRSB
 from angr.engines.vex.claripy import irop
 from angr.rustylib.ailment import RoundingMode, VEXIRSBConverter, _vexop_debug
@@ -19,12 +21,18 @@ from angr.rustylib.ailment import RoundingMode, VEXIRSBConverter, _vexop_debug
 # pylint: disable=missing-class-docstring
 # pylint: disable=line-too-long
 
+bin_location = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "..", "binaries")
+test_location = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "binaries", "tests"))
+
 
 class TestIrsb(unittest.TestCase):
     block_bytes = bytes.fromhex(
         "554889E54883EC40897DCC488975C048C745F89508400048C745F0B6064000488B45C04883C008488B00BEA70840004889C7E883FEFFFF"
     )
     block_addr = 0x4006C6
+    # A Linux kernel text address: an ordinary address for a 64-bit target that
+    # does not fit in a signed 64-bit integer.
+    high_block_addr = 0xFFFFFFFF81000330
 
     def test_convert_from_vex_irsb(self):
         arch = archinfo.arch_from_id("AMD64")
@@ -32,6 +40,47 @@ class TestIrsb(unittest.TestCase):
         irsb = pyvex.IRSB(self.block_bytes, self.block_addr, arch, opt_level=0)
         ablock = ailment.IRSBConverter.convert(irsb, manager)
         assert ablock  # TODO: test if this conversion is valid
+
+    def test_convert_from_vex_irsb_at_high_address(self):
+        arch = archinfo.arch_from_id("AMD64")
+        irsb = pyvex.IRSB(self.block_bytes, self.high_block_addr, arch, opt_level=0)
+        from_py = VEXIRSBConverter.convert(irsb, ailment.Manager(arch=arch))
+        from_lift = VEXIRSBConverter.convert_from_lift(
+            arch, self.high_block_addr, self.block_bytes, ailment.Manager(arch=arch), opt_level=0
+        )
+        assert from_py == from_lift
+        for block in (from_py, from_lift):
+            assert block.addr == self.high_block_addr
+            assert block.statements
+            for stmt in block.statements:
+                assert self.high_block_addr <= stmt.tags["ins_addr"] < self.high_block_addr + irsb.size
+
+    def test_convert_gymrat_dirty_leaves_memory_effects_unset(self):
+        # The block at 0x1400017c8 contains rdmsr, which libVEX cannot decode, so pyvex
+        # falls back to its gymrat lifter. That lifter leaves the Dirty statement's
+        # memory-effect fields unset, which the libVEX front end never does.
+        binary_path = os.path.join(test_location, "x86_64", "windows", "CorsairLLAccess64.sys")
+        proj = angr.Project(binary_path, auto_load_libs=False)
+        irsb = proj.factory.block(0x1400017C8).vex
+
+        dirty = [stmt for stmt in irsb.statements if isinstance(stmt, pyvex.stmt.Dirty)]
+        assert len(dirty) == 1
+        assert dirty[0].mFx is None
+        assert dirty[0].mSize is None
+
+        manager = ailment.Manager()
+        ablock = ailment.IRSBConverter.convert(irsb, manager)
+
+        converted = [
+            expr
+            for stmt in ablock.statements
+            for expr in (getattr(stmt, "src", None), getattr(stmt, "dst", None), getattr(stmt, "dirty", None))
+            if isinstance(expr, DirtyExpression)
+        ]
+        assert len(converted) == 1
+        assert converted[0].callee == "amd64g_dirtyhelper_RDMSR"
+        assert converted[0].mfx is None
+        assert converted[0].msize is None
 
     def test_convert_from_pcode_irsb(self):
         arch = archinfo.arch_from_id("AMD64")
@@ -42,6 +91,22 @@ class TestIrsb(unittest.TestCase):
         irsb = p.factory.block(self.block_addr).vex
         ablock = ailment.IRSBConverter.convert(irsb, manager)
         assert ablock  # TODO: test if this conversion is valid
+
+    def test_convert_from_pcode_irsb_at_high_address(self):
+        # The P-code converter assigns Manager.ins_addr from Python, which the
+        # VEX converter never does.
+        arch = archinfo.arch_from_id("AMD64")
+        manager = ailment.Manager(arch=arch)
+        p = angr.load_shellcode(
+            self.block_bytes, arch, self.high_block_addr, self.high_block_addr, engine=angr.engines.UberEnginePcode
+        )
+        irsb = p.factory.block(self.high_block_addr).vex
+        ablock = ailment.IRSBConverter.convert(irsb, manager)
+        assert ablock.addr == self.high_block_addr
+        assert manager.block_addr == self.high_block_addr
+        ins_addr = manager.ins_addr
+        assert ins_addr is not None
+        assert self.high_block_addr <= ins_addr < self.high_block_addr + irsb.size
 
     def test_convert_pcode_uppercase_memory_space(self):
         arch = archinfo.ArchPcode("6502:LE:16:default")
@@ -81,6 +146,249 @@ class TestIrsb(unittest.TestCase):
         )
         assert from_py == from_lift
         assert from_py.statements  # non-empty
+
+    def test_llsc_results_are_defined_from_nuttx(self):
+        binary = os.path.join(bin_location, "tests", "armel", "decompiler", "nuttx_O2_noinline")
+        project = angr.Project(binary, auto_load_libs=False)
+        block = project.factory.block(0x800D781, size=16)
+
+        converted = VEXIRSBConverter.convert(block.vex, ailment.Manager(arch=project.arch))
+        base_addr = block.addr & ~1
+        memory = project.loader.memory_ro_view or project.loader.memory
+        start, backer = next(memory.backers(base_addr))
+        converted_from_lift = VEXIRSBConverter.convert_from_lift(
+            project.arch,
+            block.addr,
+            backer,
+            ailment.Manager(arch=project.arch),
+            cross_insn_opt=block._cross_insn_opt,
+            max_bytes=block.size,
+            bytes_offset=base_addr - start + 1,
+        )
+        assert converted == converted_from_lift
+        definitions = [
+            stmt
+            for stmt in converted.statements
+            if isinstance(stmt, ailment.Stmt.Assignment)
+            and isinstance(stmt.dst, ailment.Expr.Tmp)
+            and isinstance(stmt.src, ailment.Expr.DirtyExpression)
+        ]
+        llsc_statements = [stmt for stmt in block.vex.statements if isinstance(stmt, pyvex.IRStmt.LLSC)]
+        expressions = [cast(ailment.Expr.DirtyExpression, stmt.src) for stmt in definitions]
+        assert [cast(ailment.Expr.Tmp, stmt.dst).tmp_idx for stmt in definitions] == [
+            stmt.result for stmt in llsc_statements
+        ]
+        assert [stmt.dst.bits for stmt in definitions] == [32, 1]
+        assert [expr.callee for expr in expressions] == ["load_linked_le", "store_conditional_le"]
+        assert [expr.bits for expr in expressions] == [32, 1]
+        assert [expr.mfx for expr in expressions] == ["Ifx_Read", "Ifx_Write"]
+        assert [expr.msize for expr in expressions] == [4, 4]
+        assert [len(expr.operands) for expr in expressions] == [1, 2]
+        assert all(expr.maddr is not None and expr.maddr.likes(expr.operands[0]) for expr in expressions)
+
+    def test_unary_conversion_types(self):
+        binary = os.path.join(
+            os.path.dirname(__file__), "..", "..", "..", "binaries", "tests", "x86_64", "manyfloatsum"
+        )
+        project = angr.Project(binary, auto_load_libs=False)
+        irsb = project.factory.block(0x4009BE).vex
+        blocks = (
+            VEXIRSBConverter.convert(irsb, ailment.Manager(arch=project.arch)),
+            VEXIRSBConverter.convert_from_lift(
+                project.arch,
+                irsb.addr,
+                bytes(project.loader.memory.load(irsb.addr, irsb.size)),
+                ailment.Manager(arch=project.arch),
+            ),
+        )
+        expected = {
+            "Iop_F32toF64": (ailment.Expr.Convert.TYPE_FP, ailment.Expr.Convert.TYPE_FP),
+            "Iop_I32StoF64": (ailment.Expr.Convert.TYPE_INT, ailment.Expr.Convert.TYPE_FP),
+        }
+
+        for block in blocks:
+            seen = set()
+            for stmt in block.statements:
+                src = getattr(stmt, "src", None)
+                if not isinstance(src, ailment.Expr.Convert):
+                    continue
+                vex_stmt_idx = src.tags.get("vex_stmt_idx")
+                if vex_stmt_idx is None:
+                    continue
+                vex_expr = getattr(irsb.statements[vex_stmt_idx], "data", None)
+                if not isinstance(vex_expr, pyvex.IRExpr.Unop) or vex_expr.op not in expected:
+                    continue
+                assert (src.from_type, src.to_type) == expected[vex_expr.op]
+                seen.add(vex_expr.op)
+            assert seen == expected.keys()
+
+
+class TestLoadGConversion(unittest.TestCase):
+    _CASES = (
+        ("ILGop_Ident32", "Ity_I32", 32, 32, False, 0xA5C3E17B),
+        ("ILGop_Ident64", "Ity_I64", 64, 64, False, 0x123456789ABCDEF0),
+        ("ILGop_IdentV128", "Ity_V128", 128, 128, False, 0),
+        ("ILGop_8Uto32", "Ity_I32", 8, 32, False, 0xA5C3E17B),
+        ("ILGop_8Sto32", "Ity_I32", 8, 32, True, 0xA5C3E17B),
+        ("ILGop_16Uto32", "Ity_I32", 16, 32, False, 0xA5C3E17B),
+        ("ILGop_16Sto32", "Ity_I32", 16, 32, True, 0xA5C3E17B),
+    )
+
+    @staticmethod
+    def _const(value, bits):
+        const_cls = pyvex.const.V128 if bits == 128 else getattr(pyvex.const, f"U{bits}")
+        return pyvex.IRExpr.Const(const_cls(value))
+
+    @classmethod
+    def _loadg_block(cls, cvt, dst_type, output_bits, alt_value, endness):
+        arch = archinfo.ArchAMD64()
+        tyenv = pyvex.IRTypeEnv(arch)
+        dst = tyenv.add(dst_type)
+        block_addr = 0x400000
+        return pyvex.IRSB.empty_block(
+            arch,
+            block_addr,
+            statements=[
+                pyvex.IRStmt.IMark(block_addr, 1, 0),
+                pyvex.IRStmt.LoadG(
+                    endness,
+                    cvt,
+                    dst,
+                    cls._const(0x401000, 64),
+                    cls._const(alt_value, output_bits),
+                    cls._const(1, 1),
+                ),
+            ],
+            nxt=cls._const(block_addr + 1, 64),
+            tyenv=tyenv,
+            jumpkind="Ijk_Boring",
+            direct_next=True,
+            size=1,
+        )
+
+    def test_loadg_conversion_matrix(self):
+        for cvt, dst_type, load_bits, output_bits, signed, alt_value in self._CASES:
+            for endness in ("Iend_LE", "Iend_BE"):
+                with self.subTest(cvt=cvt, endness=endness):
+                    irsb = self._loadg_block(cvt, dst_type, output_bits, alt_value, endness)
+                    converted = VEXIRSBConverter.convert(irsb, ailment.Manager(arch=irsb.arch))
+                    assignment = converted.statements[0]
+
+                    assert isinstance(assignment, ailment.Stmt.Assignment)
+                    assert isinstance(assignment.dst, ailment.Expr.Tmp)
+                    assert assignment.dst.bits == output_bits
+                    assert isinstance(assignment.src, ailment.Expr.ITE)
+
+                    ite = assignment.src
+                    assert isinstance(ite.cond, ailment.Expr.Const)
+                    assert ite.cond.value == 1 and ite.cond.bits == 1
+                    assert isinstance(ite.iffalse, ailment.Expr.Const)
+                    assert ite.iffalse.value == alt_value
+                    assert ite.iffalse.bits == output_bits
+
+                    true_expr = ite.iftrue
+                    if load_bits == output_bits:
+                        assert isinstance(true_expr, ailment.Expr.Load)
+                        load = true_expr
+                    else:
+                        assert isinstance(true_expr, ailment.Expr.Convert)
+                        assert true_expr.from_bits == load_bits
+                        assert true_expr.to_bits == output_bits
+                        assert true_expr.is_signed is signed
+                        assert isinstance(true_expr.operand, ailment.Expr.Load)
+                        load = true_expr.operand
+
+                    assert load.guard is None and load.alt is None
+                    assert isinstance(load.addr, ailment.Expr.Const)
+                    assert load.addr.value == 0x401000 and load.addr.bits == 64
+                    assert load.size == load_bits // 8
+                    assert load.bits == load_bits
+                    assert load.endness == endness
+                    assert ite.bits == output_bits
+                    assert ite.depth == max(ite.cond.depth, ite.iffalse.depth, ite.iftrue.depth) + 1
+
+                    # The destination, load, and VEX operands keep the historical allocation order. The canonical
+                    # ITE adds one synthesized atom immediately before the Assignment.
+                    assert load.idx == assignment.dst.idx + 1
+                    assert load.addr.idx == load.idx + 1
+                    assert ite.cond.idx == load.addr.idx + 1
+                    assert ite.iffalse.idx == ite.cond.idx + 1
+                    if isinstance(true_expr, ailment.Expr.Convert):
+                        assert true_expr.idx == ite.iffalse.idx + 1
+                        assert ite.idx == true_expr.idx + 1
+                    else:
+                        assert ite.idx == ite.iffalse.idx + 1
+                    assert assignment.idx == ite.idx + 1
+
+                    source_tags = {"ins_addr": 0x400000, "vex_block_addr": 0x400000, "vex_stmt_idx": 1}
+                    assert dict(assignment.tags) == source_tags
+                    assert dict(assignment.dst.tags) == source_tags
+                    assert dict(load.addr.tags) == source_tags
+                    assert dict(ite.cond.tags) == source_tags
+                    assert dict(ite.iffalse.tags) == source_tags
+                    assert not dict(load.tags)
+                    assert not dict(ite.tags)
+                    if isinstance(true_expr, ailment.Expr.Convert):
+                        assert not dict(true_expr.tags)
+
+                    assert pickle.loads(pickle.dumps(converted)) == converted
+
+    def test_real_thumb_loadg_matches_direct_lift(self):
+        path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "..",
+            "binaries",
+            "tests",
+            "armel",
+            "decompiler",
+            "loadg_ite_thumb.elf",
+        )
+        project = angr.Project(path, auto_load_libs=False)
+        symbol = project.loader.main_object.get_symbol("loadg_ite_mask")
+        assert symbol is not None
+
+        block = project.factory.block(symbol.rebased_addr, size=symbol.size, opt_level=1)
+        loadgs = [stmt for stmt in block.vex.statements if isinstance(stmt, pyvex.IRStmt.LoadG)]
+        assert len(loadgs) == 2
+        assert all(stmt.cvt == "ILGop_Ident32" for stmt in loadgs)
+
+        from_python = VEXIRSBConverter.convert(block.vex, ailment.Manager(arch=project.arch))
+        from_lift = VEXIRSBConverter.convert_from_lift(
+            project.arch,
+            symbol.rebased_addr,
+            block.bytes,
+            ailment.Manager(arch=project.arch),
+            opt_level=1,
+            bytes_offset=1,
+        )
+        assert from_python == from_lift
+
+        assignments = {
+            stmt.dst.tmp_idx: stmt
+            for stmt in from_python.statements
+            if isinstance(stmt, ailment.Stmt.Assignment) and isinstance(stmt.dst, ailment.Expr.Tmp)
+        }
+        for vex_stmt in loadgs:
+            src = assignments[vex_stmt.dst].src
+            assert isinstance(src, ailment.Expr.ITE)
+            assert isinstance(src.cond, ailment.Expr.Tmp) and src.cond.tmp_idx == vex_stmt.guard.tmp
+            assert isinstance(src.iffalse, ailment.Expr.Tmp) and src.iffalse.tmp_idx == vex_stmt.alt.tmp
+            assert isinstance(src.iftrue, ailment.Expr.Load)
+            assert src.iftrue.guard is None and src.iftrue.alt is None
+
+        first_load = assignments[loadgs[0].dst].src.iftrue
+        second_load = assignments[loadgs[1].dst].src.iftrue
+        assert isinstance(first_load.addr, ailment.Expr.Tmp)
+        assert isinstance(second_load.addr, ailment.Expr.Tmp)
+        second_addr = assignments[second_load.addr.tmp_idx].src
+        assert isinstance(second_addr, ailment.Expr.BinaryOp) and second_addr.op == "Add"
+        assert isinstance(second_addr.operands[0], ailment.Expr.Tmp)
+        assert second_addr.operands[0].tmp_idx == first_load.addr.tmp_idx
+        assert isinstance(second_addr.operands[1], ailment.Expr.Const)
+        assert second_addr.operands[1].value == 4
+        assert pickle.loads(pickle.dumps(from_python)) == from_python
 
 
 class TestNonConstRoundingMode(unittest.TestCase):
