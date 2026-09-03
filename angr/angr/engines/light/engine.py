@@ -7,11 +7,10 @@ from abc import abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
 
-import claripy
 import pyvex
 from pyvex.expr import IRExpr
 
-from angr import ailment
+from angr import ailment, claripy
 from angr.block import Block
 from angr.code_location import CodeLocation
 from angr.engines.engine import SimEngine
@@ -634,8 +633,8 @@ class SimEngineLightAIL[StateType, DataType_co, StmtDataType, ResultType](
             "CmpNEV": self._handle_binop_CmpNEV,
             "CmpGEV": self._handle_binop_CmpGEV,
             "CmpGTV": self._handle_binop_CmpGTV,
-            "CmpLEV": self._handle_binop_CmpLTV,
-            "CmpLTV": self._handle_binop_CmpLEV,
+            "CmpLEV": self._handle_binop_CmpLEV,
+            "CmpLTV": self._handle_binop_CmpLTV,
             "MinV": self._handle_binop_MinV,
             "MaxV": self._handle_binop_MaxV,
             "HAddV": self._handle_binop_HAddV,

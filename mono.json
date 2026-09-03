@@ -3,13 +3,12 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "d20a366936cf437628f25dfe65706ebb359a4ce3",
-      "committed_at": "2026-09-01T11:07:34-07:00",
-      "subject": "cfg: use memory endness in ArmElfFastResolver._resolve_put (#7058)",
+      "commit": "854269112a5ce5b1b356cf6d67bff9abaf986b55",
+      "committed_at": "2026-09-03T10:01:59-07:00",
+      "subject": "claripy: drop dead &[u8] branch in CoerceBV, dedup bytes-to-BV (#7068)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
-        "claripy",
         "cle",
         "pysoot",
         "pyvex"
@@ -17,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "5a7ac4a7d13fc9bd5b62c08d1630e5538a881afe",
-      "committed_at": "2026-09-01T10:40:42-07:00",
-      "subject": "Use cmake<4 for keystone-engine (#1727)",
+      "commit": "68f731358b97e812b8fe0de2a8b9bc14aa1fc4f1",
+      "committed_at": "2026-09-03T08:45:08-07:00",
+      "subject": "Migrate to clarirs (#1700)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -27,48 +26,47 @@
       "sibling_sources_repointed_at_workspace": [
         "angr",
         "archinfo",
-        "claripy",
         "cle",
         "pyvex"
       ]
     },
     "angr-platforms": {
       "upstream": "https://github.com/angr/angr-platforms",
-      "commit": "d9231f2306f5d5f1acdf7d464a81b0925c78e140",
-      "committed_at": "2025-03-24T14:18:43-07:00",
-      "subject": "Support multiple angr versions",
+      "commit": "92ddcc828dc4648112ad0bd654eec4027724c0b4",
+      "committed_at": "2026-09-03T08:47:17-07:00",
+      "subject": "Migrate to clarirs (#76)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "angrop": {
       "upstream": "https://github.com/angr/angrop",
-      "commit": "e7c3c1edfc4c25887f5017544f7dd46505795cce",
-      "committed_at": "2026-05-18T23:17:17-07:00",
-      "subject": "Merge pull request #156 from pollingsoon/fix/nt_sigalrm_timeout",
+      "commit": "e8519dc4ca294ad4cf44fd0376545c3740647330",
+      "committed_at": "2026-09-03T08:45:38-07:00",
+      "subject": "Import claripy through the angr package (#158)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "68528685dda3f45697cbc16e1416493d4d38890f",
-      "committed_at": "2026-09-01T09:20:47-07:00",
-      "subject": "Treat an unqualified PowerPC identifier as big-endian (#380)",
+      "commit": "384c676de767e1216a7fee2a08f2d549ff2a1028",
+      "committed_at": "2026-09-02T20:21:17Z",
+      "subject": "Update version to 9.3.5.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "claripy": {
       "upstream": "https://github.com/angr/claripy",
-      "commit": "71020429d255a7169d56cfae84e77d26ab372fa1",
-      "committed_at": "2026-08-31T11:51:11-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#744)",
+      "commit": "0a2d0c6f3b619f358c9ee2f10e97b26a6290c416",
+      "committed_at": "2026-09-02T20:21:21Z",
+      "subject": "Update version to 9.3.5.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "2f7657fda2a657ec76a201d5c63245c6262f60b7",
-      "committed_at": "2026-08-31T11:51:05-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#803)",
+      "commit": "3812052df2ad284cd16684fb7b7eb66e8d14dc6d",
+      "committed_at": "2026-09-03T10:48:09-07:00",
+      "subject": "Load a Mach-O relocatable object (#787)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -101,9 +99,9 @@
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "74cb12ee3ab872f96f98a7c3ccef26cdaf739dc4",
-      "committed_at": "2026-08-31T11:51:08-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#580)",
+      "commit": "f0e49736d4b21446b1b22577f277b62acf970e0a",
+      "committed_at": "2026-09-02T20:21:24Z",
+      "subject": "Update version to 9.3.5.dev0 [ci skip]",
       "excluded": [
         ".gitmodules"
       ],
@@ -121,13 +119,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-09-02T04:35:56+00:00",
+  "imported_at": "2026-09-03T18:36:56+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "981989f741dad616983a685f66a5566d2aed5bcf",
-      "committed_at": "2026-08-30T22:13:48-07:00",
-      "subject": "Add an s390x ELF whose EXRL target sits outside the code buffer (#222)",
+      "commit": "3de2c41a297606c45be7985aa09b3ae615424d61",
+      "committed_at": "2026-09-03T08:44:32-07:00",
+      "subject": "Regenerate caches for clarirs (#168)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }

@@ -8,11 +8,11 @@ import re
 import string
 import time
 from collections import OrderedDict, defaultdict
+from collections.abc import Iterator
 from enum import Enum, unique
 from typing import TYPE_CHECKING, Any
 
 import capstone
-import claripy
 import cle
 import networkx
 import pyvex
@@ -23,6 +23,7 @@ from cle.address_translator import AT
 from sortedcontainers import SortedDict
 
 import angr
+from angr import claripy
 from angr import sim_options as o
 from angr.analyses.analysis import AnalysesHub
 from angr.analyses.forward_analysis import ForwardAnalysis
@@ -57,10 +58,12 @@ from angr.utils.funcid import (
     is_function_security_init_cookie,
     is_function_security_init_cookie_win8,
 )
+from angr.utils.go_runtime import find_go_noreturn_functions, has_go_hint
 from angr.utils.ins_addr_list import InsAddrList
 
 from .cfg_arch_options import CFGArchOptions
 from .cfg_base import CFGBase
+from .go_prologue import find_go_stack_check_preambles, go_preamble_supported
 from .indirect_jump_resolvers.jumptable import JumpTableResolver
 from .meta_structs import get_data_regions_from_meta_regions, get_pointer_array_hints
 from .pe_msvc_eh_structs import (
@@ -883,6 +886,9 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         # mapping to all known thunks
         self._known_thunks = {}
 
+        # Go runtime functions that never return, mapped to the evidence that identified them
+        self._go_noreturn_funcs: dict[int, str] = {}
+
         # when True, jump/call targets loaded from registered read-only regions (e.g. PE IAT slots) are
         # constant-folded at lift time and consumed in _create_jobs without invoking indirect jump resolvers
         self._fold_ro_const_loads = False
@@ -912,6 +918,9 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         # always clear them after returning from _process_unresolved_indirect_jumps()
         self._transitory_resolved_indirect_jumps = 0
         self._transitory_unresolved_indirect_jumps = 0
+        # jump tables that the compiler emitted without a bounds check are sized from data references, so they are
+        # resolved only after the rest of the analysis is exhausted and those references are complete
+        self._defer_unbounded_jumptables = True
 
         self._drop_bad_funcs = drop_bad_funcs
 
@@ -1686,6 +1695,13 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         # Scan for __x86_return_thunk and friends
         self._known_thunks = self._find_thunks()
 
+        # Go runtime knowledge. Seeding the verdicts before recovery starts is what keeps the code
+        # that follows a morestack or panic-stub call site from ever being attached to a function.
+        self._go_noreturn_funcs = find_go_noreturn_functions(self.project, kb=self.kb) if self._is_go_binary() else {}
+        if self._go_noreturn_funcs:
+            l.debug("Identified %d non-returning Go runtime functions.", len(self._go_noreturn_funcs))
+        self._apply_go_noreturn_funcs(create=True)
+
         # Initialize variables used during analysis
         self._pending_jobs: PendingJobs = PendingJobs(self.kb, self._deregister_analysis_job)
         self._traced_addresses: set[int] = set(self.model.node_addrs)
@@ -2453,6 +2469,34 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                 self._insert_job(job)
                 self._register_analysis_job(addr, job)
 
+        if self._deferred_indirect_jumps and not self._job_info_queue:
+            # Nothing else is left to traverse, so the data references that bound unbounded jump tables are as
+            # complete as they will get. Resolve the jump tables that were postponed for that reason.
+            self._resolve_deferred_indirect_jumps()
+
+    def _resolve_deferred_indirect_jumps(self):
+        """
+        Resolve indirect jumps whose resolution was postponed until the data references bounding them were collected.
+
+        Resolving one may uncover code that carries the reference bounding the next, so this stops as soon as a jump
+        queues new jobs and resumes on the next call. Jumps that still cannot be resolved are marked unresolvable, so
+        every call shrinks the set and this terminates.
+        """
+
+        jumps = sorted(self._deferred_indirect_jumps, key=lambda j: j.addr)
+        self._deferred_indirect_jumps = set()
+        l.debug("Resolving %d deferred indirect jump(s).", len(jumps))
+
+        self._unbounded_jumptable_final_pass = True
+        try:
+            for idx, jump in enumerate(jumps):
+                self._process_one_indirect_jump(jump)
+                if self._job_info_queue:
+                    self._deferred_indirect_jumps |= set(jumps[idx + 1 :])
+                    break
+        finally:
+            self._unbounded_jumptable_final_pass = False
+
     def _repair_edges(self):
         remaining_edges_to_repair = []
 
@@ -2649,6 +2693,10 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         # Revisit all edges and rebuild all functions to correctly handle returning/non-returning functions.
         self.make_functions()
         self._calculate_progress_and_notify(skip_percentage=True)
+
+        # make_functions() built a brand new function manager, so the Go verdicts must be re-applied
+        # before the returning fixpoint runs over it.
+        self._apply_go_noreturn_funcs()
 
         self._analyze_all_function_features(all_funcs_completed=True)
 
@@ -2954,10 +3002,21 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         is_arm = is_arm_arch(self.project.arch)
 
         for start_, bytes_ in self._binary.memory.backers():
+            # Preambles that precede a conventional prologue. The prologue match they cover is
+            # discarded in favor of the (earlier) preamble start, which is the real function entry.
+            covered_prologues = set()
+            for preamble_start, preamble_end, _ in self._prologue_preambles(bytes_, start_):
+                mapped_position = AT.from_rva(preamble_start + start_, self._binary).to_mva()
+                if self._addr_in_exec_memory_regions(mapped_position):
+                    unassured_functions.append(mapped_position)
+                    covered_prologues.add(preamble_end + start_)
+
             for regex in regexes:
                 # Match them!
                 for mo in regex.finditer(bytes_):
                     position = mo.start() + start_
+                    if position in covered_prologues:
+                        continue
                     if (not is_arm and position % self.project.arch.instruction_alignment == 0) or (
                         is_arm and position % 4 == 0
                     ):
@@ -2976,6 +3035,29 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
 
         l.info("Found %d functions with prologue scanning.", len(unassured_functions))
         return unassured_functions
+
+    def _prologue_preambles(self, blob: bytes, blob_rva: int) -> Iterator[tuple[int, int, int]]:
+        """
+        Find toolchain-specific preambles that sit in front of a conventional function prologue, so
+        that prologue scanning can report the start of the preamble instead of the prologue.
+
+        Currently only the Go goroutine stack-growth check is recognized.
+
+        :param blob:        A backer blob.
+        :param blob_rva:    The RVA the blob is loaded at.
+        :return:            An iterator of ``(start, end, branch_target)`` offsets into ``blob``.
+        """
+
+        arch_name = self.project.arch.name
+        if not go_preamble_supported(arch_name):
+            return
+
+        blob_mva = AT.from_rva(blob_rva, self._binary).to_mva()
+        for start, end, target in find_go_stack_check_preambles(blob, arch_name, blob_mva):
+            # a blind byte match may fire on unrelated code: require the stack-growth branch to stay
+            # within an executable region
+            if self._addr_in_exec_memory_regions(blob_mva + target):
+                yield start, end, target
 
     # Basic block scanning
 
@@ -6362,6 +6444,42 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                     result[addr] = meaning
 
         return result
+
+    def _is_go_binary(self) -> bool:
+        # LanguageDetector is the authority, but it costs seconds on binaries with large symbol
+        # tables, so only consult it once a cheap marker suggests Go.
+        return has_go_hint(self.project) and "go" in self.project.languages()
+
+    def _apply_go_noreturn_funcs(self, create: bool = False) -> None:
+        """
+        Mark the identified Go runtime functions as non-returning.
+
+        This runs twice: once before recovery starts, so the verdicts steer it, and once after
+        make_functions() has rebuilt the function manager from scratch. The second pass also picks up
+        jump thunks that inherited the marker from a Go non-returning function.
+        """
+        if not self._go_noreturn_funcs:
+            return
+
+        verdicts = dict(self._go_noreturn_funcs)
+        for addr in self.kb.functions.get_key_func_addrs("go_noreturn"):
+            verdicts.setdefault(addr, "jump thunk to a non-returning Go runtime function")
+
+        for addr, evidence in verdicts.items():
+            if not self._inside_regions(addr):
+                continue
+            if create:
+                func = self.kb.functions.function(addr, create=True)
+            elif self.kb.functions.contains_addr(addr):
+                func = self.kb.functions.get_by_addr(addr)
+            else:
+                continue
+            if func is None or func.is_simprocedure:
+                continue
+            func.returning = False
+            func.info["is_go_noreturn"] = True
+            func.info["go_noreturn_evidence"] = evidence
+            self.kb.functions.add_key_func_addr("go_noreturn", addr)
 
     def _x86_gcc_pie_find_pc_register_adjustment(self, addr: int, reg_offset: int) -> int | None:
         """

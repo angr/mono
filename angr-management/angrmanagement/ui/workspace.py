@@ -13,6 +13,7 @@ from angr.knowledge_plugins.cfg import MemoryData, MemoryDataSort
 from angr.knowledge_plugins.functions.function import Function
 from angr.knowledge_plugins.patches import Patch
 from cle import SymbolType
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QMessageBox
 from PySide6QtAds import SideBarBottom
 
@@ -33,7 +34,7 @@ from angrmanagement.logic.commands import CommandManager
 from angrmanagement.logic.debugger import DebuggerWatcher
 from angrmanagement.logic.debugger.bintrace import BintraceDebugger
 from angrmanagement.logic.debugger.simgr import SimulationDebugger
-from angrmanagement.logic.jobmanager import JobManager
+from angrmanagement.logic.jobmanager import JobCancelled, JobManager
 from angrmanagement.logic.threads import gui_thread_schedule_async, needs_gui_thread
 from angrmanagement.plugins import PluginManager
 from angrmanagement.ui.dialogs import AnalysisOptionsDialog
@@ -45,9 +46,11 @@ from angrmanagement.utils.daemon_thread import start_daemon_thread
 from .view_manager import ViewManager
 from .views import (
     BaseView,
+    BookmarksView,
     BreakpointsView,
     CallExplorerView,
     CodeView,
+    CommentsView,
     ConsoleView,
     DataDepView,
     DependencyView,
@@ -74,6 +77,7 @@ from .views import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from angrmanagement.data.annotations import CommentKind
     from angrmanagement.ui.main_window import MainWindow
 
 
@@ -92,6 +96,7 @@ class Workspace:
         self.main_window: MainWindow = main_window
         self.job_manager = JobManager(self)
         self.job_manager.job_starting.connect(self.on_job_started)
+        self.job_manager.job_exception.connect(self._handle_job_exception)
 
         self.command_manager: CommandManager = CommandManager()
         self.view_manager: ViewManager = ViewManager(self)
@@ -113,7 +118,6 @@ class Workspace:
         self.main_instance.project.am_subscribe(self._instance_project_initalization)
         self.main_instance.simgrs.am_subscribe(self._update_simgr_debuggers)
         self.main_instance.handle_comment_changed_callback = self.plugins.handle_comment_changed
-        self.main_instance.job_worker_exception_callback = self._handle_job_exception
 
         self.current_screen = ObjectContainer(None, name="current_screen")
 
@@ -134,6 +138,7 @@ class Workspace:
             LogView(self, "bottom", self._main_instance),
             JobsView(self, "bottom", self.main_instance),
             MCPHistoryView(self, "bottom", self._main_instance),
+            CommentsView(self, "bottom", self._main_instance),
         ]
         self.default_tabs += minimized_tabs
 
@@ -489,13 +494,28 @@ class Workspace:
         bp = Breakpoint(bp_type_map[type_], addr, size)
         self.main_instance.breakpoint_mgr.add_breakpoint(bp)
 
-    def set_comment(self, addr: int, comment_text) -> None:
-        self.main_instance.set_comment(addr, comment_text)
+    def set_comment(self, addr: int, comment_text, kind: CommentKind | None = None) -> None:
+        self.main_instance.set_comment(addr, comment_text, kind=kind)
+        self.refresh_after_comment_change(addr)
 
+    def refresh_after_comment_change(self, addr: int) -> None:
+        """
+        Redraw whatever displays the comment at ``addr``: the disassembly, and the pseudocode view
+        of the containing function if one is open.
+        """
         disasm_view = self._get_or_create_view("disassembly", DisassemblyView)
         if disasm_view._flow_graph.disasm is not None:
-            # redraw
             disasm_view.current_graph.refresh()
+
+        kb = self.main_instance.kb
+        if kb is None:
+            return
+        func = kb.functions.floor_func(addr)
+        if func is None:
+            return
+        for view in self.view_manager.views_by_category["pseudocode"]:
+            if view.function.am_obj is not None and view.function.addr == func.addr and not view.codegen.am_none:
+                view.codegen.am_event()
 
     def close_project(self) -> None:
         """
@@ -558,6 +578,7 @@ class Workspace:
         self.main_instance.cfb.am_event()
         self.main_instance.cfg.am_event()
         self.on_cfg_generated()
+        self.main_instance.annotations.deserialize(job.extra_info)
         self.plugins.angrdb_load_entries(job.extra_info)
 
         if on_loaded is not None:
@@ -855,6 +876,12 @@ class Workspace:
     def show_breakpoints_view(self) -> None:
         self.show_view("breakpoints", BreakpointsView)
 
+    def show_comments_view(self) -> None:
+        self.show_view("comments", CommentsView, position="bottom")
+
+    def show_bookmarks_view(self) -> None:
+        self.show_view("bookmarks", BookmarksView, position="bottom")
+
     def show_call_explorer_view(self) -> None:
         self.show_view("call_explorer", CallExplorerView)
 
@@ -885,6 +912,46 @@ class Workspace:
             if selected_insns:
                 for insn in selected_insns:
                     self.main_instance.breakpoint_mgr.toggle_exec_breakpoint(insn)
+
+    def current_address(self) -> int | None:
+        """
+        The address the user is looking at, taken from the focused view and falling back to any
+        disassembly or pseudocode view that has a cursor.
+        """
+        views = [self.view_manager.most_recently_focused_view]
+        views += self.view_manager.views_by_category["disassembly"]
+        views += self.view_manager.views_by_category["pseudocode"]
+        for view in views:
+            if view is None:
+                continue
+            if view.category == "disassembly":
+                addr = view._instruction_address_in_selection()
+                if addr is not None:
+                    return addr
+            elif view.category == "pseudocode" and not view.addr.am_none:
+                return view.addr.am_obj
+        return None
+
+    def toggle_bookmark(self, addr: int | None = None) -> None:
+        """
+        Add or remove a bookmark at ``addr``, defaulting to the current address.
+        """
+        if self.main_instance.project.am_none:
+            return
+        if addr is None:
+            addr = self.current_address()
+        if addr is None:
+            return
+        self.main_instance.annotations.toggle_bookmark(addr)
+        self.refresh(["disassembly", "pseudocode"])
+
+    def goto_next_bookmark(self) -> None:
+        """
+        Jump to the next bookmark by address, wrapping around at the end.
+        """
+        bookmark = self.main_instance.annotations.next_bookmark(self.current_address())
+        if bookmark is not None:
+            self.jump_to(bookmark.addr)
 
     def step_forward(self, until_addr: int | None = None) -> None:
         if self.main_instance is None:
@@ -1013,10 +1080,27 @@ class Workspace:
 
         self.plugins.handle_project_initialization()
 
-    def _handle_job_exception(self, job: Job, e: Exception) -> None:
+    def _handle_job_exception(self, job: Job, ex: BaseException) -> None:
         self.log(f'Exception while running job "{job.name}":')
-        self.log(e)
+        self.log(ex)
         self.log("Type %debug to debug it")
+
+        if isinstance(ex, JobCancelled):
+            # the user asked for it; no need to report it
+            return
+
+        def _display_messagebox() -> None:
+            msg = "".join(traceback.format_exception(ex))
+            msgbox = QMessageBox(self.main_window)
+            msgbox.setIcon(QMessageBox.Icon.Critical)
+            msgbox.setWindowTitle(f"Error during job {job.name}")
+            msgbox.setText(f"An exception occurred when running {job.name}:\n\n{msg}")
+            msgbox.setStandardButtons(QMessageBox.StandardButton.Ok)
+            msgbox.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            # shown without blocking: a failing job must not stall whoever is waiting on the job queue
+            msgbox.show()
+
+        gui_thread_schedule_async(_display_messagebox)
 
     def _update_simgr_debuggers(self, **kwargs) -> None:  # pylint:disable=unused-argument
         sim_dbg = None
