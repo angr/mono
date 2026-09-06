@@ -319,88 +319,19 @@ in
   # pycparser, and pycparser 3 dropped the bundled `ply` attribute they reach
   # for. Neither failure is about angr-management, and neither package is under
   # test here, so the two affected files are skipped rather than patched.
+  #
+  # These two skips do not run any more: flake.nix turns every third-party
+  # package's test suite off, so neither package reaches its pytest phase.
+  # They are kept because the version skew they name is real and would come
+  # back the moment that rule is narrowed, and because they are what a reader
+  # searching for the pycparser failure will find. The six per-package check
+  # overrides that used to sit below them are gone; the rule subsumes them.
   libbs = python-prev.libbs.overridePythonAttrs (old: {
     disabledTestPaths = (old.disabledTestPaths or [ ]) ++ [ "tests/test_client_server.py" ];
   });
 
   binsync = python-prev.binsync.overridePythonAttrs (old: {
     disabledTestPaths = (old.disabledTestPaths or [ ]) ++ [ "tests/test_auxiliary_server.py" ];
-  });
-
-  # backrefs reaches this tree through pydantic-ai's documentation stack
-  # (pydantic-ai-slim -> griffelib -> mkdocstrings -> mkdocs-material). Its
-  # test_timeout asserts that a regex search exceeds a wall-clock budget and
-  # raises; on a busy CI runner the search finishes first and the test fails
-  # for having been too fast. Nothing here depends on that behaviour, and a
-  # timing assertion is not something to make fourteen jobs depend on.
-  backrefs = python-prev.backrefs.overridePythonAttrs (old: {
-    disabledTests = (old.disabledTests or [ ]) ++ [ "test_timeout" ];
-  });
-
-  # portalocker arrives through azure-identity -> msal-extensions, which
-  # fastmcp pulls in. Its test_shared_processes starts a multiprocessing pool
-  # and waits for both workers to take a file lock; on a loaded CI runner the
-  # wait expires and the test fails with TimeoutError. It passed here and
-  # failed in Actions, which is the signature of a timing assertion rather
-  # than a defect -- the same reason backrefs' test_timeout is off above.
-  portalocker = python-prev.portalocker.overridePythonAttrs (old: {
-    disabledTests = (old.disabledTests or [ ]) ++ [ "test_shared_processes" ];
-  });
-
-  # The third of these, and they share an origin: backrefs, portalocker and
-  # python-ulid all arrive through the pydantic-ai / fastmcp stack that angr's
-  # `llm` extra pulls in, and all three fail their own nixpkgs test suites on
-  # a loaded runner for reasons that are about the clock rather than the code.
-  # test_same_millisecond_overflow sets the randomness counter to its maximum
-  # under @freeze_time() and expects the next ULID in the same millisecond to
-  # raise; it reports DID NOT RAISE when the frozen clock and the provider
-  # disagree about which millisecond it is. It killed four of ten angr shards
-  # while the other six built the same derivation successfully, which is the
-  # signature. These packages' own test suites are not this repository's gate,
-  # and they sit under `warm`, which gates everything.
-  python-ulid = python-prev.python-ulid.overridePythonAttrs (old: {
-    disabledTests = (old.disabledTests or [ ]) ++ [ "test_same_millisecond_overflow" ];
-  });
-
-  # The fourth, and the pattern is now the point rather than the instance.
-  # backrefs, portalocker, python-ulid and cyclopts all reach this closure
-  # through pydantic-ai / fastmcp -- packages angr's `llm` extra needs at run
-  # time and whose own test suites are not what this repository gates on --
-  # and each has a check that measures the clock. cyclopts' is the most
-  # obviously so: tests/completion/ drives real bash, zsh and fish through a
-  # pty and gives each prompt five seconds to come back, which a loaded
-  # runner does not always manage. The whole directory goes rather than one
-  # parameterisation, because they are all the same shape of test.
-  #
-  # They sit under `warm`, which gates every other job, so one of these
-  # taking the whole matrix down is a recurring cost with no upside. If a
-  # fifth appears, the answer is probably to stop running this stack's own
-  # suites altogether rather than to add a line here.
-  cyclopts = python-prev.cyclopts.overridePythonAttrs (old: {
-    disabledTestPaths = (old.disabledTestPaths or [ ]) ++ [ "tests/completion" ];
-  });
-
-  # py-key-value-aio is a transitive dependency of fastmcp -- a key-value
-  # abstraction with a backend per store. fastmcp asks for it with no extras
-  # and only ever uses the in-memory backend, but the package's own test suite
-  # exercises every backend, so its check inputs name duckdb and pyarrow (both
-  # from-source C++ builds, tens of minutes each) alongside mongodb,
-  # elasticsearch, redis and memcached. None of that is on any runtime path
-  # here. `doCheck = false` rather than skipping test files, because the cost
-  # is in the check *inputs*, not in running the tests.
-  py-key-value-aio = python-prev.py-key-value-aio.overridePythonAttrs (_: {
-    doCheck = false;
-  });
-
-  # inline-snapshot is a test dependency of mcp, which angr's `llm` extra
-  # needs. Its tests/test_docs.py runs the code blocks in the project's own
-  # documentation and compares them against the formatted output recorded in
-  # the Markdown; three of them disagree because the docs were written against
-  # a different version of the code formatter than the one nixpkgs supplies,
-  # so the expected text differs in line wrapping and highlighted line numbers.
-  # The library itself is unaffected, so only that file is skipped.
-  inline-snapshot = python-prev.inline-snapshot.overridePythonAttrs (old: {
-    disabledTestPaths = (old.disabledTestPaths or [ ]) ++ [ "tests/test_docs.py" ];
   });
 
   # cle's PDB reader. Ships as a per-platform wheel wrapping a native library;

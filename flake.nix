@@ -35,8 +35,96 @@
           angrDataSrc = angr-data;
         };
 
+      # We do not run third-party packages' own test suites.
+      #
+      # Upstream tests its own code. What this repository needs from those
+      # packages is that they build and import; whether they work for our use
+      # is what our own component suites are for. Leaving their suites on
+      # means a clock-dependent test in somebody else's package can fail
+      # `warm`, and `warm` gates every one of the 97 jobs in the matrix. It
+      # keeps happening: backrefs, portalocker, python-ulid, cyclopts,
+      # syrupy, fastmcp, inline-snapshot, libbs and binsync have all had to
+      # be patched or skipped, and most recently python3.12-httpx2-2.9.1's
+      # websocket keepalive test took the whole matrix down -- attempt 1 of
+      # run 34038401917 lost 15 jobs that never started. Not one of those
+      # failures said anything about angr's code.
+      #
+      # The boundary is ours versus not-ours, and it needs no list of names.
+      # Our twelve components -- angr, angr-data, angr-management,
+      # angr-platforms, angrop, archinfo, claripy, cle, pypcode, pysoot,
+      # pyvex and tracer -- already set `doCheck = false`, because the
+      # monorepo ships no test fixtures and the suites run from the source
+      # tree instead. So "turn checks off for every package in the set"
+      # leaves our twelve exactly where they are and turns off everybody
+      # else's. A hand-maintained list of third-party names is the thing this
+      # avoids: it goes stale on the next nixpkgs bump, and which packages
+      # run their suites at all depends on what Hydra happens to have built.
+      #
+      # What still gates is untouched. `mk-python-derivation` adds the
+      # import, runtime-dependency, conflict and metadata check hooks
+      # unconditionally rather than as check inputs, so a package that no
+      # longer runs pytest must still import cleanly, resolve its runtime
+      # dependencies, not collide with anything else in the environment, and
+      # carry consistent metadata. Only the pytest phase and its check inputs
+      # go.
+      #
+      # This replaces six per-package overrides in nix/python-overlay.nix,
+      # whose comment predicted that the answer to a fifth failure would be
+      # to stop running the *llm stack's* suites. The fifth was httpx2, and
+      # that narrower rule would not have caught it: httpx2 is not an llm
+      # package at all. It is in the build closure of pyvex, cle and angr
+      # through pyvex -> bitstring -> pytest-benchmark -> elasticsearch ->
+      # elastic-transport -> respx -> starlette -> httpx2, where bitstring is
+      # a pyvex runtime dependency and pytest-benchmark is bitstring's check
+      # input. Scoping the rule to one stack leaves the failure in place.
+      #
+      # Gated on 3.12 because that is the interpreter this flake builds for.
+      # Mapping the 3.14 set as well breaks evaluation outright: nixpkgs'
+      # fetch-cargo-vendor calls `charset-normalizer.override`, and
+      # `overridePythonAttrs` returns a derivation that has no `override`.
+      noThirdPartyTests =
+        _pythonFinal: pythonPrev:
+        if pythonPrev.python.pythonVersion != "3.12" then
+          { }
+        else
+          lib.mapAttrs (
+            _name: value:
+            # Mapping the whole set reaches attributes that throw when
+            # forced -- packages nixpkgs marks unsupported on this platform,
+            # aliases it has removed. Those pass through untouched and throw
+            # when something asks for them, exactly as they did before.
+            let
+              overridable = builtins.tryEval (lib.isDerivation value && value ? overridePythonAttrs);
+              checksOff =
+                drv:
+                drv.overridePythonAttrs (_: {
+                  doCheck = false;
+                });
+            in
+            if overridable.success && overridable.value then
+              # `overridePythonAttrs` returns a derivation with no `override`,
+              # and nixpkgs defines packages in terms of one another that way
+              # -- `beets-minimal = beets.override { ... }` in
+              # python-packages.nix, `charset-normalizer.override` in
+              # fetch-cargo-vendor. Dropping `override` turns those into
+              # evaluation errors, so it is put back, applying the rule to
+              # whatever it returns.
+              checksOff value
+              // lib.optionalAttrs (value ? override) {
+                override = args: checksOff (value.override args);
+              }
+            else
+              value
+          ) pythonPrev;
+
       overlay = final: prev: {
-        pythonPackagesExtensions = prev.pythonPackagesExtensions ++ [ (pythonOverlay final) ];
+        # The order matters: noThirdPartyTests has to come after the
+        # monorepo's own extension so that it also covers the third-party
+        # packages that extension defines.
+        pythonPackagesExtensions = prev.pythonPackagesExtensions ++ [
+          (pythonOverlay final)
+          noThirdPartyTests
+        ];
       };
 
       pkgsFor =
