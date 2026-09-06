@@ -1,9 +1,18 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use clarirs_core::algorithms::{collect_vars::collect_vars, structurally_match};
-use pyo3::types::{PyDict, PyFrozenSet, PySet, PyType};
+use pyo3::types::{PyDict, PyFrozenSet, PyType};
 
 use crate::claripy::prelude::*;
+
+type Reduced<'py> = (
+    Bound<'py, PyType>,
+    (
+        String,
+        Vec<Bound<'py, PyAny>>,
+        Vec<Bound<'py, PyAnnotation>>,
+    ),
+);
 
 /// The base class for all AST wrappers. It holds the underlying [`AstRef`] and
 /// implements every operation that does not depend on the concrete sort
@@ -13,7 +22,6 @@ use crate::claripy::prelude::*;
 #[pyclass(subclass, frozen, weakref, module = "angr.rustylib.claripy.ast.base")]
 pub struct Base {
     inner: AstRef<'static>,
-    errored: Py<PySet>,
     name: Option<String>,
     encoded_name: Option<Vec<u8>>,
     /// Python annotation objects materialized once at construction, in the same order as `inner.annotations()`, so reads avoid the Rust round-trip.
@@ -21,10 +29,6 @@ pub struct Base {
 }
 
 impl Base {
-    pub fn new(py: Python, inner: &AstRef<'static>) -> Result<Self, ClaripyError> {
-        Self::new_with_name(py, inner, None)
-    }
-
     pub fn new_with_name(
         py: Python,
         inner: &AstRef<'static>,
@@ -38,15 +42,10 @@ impl Base {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             inner: inner.clone(),
-            errored: PySet::empty(py).expect("Failed to create PySet").unbind(),
             name,
             encoded_name,
             annotations,
         })
-    }
-
-    pub fn to_ast(self_: Bound<'_, Base>) -> Result<AstRef<'static>, ClaripyError> {
-        Ok(self_.get().inner.clone())
     }
 
     /// A clone of the wrapped [`AstRef`].
@@ -85,11 +84,6 @@ impl Base {
     #[getter]
     pub fn _encoded_name(&self) -> Option<&[u8]> {
         self.encoded_name.as_deref()
-    }
-
-    #[getter]
-    pub fn _errored(&self, py: Python<'_>) -> Py<PySet> {
-        self.errored.clone_ref(py)
     }
 
     #[getter]
@@ -136,6 +130,21 @@ impl Base {
         self.hash() as usize
     }
 
+    /// `slf.get_type()` is the concrete subclass, so unpickling calls that class's `__new__`.
+    pub fn __reduce__<'py>(slf: &Bound<'py, Self>) -> Result<Reduced<'py>, ClaripyError> {
+        let py = slf.py();
+        let inner = &slf.get().inner;
+        let annotations: Vec<Bound<'py, PyAnnotation>> = inner
+            .annotations()
+            .iter()
+            .map(|annotation| PyAnnotation::from_annotation(py, annotation))
+            .collect::<Result<_, _>>()?;
+        Ok((
+            slf.get_type(),
+            (inner.to_opstring(), inner.extract_py_args(py)?, annotations),
+        ))
+    }
+
     pub fn __repr__(&self) -> String {
         self.inner.to_smtlib()
     }
@@ -174,11 +183,11 @@ impl Base {
         sorted_vars.sort_by_key(|v| v.variables().iter().next().cloned());
 
         let ctx = self.inner.context();
-        let mut replacements: Vec<(AstRef<'static>, AstRef<'static>)> = Vec::new();
+        let mut replacements: HashMap<u64, AstRef<'static>> = HashMap::new();
         for var in sorted_vars {
             let key = var.hash();
             let canonical_ast = match dict.get_item(key)? {
-                Some(existing) => Base::to_ast(existing.cast_into::<Base>()?)?,
+                Some(existing) => existing.cast_into::<Base>()?.get().ast(),
                 None => {
                     let idx = if counter_is_iter {
                         counter
@@ -202,13 +211,10 @@ impl Base {
                     canonical
                 }
             };
-            replacements.push((var, canonical_ast));
+            replacements.insert(key, canonical_ast);
         }
 
-        let mut result = self.inner.clone();
-        for (from, to) in &replacements {
-            result = result.replace(from, to)?;
-        }
+        let result = self.inner.replace_many(&replacements)?;
 
         let counter_ret: Bound<'py, PyAny> = match counter {
             Some(c) if counter_is_iter => c,
@@ -222,7 +228,7 @@ impl Base {
     }
 
     pub fn identical(&self, other: Bound<'_, Base>) -> Result<bool, ClaripyError> {
-        let other_dyn = Base::to_ast(other)?;
+        let other_dyn = other.get().ast();
         Ok(structurally_match(&self.inner, &other_dyn)?)
     }
 
@@ -250,8 +256,8 @@ impl Base {
         from: Bound<'py, Base>,
         to: Bound<'py, Base>,
     ) -> Result<Bound<'py, Base>, ClaripyError> {
-        let from_ast = Base::to_ast(from)?;
-        let to_ast = Base::to_ast(to)?;
+        let from_ast = from.get().ast();
+        let to_ast = to.get().ast();
         // `replace` builds a new AST, so simplify the result before wrapping it.
         Base::from_ast(py, self.inner.replace(&from_ast, &to_ast)?.simplify()?)
     }

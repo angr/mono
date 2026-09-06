@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "854269112a5ce5b1b356cf6d67bff9abaf986b55",
-      "committed_at": "2026-09-03T10:01:59-07:00",
-      "subject": "claripy: drop dead &[u8] branch in CoerceBV, dedup bytes-to-BV (#7068)",
+      "commit": "87411a719c96ddc3f3954590b1833b1789e19697",
+      "committed_at": "2026-09-04T17:07:46-07:00",
+      "subject": "Make claripy annotation flags class attributes (#7095)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "68f731358b97e812b8fe0de2a8b9bc14aa1fc4f1",
-      "committed_at": "2026-09-03T08:45:08-07:00",
-      "subject": "Migrate to clarirs (#1700)",
+      "commit": "aa843e5c10645ba361620768d59642a460805e80",
+      "committed_at": "2026-09-03T20:18:13-07:00",
+      "subject": "Prevent preferences sidebar from collapsing (#1728)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -64,9 +64,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "3812052df2ad284cd16684fb7b7eb66e8d14dc6d",
-      "committed_at": "2026-09-03T10:48:09-07:00",
-      "subject": "Load a Mach-O relocatable object (#787)",
+      "commit": "0e77ade3c39a3cee05f65051e57955675e1ac21b",
+      "committed_at": "2026-09-04T07:55:32-07:00",
+      "subject": "Fix Mach-O section metadata and function discovery (#810)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -119,13 +119,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-09-03T18:36:56+00:00",
+  "imported_at": "2026-09-06T10:39:52+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "3de2c41a297606c45be7985aa09b3ae615424d61",
-      "committed_at": "2026-09-03T08:44:32-07:00",
-      "subject": "Regenerate caches for clarirs (#168)",
+      "commit": "003e82a2bfa641530924055695b36cec8af483ab",
+      "committed_at": "2026-09-03T19:15:32-07:00",
+      "subject": "Add a darwin/arm64 Go language-detector fixture (#224)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
