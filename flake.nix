@@ -88,6 +88,12 @@
         # they skipped here while pysoot sat in the tree unpackaged, which
         # is the failure mode importing it was meant to remove.
         p.pysoot
+        # claripy's suite runs in this environment (ci/suites.json), and
+        # since angr/angr#6550 angr vendors claripy at angr/angr/claripy and
+        # no longer depends on the package -- so nothing pulls it in any
+        # more. Without this line ci/run-suite.sh aborts with "cannot import
+        # claripy in the 'test' environment".
+        p.claripy
         # The dependents whose own suites run here. Upstream tests every
         # transitive dependent of a changed component; without these, a
         # claripy change is tried against angr and angr-management only.
