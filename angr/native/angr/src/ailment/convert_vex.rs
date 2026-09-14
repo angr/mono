@@ -525,14 +525,24 @@ impl<'py, 'r, R: IrReader> Conv<'py, 'r, R> {
             // Python arg eval order: Convert(next_atom(), ..., convert(arg)).
             let idx = self.next_atom();
             let operand = self.convert_expr(arg)?;
+            let from_type = if simop.from_type.as_deref() == Some("F") {
+                ConvertType::TypeFp
+            } else {
+                ConvertType::TypeInt
+            };
+            let to_type = if simop.to_type.as_deref() == Some("F") {
+                ConvertType::TypeFp
+            } else {
+                ConvertType::TypeInt
+            };
             return Ok(new_convert(
                 idx,
                 from_size,
                 to_size,
                 signed,
                 operand,
-                ConvertType::TypeInt,
-                ConvertType::TypeInt,
+                from_type,
+                to_type,
                 None,
                 self.tags(),
             ));
@@ -996,13 +1006,13 @@ impl<'py, 'r, R: IrReader> Conv<'py, 'r, R> {
             } => {
                 let (load_bits, convert_bits, signed) = loadg_sizes(&cvt)?;
                 let dst_var = self.make_tmp(dst as i64, dst_bits)?;
-                // Python arg eval order: Load(next_atom(), convert(addr), ...,
-                // guard=convert(guard), alt=convert(alt)).
+                // Preserve the historical LoadG operand conversion order: address, guard, then alternative.
                 let lidx = self.next_atom();
                 let a = self.convert_expr(&addr)?;
                 let g = self.convert_expr(&guard)?;
                 let al = self.convert_expr(&alt)?;
-                // Load has NO tags in the Python converter for LoadG.
+                // LoadG is represented as an ITE over an unconditional load. The load, optional conversion, and ITE
+                // are synthesized expressions and therefore have no source tags.
                 let size = (load_bits / 8) as i32;
                 let load = AilExpression {
                     header: ExprHeader::new(
@@ -1014,12 +1024,11 @@ impl<'py, 'r, R: IrReader> Conv<'py, 'r, R> {
                     inner: ExprInner::Load {
                         addr: Arc::new(a),
                         endness: end,
-                        guard: Some(Arc::new(g)),
-                        alt: Some(Arc::new(al)),
+                        guard: None,
+                        alt: None,
                     },
                 };
-                let src = if convert_bits != load_bits {
-                    // ... and neither has this Convert.
+                let iftrue = if convert_bits != load_bits {
                     let cidx = self.next_atom();
                     new_convert(
                         cidx,
@@ -1034,6 +1043,17 @@ impl<'py, 'r, R: IrReader> Conv<'py, 'r, R> {
                     )
                 } else {
                     load
+                };
+                let iidx = self.next_atom();
+                let depth = g.header.depth.max(al.header.depth).max(iftrue.header.depth) + 1;
+                let bits = iftrue.header.bits;
+                let src = AilExpression {
+                    header: ExprHeader::new(iidx, depth, bits, Tags::default()),
+                    inner: ExprInner::ITE {
+                        cond: Arc::new(g),
+                        iffalse: Arc::new(al),
+                        iftrue: Arc::new(iftrue),
+                    },
                 };
                 let idx = self.next_atom();
                 out.push(new_stmt(
@@ -1759,6 +1779,38 @@ fn effect_name(fx: u32) -> String {
     .to_string()
 }
 
+fn llsc_kind<E: Clone>(
+    result: u32,
+    result_bits: u32,
+    addr: E,
+    storedata: Option<(E, u32)>,
+    endness: &str,
+) -> StmtKind<E> {
+    let mut args = vec![addr.clone()];
+    let (operation, mfx, msize) = match storedata {
+        None => ("load_linked", "Ifx_Read", (result_bits / 8) as i64),
+        Some((data, data_bits)) => {
+            args.push(data);
+            ("store_conditional", "Ifx_Write", (data_bits / 8) as i64)
+        }
+    };
+    let suffix = match endness {
+        "Iend_LE" => "le",
+        "Iend_BE" => "be",
+        _ => "unknown_endness",
+    };
+    StmtKind::Dirty {
+        callee: format!("{operation}_{suffix}"),
+        args,
+        guard: None,
+        mfx: Some(mfx.to_string()),
+        maddr: Some(addr),
+        msize: Some(msize),
+        tmp: Some(result),
+        tmp_bits: result_bits,
+    }
+}
+
 fn loadg_cvt_name(cvt: u32) -> String {
     match cvt {
         0x1D01 => "ILGop_IdentV128",
@@ -1893,6 +1945,24 @@ impl IrReader for CReader {
                         endness: endness_str(d.end).to_string(),
                     }
                 }
+                IST_LLSC => {
+                    let result = ist.llsc.result;
+                    let result_bits = type_size_bits(self.tyenv_lookup(result));
+                    let addr = ist.llsc.addr;
+                    let storedata = if ist.llsc.storedata.is_null() {
+                        None
+                    } else {
+                        let data = ist.llsc.storedata;
+                        Some((data, self.result_bits(&data)))
+                    };
+                    llsc_kind(
+                        result,
+                        result_bits,
+                        addr,
+                        storedata,
+                        endness_str(ist.llsc.end),
+                    )
+                }
                 IST_DIRTY => {
                     let d = &*ist.dirty.details;
                     let callee = cstr((*d.cee).name);
@@ -1929,7 +1999,7 @@ impl IrReader for CReader {
                     }
                 }
                 _ => {
-                    // MBE / LLSC / PutI etc.: the Python converter labels these
+                    // MBE / PutI etc.: the Python converter labels these
                     // with ``str(stmt)`` (e.g. "MBusEvent-Imbe_Fence"), which we
                     // can't faithfully reproduce from the C struct. Error out so
                     // the caller falls back to the Python-IRSB path. (run() only
@@ -2462,6 +2532,20 @@ impl<'py> IrReader for PyReader<'py> {
                     endness: stmt.getattr("endness")?.extract()?,
                 }
             }
+            "LLSC" => {
+                let result: u32 = stmt.getattr("result")?.extract()?;
+                let result_bits = self.tyenv.call_method1("sizeof", (result,))?.extract()?;
+                let addr = stmt.getattr("addr")?.unbind();
+                let storedata_obj = stmt.getattr("storedata")?;
+                let endness: String = stmt.getattr("endness")?.extract()?;
+                let storedata = if storedata_obj.is_none() {
+                    None
+                } else {
+                    let store_bits = self.result_size(&storedata_obj);
+                    Some((storedata_obj.unbind(), store_bits))
+                };
+                llsc_kind(result, result_bits, addr, storedata, &endness)
+            }
             "Dirty" => {
                 let tmp_raw: u32 = stmt.getattr("tmp")?.extract()?;
                 let (tmp, tmp_bits) = if tmp_raw != IRTEMP_INVALID {
@@ -2479,9 +2563,9 @@ impl<'py> IrReader for PyReader<'py> {
                     callee: stmt.getattr("cee")?.getattr("name")?.extract()?,
                     args,
                     guard,
-                    mfx: Some(stmt.getattr("mFx")?.extract()?),
+                    mfx: stmt.getattr("mFx")?.extract()?,
                     maddr,
-                    msize: Some(stmt.getattr("mSize")?.extract()?),
+                    msize: stmt.getattr("mSize")?.extract()?,
                     tmp,
                     tmp_bits,
                 }

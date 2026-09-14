@@ -4,6 +4,7 @@ import contextlib
 import enum
 import functools
 import logging
+import time
 from collections import OrderedDict, defaultdict
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal, cast
@@ -44,6 +45,14 @@ if TYPE_CHECKING:
 l = logging.getLogger(name=__name__)
 
 
+class OutOfTimeNotification(AngrError):
+    """
+    Raised from inside the slice's symbolic execution when the resolver's time limit is up. A single block of
+    undecoded bytes can cost minutes on its own, so the limit has to be checked between statements and not only
+    between steps.
+    """
+
+
 class NotAJumpTableNotification(AngrError):
     """
     Exception raised to indicate this is not (or does not appear to be) a jump table.
@@ -72,6 +81,7 @@ class AddressTransformationTypes(int, enum.Enum):
     ShiftRight = 6
     Add = 7
     Load = 8
+    AlignmentMask = 9
 
 
 class AddressTransformation:
@@ -841,6 +851,9 @@ class MIPSGPHook:
 #
 
 
+DEFAULT_TIME_LIMIT = 30.0
+
+
 class JumpTableResolver(IndirectJumpResolver):
     """
     A generic jump table resolver.
@@ -851,14 +864,19 @@ class JumpTableResolver(IndirectJumpResolver):
 
     Progressively larger program slices will be analyzed to determine jump table location and size. If the size of the
     table cannot be determined, a *guess* will be made based on how many entries in the table *appear* valid.
+
+    Each indirect jump gets at most ``time_limit`` seconds of symbolic execution. A jump that runs out of time is
+    reported unresolved, the same as one the resolver cannot make sense of. Pass ``time_limit=None`` to let a jump run
+    for as long as it takes.
     """
 
-    def __init__(self, project, resolve_calls: bool = True):
+    def __init__(self, project, resolve_calls: bool = True, time_limit: float | None = DEFAULT_TIME_LIMIT):
         super().__init__(project, timeless=False)
 
         self.resolve_calls = resolve_calls
+        self.time_limit = time_limit
 
-        self._bss_regions = None
+        self._bss_regions: list[tuple[int, int]] = []
         # the maximum number of resolved targets. Will be initialized from CFG.
         self._max_targets = 0
 
@@ -913,7 +931,12 @@ class JumpTableResolver(IndirectJumpResolver):
         else:
             cv_manager = None
 
+        deadline = None if self.time_limit is None else time.monotonic() + self.time_limit
+
         for slice_steps in range(1, 5):
+            if self._out_of_time(deadline, addr):
+                return False, None
+
             # Perform a backward slicing from the jump target
             # Important: Do not go across function call boundaries
             b = Blade(
@@ -932,12 +955,22 @@ class JumpTableResolver(IndirectJumpResolver):
 
             l.debug("Try resolving %#x with a %d-level backward slice...", addr, slice_steps)
             r, targets = self._resolve(
-                cfg, addr, func, b, cv_manager, potential_call_table=False, func_graph_complete=func_graph_complete
+                cfg,
+                addr,
+                func,
+                b,
+                cv_manager,
+                potential_call_table=False,
+                func_graph_complete=func_graph_complete,
+                deadline=deadline,
             )
             if r:
                 return r, targets
 
         if potential_call_table:
+            if self._out_of_time(deadline, addr):
+                return False, None
+
             b = Blade(
                 cfg.graph,
                 addr,
@@ -952,7 +985,14 @@ class JumpTableResolver(IndirectJumpResolver):
                 cross_insn_opt=True,
             )
             return self._resolve(
-                cfg, addr, func, b, cv_manager, potential_call_table=True, func_graph_complete=func_graph_complete
+                cfg,
+                addr,
+                func,
+                b,
+                cv_manager,
+                potential_call_table=True,
+                func_graph_complete=func_graph_complete,
+                deadline=deadline,
             )
 
         return False, None
@@ -960,6 +1000,13 @@ class JumpTableResolver(IndirectJumpResolver):
     #
     # Private methods
     #
+
+    @staticmethod
+    def _out_of_time(deadline: float | None, addr: int) -> bool:
+        if deadline is None or time.monotonic() < deadline:
+            return False
+        l.debug("Ran out of time while resolving the indirect jump at %#x.", addr)
+        return True
 
     def _resolve(
         self,
@@ -970,6 +1017,7 @@ class JumpTableResolver(IndirectJumpResolver):
         cv_manager: ConstantValueManager | None,
         potential_call_table: bool = False,
         func_graph_complete: bool = True,
+        deadline: float | None = None,
     ) -> tuple[bool, Sequence[int] | None]:
         """
         Internal method for resolving jump tables.
@@ -978,6 +1026,7 @@ class JumpTableResolver(IndirectJumpResolver):
         :param addr:      Address of the block where the indirect jump is.
         :param func:      The Function instance.
         :param b:         The generated backward slice.
+        :param deadline:  A ``time.monotonic()`` reading past which to give up, or None for no limit.
         :return:          A bool indicating whether the indirect jump is resolved successfully, and a list of
                           resolved targets.
         """
@@ -1098,14 +1147,18 @@ class JumpTableResolver(IndirectJumpResolver):
             elif not potential_call_table and not is_arm:
                 l.debug("Indirect jump at %#x does not look like a jump table. Skip.", addr)
                 return False, None
-            if (
-                potential_call_table
-                and transformations
-                and next(iter(transformations.values())).op != AddressTransformationTypes.Load
-            ):
-                # targets of call tables must be directly loaded from memory
-                l.debug("Indirect jump/call at %#x does not look like an indirect call from a call table. Skip", addr)
-                return False, None
+            if potential_call_table:
+                # the alignment mask that the lifter puts on the branch target is not part of the address
+                # computation, so it does not say anything about where the target came from
+                addr_trans = [
+                    tran for tran in transformations.values() if tran.op is not AddressTransformationTypes.AlignmentMask
+                ]
+                if addr_trans and addr_trans[0].op != AddressTransformationTypes.Load:
+                    # targets of call tables must be directly loaded from memory
+                    l.debug(
+                        "Indirect jump/call at %#x does not look like an indirect call from a call table. Skip", addr
+                    )
+                    return False, None
 
         # Debugging output
         if l.level == logging.DEBUG:
@@ -1118,8 +1171,16 @@ class JumpTableResolver(IndirectJumpResolver):
         annotatedcfg = AnnotatedCFG(project, None, detect_loops=False)
         annotatedcfg.from_digraph(b.slice)
 
+        def out_of_time_bp(_state):
+            assert deadline is not None
+            if time.monotonic() >= deadline:
+                raise OutOfTimeNotification
+
         # pylint: disable=too-many-nested-blocks
         for block_addr, _ in sources:
+            if self._out_of_time(deadline, addr):
+                return False, None
+
             # Use slicecutor to execute each one, and get the address
             # We simply give up if any exception occurs on the way
             start_state = self._initial_state(block_addr, cfg, func_addr)
@@ -1134,6 +1195,9 @@ class JumpTableResolver(IndirectJumpResolver):
             # rewrite folded bound-check constraints (Shr(x, k) == 0) into forms that VSA can narrow x with
             shr_bounds_bp = BP(when=BP_BEFORE, enabled=True, action=ShrBoundsConstraintHook.hook)
             start_state.inspect.add_breakpoint("constraints", shr_bounds_bp)
+
+            if deadline is not None:
+                start_state.inspect.add_breakpoint("statement", BP(when=BP_BEFORE, enabled=True, action=out_of_time_bp))
 
             # constant value manager
             if cv_manager is not None:
@@ -1161,7 +1225,7 @@ class JumpTableResolver(IndirectJumpResolver):
 
             # Run it!
             try:
-                simgr.run()
+                simgr.run(until=None if deadline is None else lambda _: time.monotonic() >= deadline)
             except KeyError as ex:
                 # This is because the program slice is incomplete.
                 # Blade will support more IRExprs and IRStmts in the future
@@ -1170,6 +1234,9 @@ class JumpTableResolver(IndirectJumpResolver):
 
             # Get the jumping targets
             for r in simgr.found:
+                if self._out_of_time(deadline, addr):
+                    return False, None
+
                 jt2, jt2_addr, jt2_entrysize, jt2_size = None, None, None, None
                 entries_guessed = False
                 if load_stmt is not None:
@@ -1574,6 +1641,34 @@ class JumpTableResolver(IndirectJumpResolver):
                             AddressTransformationTypes.ShiftRight, [AddressSingleton, stmt.data.args[1].con.value]
                         )
                         continue
+                    elif (
+                        stmt.data.op.startswith("Iop_And")
+                        and isinstance(stmt, pyvex.stmt.WrTmp)
+                        and isinstance(stmt.data.args[0], pyvex.IRExpr.RdTmp)
+                        and isinstance(stmt.data.args[1], pyvex.IRExpr.Const)
+                        and block.tyenv.sizeof(stmt.tmp) == self.project.arch.bits
+                        and stmt.data.args[1].con.value == self._instruction_alignment_mask()
+                    ):
+                        # PowerPC ignores the low two bits of the count and link registers, so the lifter masks the
+                        # target of every bcctr and bclr.
+                        # e.g.
+                        #        IRSB 0x4c6b38
+                        #  + 01 | t17 = GET:I32(gpr30)
+                        #  + 02 | t16 = Add32(t17,0xffffeb8c)
+                        #  + 03 | t18 = LDbe:I32(t16)
+                        #  + 05 | t1 = GET:I32(gpr9)
+                        #  + 06 | t2 = Shl32(t1,0x02)
+                        #  + 09 | t19 = Add32(t18,t2)
+                        #  + 10 | t22 = LDbe:I32(t19)
+                        #  + 13 | t8 = Add32(t22,t18)
+                        #    16 | PUT(ctr) = t8
+                        #  + 18 | t23 = And32(t8,0xfffffffc)
+                        #  + Next: t23
+                        stmts_to_remove.append(stmt_loc)
+                        transformations[(stmt_loc[0], stmt.tmp)] = AddressTransformation(
+                            AddressTransformationTypes.AlignmentMask, [AddressSingleton, stmt.data.args[1].con.value]
+                        )
+                        continue
                 elif isinstance(stmt.data, pyvex.IRExpr.Load):
                     assert isinstance(stmt, pyvex.stmt.WrTmp)
                     # Got it!
@@ -1826,6 +1921,9 @@ class JumpTableResolver(IndirectJumpResolver):
         def handle_or1(a):
             return a | 1
 
+        def handle_alignment_mask(con, a):
+            return a & con
+
         def handle_lshift(num_bits, a):
             return a << num_bits
 
@@ -1859,6 +1957,10 @@ class JumpTableResolver(IndirectJumpResolver):
                     raise NotImplementedError("Unsupported truncation operation.")
             elif tran_op is AddressTransformationTypes.Or1:
                 lam = handle_or1
+            elif tran_op is AddressTransformationTypes.AlignmentMask:
+                lam = functools.partial(
+                    handle_alignment_mask, next(iter(arg for arg in args if arg is not AddressSingleton))
+                )
             elif tran_op is AddressTransformationTypes.ShiftLeft:
                 lam = functools.partial(handle_lshift, next(iter(arg for arg in args if arg is not AddressSingleton)))
             elif tran_op is AddressTransformationTypes.ShiftRight:
@@ -2024,6 +2126,12 @@ class JumpTableResolver(IndirectJumpResolver):
         # we use this to differentiate between traditional jump tables (where each entry is some blocks that belong to
         # the current function) and vtables (where each entry is a function).
         if stride < load_size:
+            if load_size != project.arch.bytes or stmts_adding_base_addr:
+                # A vtable holds pointers that are jumped to as they are. These entries are narrower than a pointer, or
+                # a base address is added to them, so this is an offset table whose address interval came out too
+                # imprecise to tell where the table ends.
+                l.debug("The address of the jump table at %#x is too imprecise to bound the table. Skip.", addr)
+                return None
             stride = load_size
             total_cases = jumptable_addr.cardinality // load_size
             sort = "vtable"  # it's probably a vtable!
@@ -2165,6 +2273,16 @@ class JumpTableResolver(IndirectJumpResolver):
         ):
             l.debug(
                 "Jump table %#x might have jump targets outside mapped memory regions. "
+                "Continue to resolve it from the next data source.",
+                addr,
+            )
+            return None
+
+        if any(start <= min_jumptable_addr < start + size for start, size in self._bss_regions):
+            # The bytes there are the loader's zero fill rather than the program's data, so whatever
+            # this reads is an artifact of how the object was loaded.
+            l.debug(
+                "Jump table %#x is read out of memory that is only zero-filled. "
                 "Continue to resolve it from the next data source.",
                 addr,
             )
@@ -2396,12 +2514,32 @@ class JumpTableResolver(IndirectJumpResolver):
     def _find_bss_region(self):
         self._bss_regions = []
 
-        # TODO: support other sections other than '.bss'.
-        # TODO: this is very hackish. fix it after the chaos.
-        for section in self.project.loader.main_object.sections:
-            if section.name == ".bss":
-                self._bss_regions.append((section.vaddr, section.memsize))
-                break
+        main_object = self.project.loader.main_object
+        tls_start, tls_end = self._tls_block(main_object)
+        for section in main_object.sections:
+            if not section.memsize:
+                continue
+            try:
+                zero_filled = section.only_contains_uninitialized_data
+            except NotImplementedError:
+                # A backend that builds sections without modelling their content cannot say.
+                continue
+            if not zero_filled:
+                continue
+            if tls_start <= section.vaddr < tls_end:
+                # A thread-local zero-fill section describes the initial image of a thread's
+                # thread-local block rather than memory at its own address. An ELF .tbss is laid over
+                # the addresses the linker gave to whatever follows the thread-local template, so
+                # what a read there returns is that section's data and is not uninitialized.
+                continue
+            self._bss_regions.append((section.vaddr, section.memsize))
+
+    @staticmethod
+    def _tls_block(obj) -> tuple[int, int]:
+        if not obj.tls_used or obj.tls_data_start is None:
+            return 0, 0
+        start = obj.mapped_base + obj.tls_data_start
+        return start, start + (obj.tls_block_size or 0)
 
     def _init_registers_on_demand(self, state):
         # for uninitialized read using a register as the source address, we replace them in memory on demand
@@ -2670,6 +2808,18 @@ class JumpTableResolver(IndirectJumpResolver):
         if vex_block.jumpkind == "Ijk_NoDecode":
             return False
         return vex_block.size != 0
+
+    def _instruction_alignment_mask(self) -> int | None:
+        """
+        Build the mask that clears the bits an instruction address cannot use on this architecture.
+
+        :return:    The mask, or None if instructions may start at any byte.
+        """
+
+        alignment = self.project.arch.instruction_alignment
+        if alignment is None or alignment <= 1:
+            return None
+        return ((1 << self.project.arch.bits) - 1) & ~(alignment - 1)
 
     def _is_address_mapped(self, addr: int) -> bool:
         return (
