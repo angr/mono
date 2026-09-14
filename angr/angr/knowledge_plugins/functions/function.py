@@ -31,6 +31,8 @@ from angr.rust.utils.demangler import demangle
 from angr.serializable import Serializable
 from angr.sim_type import SimTypeFunction, parse_defns
 from angr.utils.library import get_cpp_function_name_and_metadata
+from angr.utils.types import dereference_simtype, find_type_refs, type_collections_for_lib
+from angr.utils.vex import block_branch_ins_addr
 
 from .function_parser import FunctionParser
 
@@ -143,6 +145,8 @@ class Function(Serializable):
         "_project",
         "_prototype",
         "_prototype_libname",
+        "_prototype_ref_warned",
+        "_prototype_resolved",
         "_prototype_source",
         "_ret_sites",
         "_retout_sites",
@@ -227,8 +231,11 @@ class Function(Serializable):
         self.sp_delta = 0
         # Calling convention
         self._calling_convention = calling_convention
-        # Function prototype
+        # Function prototype. Prototypes may contain SimTypeRefs (e.g., when loaded from a library definition or an
+        # angrdb); they are dereferenced lazily on the first read of .prototype.
         self._prototype = prototype
+        self._prototype_resolved = False
+        self._prototype_ref_warned = False
         self._prototype_libname = prototype_libname
         if prototype_source is None:
             self._prototype_source = (
@@ -405,7 +412,35 @@ class Function(Serializable):
 
     @property
     def prototype(self) -> SimTypeFunction | None:
+        if self._prototype is None or self._prototype_resolved:
+            return self._prototype
+        self._resolve_prototype()
         return self._prototype
+
+    def _resolve_prototype(self) -> None:
+        """
+        Dereference SimTypeRefs in the prototype using the loaded type collections. Unresolvable references are kept
+        and retried on the next read.
+        """
+        assert self._prototype is not None
+        refs = find_type_refs(self._prototype)
+        if refs:
+            proto = dereference_simtype(
+                self._prototype, type_collections_for_lib(self._prototype_libname), keep_missing=True
+            )
+            assert isinstance(proto, SimTypeFunction)
+            self._prototype = proto
+            refs = find_type_refs(proto)
+        if refs:
+            if not self._prototype_ref_warned:
+                self._prototype_ref_warned = True
+                l.warning(
+                    "Prototype of function %s references unknown types %s; load the type library that defines them.",
+                    self.name,
+                    sorted(refs),
+                )
+        else:
+            self._prototype_resolved = True
 
     @prototype.setter
     @dirty_func
@@ -432,6 +467,8 @@ class Function(Serializable):
                         arg_names.append(f"a{i}")
             proto.arg_names = tuple(arg_names)
         self._prototype = proto
+        self._prototype_resolved = False
+        self._prototype_ref_warned = False
 
     @property
     def prototype_libname(self):
@@ -442,11 +479,22 @@ class Function(Serializable):
         if self._prototype_libname == libname:
             return
         self._prototype_libname = libname
+        self._prototype_resolved = False
+        self._prototype_ref_warned = False
         self.mark_dirty()
 
     @property
     def is_prototype_guessed(self) -> bool:
         return self._prototype_source in {PrototypeSource.NONE, PrototypeSource.GUESSED, PrototypeSource.CCA_LOW}
+
+    @property
+    def is_prototype_groundtruth(self) -> bool:
+        """
+        True if the prototype comes from outside of the decompiler (SimProcedures, signatures, or the user) and may be
+        fed back into type inference as ground truth. Prototypes inferred by the decompiler itself are excluded so that
+        re-decompiling a function does not freeze its own earlier guess.
+        """
+        return self._prototype is not None and self._prototype_source > PrototypeSource.CCA_DECOMPILER
 
     @property
     def prototype_source(self) -> PrototypeSource:
@@ -473,6 +521,8 @@ class Function(Serializable):
         self._info = info
         # update the owner
         self._info._func = self
+        if self._function_manager is not None:
+            self._function_manager.index_key_func_addrs(self)
 
     @property
     def is_plt(self) -> bool:
@@ -1235,6 +1285,7 @@ class Function(Serializable):
             return self._local_blocks[node.addr]
 
         self.mark_dirty()
+        self._local_transition_graph = None
         if node.addr not in self and node not in self.transition_graph:
             # only add each node to the graph once
             self.transition_graph.add_node(node)
@@ -1764,12 +1815,11 @@ class Function(Serializable):
                 new_successors = [i for i in all_nodes if i.addr == smallest_node.addr]
                 if new_successors:
                     new_successor = new_successors[0]
-                    new_ins_addrs = self.project.factory.block(new_node.addr, size=new_node.size).instruction_addrs
-                    if self.project.arch.branch_delay_slot and len(new_ins_addrs) >= 2:
-                        new_ins_addr = new_ins_addrs[-2]
-                    elif len(new_ins_addrs) >= 1:
-                        new_ins_addr = new_ins_addrs[-1]
-                    else:
+                    new_block = self.project.factory.block(new_node.addr, size=new_node.size)
+                    new_ins_addr = block_branch_ins_addr(
+                        new_block.instruction_addrs, new_block.addr, new_block.size, self.project.arch
+                    )
+                    if new_ins_addr is None:
                         # the new node is somehow not decode-able
                         new_ins_addr = new_node.addr + new_node.size - 1
                     graph.add_edge(

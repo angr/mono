@@ -139,6 +139,15 @@ class SimEngineVRAIL(
         if stmt.expd_hi is not None:
             self._expr(stmt.expd_hi)
 
+        for old in (stmt.old_lo, stmt.old_hi):
+            if isinstance(old, ailment.Expr.VirtualVariable):
+                self._assign_to_vvar(
+                    old,
+                    RichR(self.state.top(old.bits)),
+                    dst=old,
+                    vvar_id=self._mapped_vvarid(old.varid),
+                )
+
     def _handle_stmt_Store(self, stmt: ailment.Stmt.Store):
         addr_r = self._expr_bv(stmt.addr)
         data = self._expr(stmt.data)
@@ -633,6 +642,8 @@ class SimEngineVRAIL(
 
     def _handle_expr_Convert(self, expr: ailment.Expr.Convert):
         r = self._expr(expr.operand)
+        if expr.vector_count is not None:
+            return RichR(self.state.top(expr.to_bits))
         typevar = None
         if r.typevar is not None:
             if isinstance(r.typevar, typevars.DerivedTypeVariable) and isinstance(
@@ -807,7 +818,7 @@ class SimEngineVRAIL(
     def _handle_binop_Sub(self, expr):
         arg0, arg1 = expr.operands
         r0, r1 = self._expr_pair(arg0, arg1)
-        compute = r0.data - r1.data  # type: ignore
+        compute = r0.data - r1.data if r0.data.size() == r1.data.size() else self.state.top(expr.bits)  # type: ignore
 
         type_constraints = set()
         typevar = None
@@ -831,7 +842,7 @@ class SimEngineVRAIL(
         r0, r1 = self._expr_pair(arg0, arg1)
 
         result_size = arg0.bits
-        if r0.data.concrete or r1.data.concrete:
+        if (r0.data.concrete or r1.data.concrete) and r0.data.size() == r1.data.size():
             # constants
             result_size = arg0.bits
             compute = r0.data * r1.data  # type: ignore
@@ -899,7 +910,7 @@ class SimEngineVRAIL(
                 tc = typevars.Subtype(r1.typevar, int_type_func(arg1.bits))
                 self.state.add_type_constraint(tc)
 
-        if expr.floating_point:
+        if expr.floating_point or to_size > from_size:
             quotient = self.state.top(to_size)
         else:
             if (r1.data == 0).is_true():
@@ -998,8 +1009,9 @@ class SimEngineVRAIL(
         r1 = self._expr_bv(arg1)
         result_size = arg0.bits
 
-        # logical right shift implies unsigned operand
-        if isinstance(r0.typevar, typevars.TypeVariable):
+        # logical right shift implies unsigned operand, unless it extracts the sign bit (x >> (bits - 1))
+        is_sign_bit_extraction = r1.data.concrete and r1.data.concrete_value == result_size - 1
+        if isinstance(r0.typevar, typevars.TypeVariable) and not is_sign_bit_extraction:
             tc = typevars.Subtype(r0.typevar, typeconsts.unsigned_int_type(result_size))
             self.state.add_type_constraint(tc)
 

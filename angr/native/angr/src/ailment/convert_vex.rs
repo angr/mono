@@ -28,7 +28,7 @@ use crate::ailment::enums::{ConvertType, RoundingMode};
 use crate::ailment::manager::Manager;
 use crate::ailment::tags::{TagExtra, TagKey, Tags};
 use crate::ailment::vex_ffi::{self, IRExpr, IRSB};
-use crate::ailment::vexop;
+use crate::ailment::vexop::{self, SimOpInfo};
 
 const DEFAULT_STATEMENT: i64 = -2;
 const IRTEMP_INVALID: u32 = 0xFFFF_FFFF;
@@ -479,6 +479,12 @@ impl<'py, 'r, R: IrReader> Conv<'py, 'r, R> {
                 // Python raises NotImplementedError; treat as unsupported.
                 return Err(ConvErr::Unsupported);
             }
+            if let Some(vector_count) = simop.vector_count {
+                // lane-wise conversion, e.g. Iop_F16toF32x4 or Iop_F32toI32Sx4_RZ
+                let idx = self.next_atom();
+                let operand = self.convert_expr(arg)?;
+                return Ok(self.vector_convert(&simop, idx, operand, vector_count, None));
+            }
             let from_size = simop.from_size.unwrap_or(0);
             let to_size = simop.to_size.unwrap_or(0);
             let signed = simop.is_signed();
@@ -551,6 +557,38 @@ impl<'py, 'r, R: IrReader> Conv<'py, 'r, R> {
 
     // ---- Binop ---------------------------------------------------------
 
+    /// Build a lane-wise `Convert` for a vector conversion op. `from_bits`/`to_bits` are the
+    /// total widths; the lane widths are `from_bits / vector_count` and `to_bits / vector_count`.
+    fn vector_convert(
+        &mut self,
+        simop: &SimOpInfo,
+        idx: i64,
+        operand: AilExpression,
+        vector_count: u32,
+        rounding_mode: Option<RoundingModeOrExpr>,
+    ) -> AilExpression {
+        let from_type = convert_type_of(simop.from_type.as_deref());
+        let to_type = convert_type_of(simop.to_type.as_deref());
+        let is_signed = if from_type == ConvertType::TypeFp && to_type == ConvertType::TypeInt {
+            simop.fp_to_int_signed()
+        } else {
+            simop.is_signed()
+        };
+        let rounding_mode = rounding_mode.or_else(|| suffix_rounding_mode(&simop.name));
+        new_convert_v(
+            idx,
+            operand.header.bits,
+            simop.output_size_bits,
+            is_signed,
+            operand,
+            from_type,
+            to_type,
+            rounding_mode,
+            Some(vector_count),
+            self.tags(),
+        )
+    }
+
     fn convert_binop(
         &mut self,
         op: &OpRef,
@@ -559,6 +597,17 @@ impl<'py, 'r, R: IrReader> Conv<'py, 'r, R> {
     ) -> Result<AilExpression, ConvErr> {
         let simop = op.simop().map_err(|_| ConvErr::Unsupported)?;
         let mut op_name = simop.generic_name.clone();
+        if let (None, Some(vector_count)) = (op_name.as_deref(), simop.vector_count) {
+            if !simop.is_conversion() {
+                return Err(ConvErr::Unsupported);
+            }
+            // lane-wise conversion with a rounding-mode operand, e.g. Iop_F32toI32Sx4
+            let rm = self.convert_expr(a1)?;
+            let operand = self.convert_expr(a2)?;
+            let idx = self.next_atom();
+            let rm = Some(vex_rm_value(&rm));
+            return Ok(self.vector_convert(&simop, idx, operand, vector_count, rm));
+        }
         let mut operands = vec![self.convert_expr(a1)?, self.convert_expr(a2)?];
 
         // Add + negative Const -> Sub
@@ -663,7 +712,7 @@ impl<'py, 'r, R: IrReader> Conv<'py, 'r, R> {
                     idx,
                     from_size,
                     to_size,
-                    simop.is_signed(),
+                    simop.fp_to_int_signed(),
                     operand,
                     ConvertType::TypeFp,
                     ConvertType::TypeInt,
@@ -772,12 +821,16 @@ impl<'py, 'r, R: IrReader> Conv<'py, 'r, R> {
             ));
         }
 
+        // a conversion none of the branches above understood; never emit a nameless BinaryOp
+        let Some(op_name) = op_name else {
+            return Err(ConvErr::Unsupported);
+        };
         let idx = self.next_atom();
         let rhs = operands.pop().unwrap();
         let lhs = operands.pop().unwrap();
         Ok(new_binop(
             idx,
-            op_name.unwrap_or_default(),
+            op_name,
             lhs,
             rhs,
             signed,
@@ -792,7 +845,9 @@ impl<'py, 'r, R: IrReader> Conv<'py, 'r, R> {
 
     fn convert_triop(&mut self, op: &OpRef, args: &[R::E]) -> Result<AilExpression, ConvErr> {
         let simop = op.simop().map_err(|_| ConvErr::Unsupported)?;
-        let op_name = simop.generic_name.clone().unwrap_or_default();
+        let Some(op_name) = simop.generic_name.clone() else {
+            return Err(ConvErr::Unsupported);
+        };
         let mut operands = self.convert_list(args)?;
         let bits = simop.output_size_bits;
         if simop.float {
@@ -1420,6 +1475,34 @@ fn new_convert(
     rounding_mode: Option<RoundingModeOrExpr>,
     tags: Tags,
 ) -> AilExpression {
+    new_convert_v(
+        idx,
+        from_bits,
+        to_bits,
+        is_signed,
+        operand,
+        from_type,
+        to_type,
+        rounding_mode,
+        None,
+        tags,
+    )
+}
+
+/// `new_convert` with a lane count for vector conversions (`Iop_F32toI32Sx4` etc.).
+#[allow(clippy::too_many_arguments)]
+fn new_convert_v(
+    idx: i64,
+    from_bits: u32,
+    to_bits: u32,
+    is_signed: bool,
+    operand: AilExpression,
+    from_type: ConvertType,
+    to_type: ConvertType,
+    rounding_mode: Option<RoundingModeOrExpr>,
+    vector_count: Option<u32>,
+    tags: Tags,
+) -> AilExpression {
     let depth = operand.header.depth + 1;
     AilExpression {
         header: ExprHeader::new(idx, depth, to_bits, tags),
@@ -1431,8 +1514,30 @@ fn new_convert(
             from_type,
             to_type,
             rounding_mode,
+            vector_count,
         },
     }
+}
+
+fn convert_type_of(t: Option<&str>) -> ConvertType {
+    if t == Some("F") {
+        ConvertType::TypeFp
+    } else {
+        ConvertType::TypeInt
+    }
+}
+
+/// Rounding mode baked into an op name (`Iop_F32toI32Sx4_RZ`), if any. The deprecated `_DEP`
+/// forms carry no rounding mode at all.
+fn suffix_rounding_mode(name: &str) -> Option<RoundingModeOrExpr> {
+    let mode = match name.rsplit_once('_')?.1 {
+        "RZ" => RoundingMode::RmTowardsZero,
+        "RN" => RoundingMode::RmNearestTiesEven,
+        "RM" => RoundingMode::RmTowardsNegativeInf,
+        "RP" => RoundingMode::RmTowardsPositiveInf,
+        _ => return None,
+    };
+    Some(RoundingModeOrExpr::Mode(mode))
 }
 
 /// `_new_dirty_expression` with no operands: depth is a constant 1.
@@ -1466,6 +1571,8 @@ fn loadg_sizes(cvt: &str) -> PyResult<(u32, u32, bool)> {
         "ILGop_Ident32" => (32, 32, false),
         "ILGop_Ident64" => (64, 64, false),
         "ILGop_IdentV128" => (128, 128, false),
+        "ILGop_Ident16" => (16, 16, false),
+        "ILGop_Ident8" => (8, 8, false),
         "ILGop_8Uto32" => (8, 32, false),
         "ILGop_8Sto32" => (8, 32, true),
         "ILGop_16Uto32" => (16, 32, false),
@@ -1578,10 +1685,12 @@ unsafe fn const_value(c: *const vex_ffi::IRConst) -> ConstVal {
             ICO_U16 => (ConstValue::Int(ico.u16_ as i128), 16),
             ICO_U32 => (ConstValue::Int(ico.u32_ as i128), 32),
             ICO_U64 => (ConstValue::Int(ico.u64_ as i128), 64),
+            ICO_U128 => (expand_vector(ico.u128 as u64, 16), 128),
             ICO_F32 | ICO_F32I => (ConstValue::Float(ico.f32_ as f64), 32),
             ICO_F64 | ICO_F64I => (ConstValue::Float(ico.f64_), 64),
             ICO_V128 => (expand_vector(ico.v128 as u64, 16), 128),
             ICO_V256 => (expand_vector(ico.v256 as u64, 32), 256),
+            ICO_V512 => (expand_vector(ico.v512, 64), 512),
             _ => (ConstValue::Int(0), 0),
         }
     };
@@ -1655,10 +1764,12 @@ fn loadg_cvt_name(cvt: u32) -> String {
         0x1D01 => "ILGop_IdentV128",
         0x1D02 => "ILGop_Ident64",
         0x1D03 => "ILGop_Ident32",
-        0x1D04 => "ILGop_16Uto32",
-        0x1D05 => "ILGop_16Sto32",
-        0x1D06 => "ILGop_8Uto32",
-        0x1D07 => "ILGop_8Sto32",
+        0x1D04 => "ILGop_Ident16",
+        0x1D05 => "ILGop_Ident8",
+        0x1D06 => "ILGop_16Uto32",
+        0x1D07 => "ILGop_16Sto32",
+        0x1D08 => "ILGop_8Uto32",
+        0x1D09 => "ILGop_8Sto32",
         _ => "ILGop_INVALID",
     }
     .to_string()
@@ -1944,8 +2055,9 @@ fn const_bits(tag: u32) -> u32 {
         ICO_U16 => 16,
         ICO_U32 | ICO_F32 | ICO_F32I => 32,
         ICO_U64 | ICO_F64 | ICO_F64I => 64,
-        ICO_V128 => 128,
+        ICO_U128 | ICO_V128 => 128,
         ICO_V256 => 256,
+        ICO_V512 => 512,
         _ => 0,
     }
 }
@@ -1986,10 +2098,18 @@ fn build_archinfo(arch: &Bound<'_, PyAny>) -> PyResult<vex_ffi::VexArchInfo> {
         },
         ppc_icache_line_sz_b: geti("ppc_icache_line_szB").unwrap_or(0) as std::ffi::c_int,
         ppc_dcbz_sz_b: geti("ppc_dcbz_szB").unwrap_or(0) as u32,
+        ppc_scv_supported: geti("ppc_scv_supported").unwrap_or(0) as u8,
         ppc_dcbzl_sz_b: geti("ppc_dcbzl_szB").unwrap_or(0) as u32,
         arm64_d_min_line_lg2_sz_b: geti("arm64_dMinLine_lg2_szB").unwrap_or(0) as u32,
         arm64_i_min_line_lg2_sz_b: geti("arm64_iMinLine_lg2_szB").unwrap_or(0) as u32,
-        x86_cr0: geti("x86_cr0").unwrap_or(0) as u32,
+        arm64_cache_block_size: geti("arm64_cache_block_size").unwrap_or(0) as u8,
+        arm64_requires_fallback_llsc: geti("arm64_requires_fallback_LLSC").unwrap_or(0) as u8,
+        // cr0 == 0 means real mode to the x86 lifter, so a missing key must
+        // fall back to libVEX's protected-mode default, not to zero.
+        x86_cr0: match geti("x86_cr0") {
+            Ok(0) | Err(_) => 0xFFFF_FFFF,
+            Ok(v) => v as u32,
+        },
     })
 }
 

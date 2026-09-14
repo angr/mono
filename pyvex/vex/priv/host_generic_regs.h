@@ -7,12 +7,12 @@
    This file is part of Valgrind, a dynamic binary instrumentation
    framework.
 
-   Copyright (C) 2004-2015 OpenWorks LLP
+   Copyright (C) 2004-2017 OpenWorks LLP
       info@open-works.net
 
    This program is free software; you can redistribute it and/or
    modify it under the terms of the GNU General Public License as
-   published by the Free Software Foundation; either version 2 of the
+   published by the Free Software Foundation; either version 3 of the
    License, or (at your option) any later version.
 
    This program is distributed in the hope that it will be useful, but
@@ -21,9 +21,7 @@
    General Public License for more details.
 
    You should have received a copy of the GNU General Public License
-   along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-   02110-1301, USA.
+   along with this program; if not, see <http://www.gnu.org/licenses/>.
 
    The GNU General Public License is contained in the file COPYING.
 
@@ -38,6 +36,7 @@
 
 #include "libvex_basictypes.h"
 
+#include "main_util.h"
 
 /*---------------------------------------------------------*/
 /*--- Representing HOST REGISTERS                       ---*/
@@ -422,7 +421,10 @@ typedef
       RLPri_Int,       /* in the primary int return reg */
       RLPri_2Int,      /* in both primary and secondary int ret regs */
       RLPri_V128SpRel, /* 128-bit value, on the stack */
-      RLPri_V256SpRel  /* 256-bit value, on the stack */
+      RLPri_V256SpRel, /* 256-bit value, on the stack */
+#ifdef AVX_512
+      RLPri_V512SpRel  /* 512-bit value, on the stack */
+#endif
    }
    RetLocPrimary;
 
@@ -446,7 +448,11 @@ static inline RetLoc mk_RetLoc_simple ( RetLocPrimary pri ) {
 }
 
 static inline RetLoc mk_RetLoc_spRel ( RetLocPrimary pri, Int off ) {
+#ifdef AVX_512
+   vassert(pri >= RLPri_V128SpRel && pri <= RLPri_V512SpRel);
+#else
    vassert(pri >= RLPri_V128SpRel && pri <= RLPri_V256SpRel);
+#endif
    return (RetLoc){pri, off};
 }
 
@@ -455,6 +461,9 @@ static inline Bool is_sane_RetLoc ( RetLoc rloc ) {
       case RLPri_None: case RLPri_Int: case RLPri_2Int:
          return rloc.spOff == 0;
       case RLPri_V128SpRel: case RLPri_V256SpRel:
+#ifdef AVX_512
+      case RLPri_V512SpRel:
+#endif
          return True;
       default:
          return False;

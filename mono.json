@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "87411a719c96ddc3f3954590b1833b1789e19697",
-      "committed_at": "2026-09-04T17:07:46-07:00",
-      "subject": "Make claripy annotation flags class attributes (#7095)",
+      "commit": "04cc2782b246810a5e43355ffe13a12b398a6242",
+      "committed_at": "2026-09-14T13:05:19-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#7196)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "aa843e5c10645ba361620768d59642a460805e80",
-      "committed_at": "2026-09-03T20:18:13-07:00",
-      "subject": "Prevent preferences sidebar from collapsing (#1728)",
+      "commit": "744e9864899a3d14c2967e7dd265ccc58694d3ab",
+      "committed_at": "2026-09-14T13:06:14-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#1732)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -40,17 +40,17 @@
     },
     "angrop": {
       "upstream": "https://github.com/angr/angrop",
-      "commit": "e8519dc4ca294ad4cf44fd0376545c3740647330",
-      "committed_at": "2026-09-03T08:45:38-07:00",
-      "subject": "Import claripy through the angr package (#158)",
+      "commit": "6875df828b08db1922fde45a7290add1e05b6085",
+      "committed_at": "2026-09-07T05:40:10-07:00",
+      "subject": "rop_utils: Support controlling stack values that are shifted right. (#159)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "384c676de767e1216a7fee2a08f2d549ff2a1028",
-      "committed_at": "2026-09-02T20:21:17Z",
-      "subject": "Update version to 9.3.5.dev0 [ci skip]",
+      "commit": "983e0827a3836db3703db03930a28a6f6c631df9",
+      "committed_at": "2026-09-14T13:05:00-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#383)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -64,9 +64,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "0e77ade3c39a3cee05f65051e57955675e1ac21b",
-      "committed_at": "2026-09-04T07:55:32-07:00",
-      "subject": "Fix Mach-O section metadata and function discovery (#810)",
+      "commit": "c4a0db11e124acc0c59d9767820747c5e525e676",
+      "committed_at": "2026-09-14T13:06:20-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#831)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -91,23 +91,23 @@
     },
     "pysoot": {
       "upstream": "https://github.com/angr/pysoot",
-      "commit": "d42f9afbeea43389eb2deaf41b22077d2d7cd4f4",
-      "committed_at": "2026-08-31T11:52:00-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#57)",
+      "commit": "820499f6d92a034404698dcd3b66f31bdc4fb829",
+      "committed_at": "2026-09-14T13:05:33-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#58)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "f0e49736d4b21446b1b22577f277b62acf970e0a",
-      "committed_at": "2026-09-02T20:21:24Z",
-      "subject": "Update version to 9.3.5.dev0 [ci skip]",
+      "commit": "24e2bd862aaedc14887bd247f1f1130445f94db6",
+      "committed_at": "2026-09-14T13:05:51-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#583)",
       "excluded": [
         ".gitmodules"
       ],
       "sibling_sources_repointed_at_workspace": [],
       "vendored_submodules": {
-        "vex": "875f7c9a5f6be621b4f000c29c016e15ddf32207"
+        "vex": "e3062871112afded52ae155757113a5873e9819c"
       }
     },
     "tracer": {
@@ -119,13 +119,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-09-06T10:39:52+00:00",
+  "imported_at": "2026-09-14T23:17:39+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "003e82a2bfa641530924055695b36cec8af483ab",
-      "committed_at": "2026-09-03T19:15:32-07:00",
-      "subject": "Add a darwin/arm64 Go language-detector fixture (#224)",
+      "commit": "a7e43a0620b77681e4b2d0e87513ea1d1031479e",
+      "committed_at": "2026-09-14T03:23:45-07:00",
+      "subject": "Add a struct-return decompiler fixture (#231)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }

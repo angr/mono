@@ -101,6 +101,7 @@ from angr.utils.constants import DEFAULT_STATEMENT
 from angr.utils.graph import GraphUtils
 from angr.utils.ssa import is_phi_assignment
 from angr.utils.types import dereference_simtype_by_lib
+from angr.utils.vex import block_branch_ins_addr
 
 from .ail_simplifier import AILSimplifier
 from .ailgraph_walker import AILGraphWalker, RemoveNodeNotice
@@ -1475,14 +1476,11 @@ class Clinic(Analysis, Serializable):
                 if callsite_ins_addr is None:
                     # parse the block...
                     callsite_block = self.project.factory.block(callsite.addr, size=callsite.size)
-                    if self.project.arch.branch_delay_slot:
-                        if callsite_block.instructions < 2:
-                            continue
-                        callsite_ins_addr = callsite_block.instruction_addrs[-2]
-                    else:
-                        if callsite_block.instructions == 0:
-                            continue
-                        callsite_ins_addr = callsite_block.instruction_addrs[-1]
+                    callsite_ins_addr = block_branch_ins_addr(
+                        callsite_block.instruction_addrs, callsite_block.addr, callsite_block.size, self.project.arch
+                    )
+                    if callsite_ins_addr is None:
+                        continue
 
                 cc = self.project.analyses.CallingConvention(
                     None,
@@ -1527,7 +1525,7 @@ class Clinic(Analysis, Serializable):
         # finally, recover the calling convention of the current function
         if (
             self.function.prototype is None or self.function.calling_convention is None
-        ) or self.function.prototype_source < PrototypeSource.CCA_DECOMPILER:
+        ) or not self.function.is_prototype_groundtruth:
             old_proto = self.function.prototype
             old_source = self.function.prototype_source
 
@@ -2027,8 +2025,8 @@ class Clinic(Analysis, Serializable):
             new_last_stmt.tags["is_prototype_guessed"] = True
             new_last_stmt.expr.tags["is_prototype_guessed"] = True
             if func is not None:
-                new_last_stmt.tags["is_prototype_guessed"] = func.is_prototype_guessed
-                new_last_stmt.expr.tags["is_prototype_guessed"] = func.is_prototype_guessed
+                new_last_stmt.tags["is_prototype_guessed"] = not func.is_prototype_groundtruth
+                new_last_stmt.expr.tags["is_prototype_guessed"] = not func.is_prototype_groundtruth
             block.statements[-1] = new_last_stmt
 
         return ail_graph
@@ -2495,12 +2493,7 @@ class Clinic(Analysis, Serializable):
     @timethis
     def _make_argument_list(self) -> list[SimVariable]:
         if self.function.calling_convention is not None and self.function.prototype is not None:
-            proto = (
-                dereference_simtype_by_lib(self.function.prototype, self.function.prototype_libname)
-                if self.function.prototype_libname
-                else self.function.prototype
-            )
-            args: list[SimFunctionArgument] = self.function.calling_convention.arg_locs(proto)
+            args: list[SimFunctionArgument] = self.function.calling_convention.arg_locs(self.function.prototype)
             if self._flatten_args:
                 new_args = []
                 for arg in args:
@@ -2638,9 +2631,8 @@ class Clinic(Analysis, Serializable):
     @timethis
     def _make_function_prototype(self, arg_list: list[SimVariable]):
         if self.function.prototype is not None:
-            if self.function.prototype_source.value >= PrototypeSource.CCA_DECOMPILER.value:
-                # do not overwrite an existing function prototype
-                # if you want to re-generate the prototype, clear the existing one first
+            if self.function.is_prototype_groundtruth:
+                # do not overwrite a prototype that came from outside our own analyses
                 return
             if isinstance(self.function.prototype.returnty, SimTypeFloat) or any(
                 isinstance(arg, SimTypeFloat) for arg in self.function.prototype.args
@@ -2721,7 +2713,8 @@ class Clinic(Analysis, Serializable):
                 for tv in vr.var_to_typevars[variable]:
                     groundtruth[tv] = vartype
 
-        if self.function.prototype is not None and not self.function.is_prototype_guessed:
+        if self.function.is_prototype_groundtruth:
+            assert self.function.prototype is not None
             for arg_i, (_, variable) in arg_vvars.items():
                 if arg_i < len(self.function.prototype.args):
                     for tv in vr.var_to_typevars[variable]:
@@ -4703,7 +4696,7 @@ class Clinic(Analysis, Serializable):
             if not self.kb.functions.contains_addr(func_addr):
                 continue
             func = self.kb.functions.get_by_addr(func_addr)
-            if func.prototype is not None and func.is_prototype_guessed is False:
+            if func.prototype is not None and func.is_prototype_groundtruth:
                 # already has a "good" prototype; don't overwrite it
                 continue
 

@@ -49,6 +49,7 @@ from angr.procedures.procedure_dict import SIM_PROCEDURES
 from angr.procedures.stubs.UnresolvableJumpTarget import UnresolvableJumpTarget
 from angr.utils.constants import DEFAULT_STATEMENT
 from angr.utils.orderedset import OrderedSet
+from angr.utils.vex import block_branch_ins_addr, block_is_single_instruction
 
 from .indirect_jump_resolvers.default_resolvers import default_indirect_jump_resolvers
 
@@ -68,6 +69,12 @@ class CFGBase(Analysis):
     """
     The base class for control flow graphs.
     """
+
+    if TYPE_CHECKING:
+        # provided by ForwardAnalysis, which every concrete CFG analysis also derives from
+
+        @property
+        def should_abort(self) -> bool: ...
 
     tag: str = None  # type:ignore
     addr_type: Literal["int", "block_id", "soot"] = None  # type: ignore
@@ -3108,15 +3115,15 @@ class CFGBase(Analysis):
         # Add it to our set. Will process it later if user allows.
         # Create an IndirectJump instance
         if addr not in self.indirect_jumps:
-            if self.project.arch.branch_delay_slot:
-                if len(cfg_node.instruction_addrs) < 2:
-                    # sanity check
-                    # decoding failed when decoding the second instruction (or even the first instruction)
-                    return False, set(), None
-                ins_addr = cfg_node.instruction_addrs[-2]
-            elif cfg_node.instruction_addrs:
-                ins_addr = cfg_node.instruction_addrs[-1]
-            else:
+            if self.project.arch.branch_delay_slot and block_is_single_instruction(
+                cfg_node.instruction_addrs, cfg_node.addr, cfg_node.size, self.project.arch
+            ):
+                # the block cannot hold both a branch and its delay slot; the indirect exit is a decode artifact
+                return False, set(), None
+            ins_addr = block_branch_ins_addr(
+                cfg_node.instruction_addrs, cfg_node.addr, cfg_node.size, self.project.arch
+            )
+            if ins_addr is None:
                 # fallback
                 ins_addr = addr
             assert jumpkind is not None
@@ -3148,6 +3155,8 @@ class CFGBase(Analysis):
         idx: int
         jump: IndirectJump
         for idx, jump in enumerate(self._indirect_jumps_to_resolve):
+            if self.should_abort:
+                break
             if self._low_priority:
                 self._release_gil(idx, 50, 0.000001)
             all_targets |= self._process_one_indirect_jump(jump)

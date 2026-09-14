@@ -256,7 +256,22 @@ impl StridedInterval {
                 if straddling {
                     // Split into two parts
                     // First part: [lower_bound, north_pole_left] aligned to stride
-                    let a_upper = &north_pole_left - ((&north_pole_left - lower_bound) % stride);
+                    //
+                    // A wrapping interval can start above the north pole -- 8-bit
+                    // 1[0xf0, 0x90] -- so north_pole_left - lower_bound can be negative.
+                    let modulus = BigUint::one() << *bits;
+                    let offset = if lower_bound <= &north_pole_left {
+                        (&north_pole_left - lower_bound) % stride
+                    } else {
+                        let overshoot = (lower_bound - &north_pole_left) % stride;
+                        if overshoot.is_zero() {
+                            BigUint::zero()
+                        } else {
+                            stride - overshoot
+                        }
+                    };
+                    let a_upper =
+                        (&modulus + &north_pole_left - offset % &modulus) & max_int(*bits);
                     let a = Self::new(*bits, stride.clone(), lower_bound.clone(), a_upper.clone());
 
                     // Second part: [north_pole_right or next stride point, upper_bound]
@@ -1862,7 +1877,7 @@ impl StridedInterval {
                 let bits = max(*bits1, *bits2);
 
                 // Simple case: both are constants
-                if s_lb == o_lb && s_lb == o_ub {
+                if self.is_integer() && other.is_integer() {
                     let result = s_lb % o_lb;
                     return Ok(StridedInterval::constant(bits, result));
                 }
@@ -3161,6 +3176,76 @@ mod si_bounds_tests {
         assert_eq!(min_s, BigInt::zero());
         assert_eq!(max_s, BigInt::zero());
     }
+
+    #[test]
+    fn test_nsplit_wrapping_above_north_pole() {
+        // Wrapping interval starting above the north pole: 1[0xf0, 0x90] covers
+        // 0xf0..=0xff and 0x00..=0x90, so it crosses 0x7f -> 0x80 once.
+        let si = StridedInterval::Normal {
+            bits: 8,
+            stride: BigUint::one(),
+            lower_bound: BigUint::from(0xf0u32),
+            upper_bound: BigUint::from(0x90u32),
+        };
+        assert_eq!(
+            si.nsplit(),
+            vec![
+                StridedInterval::new(8, 1u32, 0xf0u32, 0x7fu32),
+                StridedInterval::new(8, 1u32, 0x80u32, 0x90u32),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_nsplit_wrapping_above_north_pole_odd_stride() {
+        // A stride that does not divide 2^bits: 0x7f - ((0x7f - 0xf0) mod 3) is
+        // 0x7e under a floored remainder and 0x7d under a modulo-2^bits one.
+        let si = StridedInterval::Normal {
+            bits: 8,
+            stride: BigUint::from(3u32),
+            lower_bound: BigUint::from(0xf0u32),
+            upper_bound: BigUint::from(0x90u32),
+        };
+        assert_eq!(
+            si.nsplit(),
+            vec![
+                StridedInterval::new(8, 3u32, 0xf0u32, 0x7eu32),
+                StridedInterval::new(8, 3u32, 0x81u32, 0x90u32),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_nsplit_wrapping_above_north_pole_stride_wider_than_bits() {
+        // Nothing masks the stride to the bit width, so the split has to hold
+        // for one that exceeds it. 0x7f - ((0x7f - 0xf0) mod 385) is -145, and
+        // claripy stores that as -145 & 0xff = 0x6f.
+        let si = StridedInterval::Normal {
+            bits: 8,
+            stride: BigUint::from(385u32),
+            lower_bound: BigUint::from(0xf0u32),
+            upper_bound: BigUint::from(0x90u32),
+        };
+        assert_eq!(
+            si.nsplit(),
+            vec![
+                StridedInterval::new(8, 385u32, 0xf0u32, 0x6fu32),
+                StridedInterval::new(8, 385u32, 0xf0u32, 0x90u32),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_mul_wrapping_above_north_pole() {
+        // mul splits both operands at the poles, which is how nsplit is reached.
+        let si = StridedInterval::Normal {
+            bits: 8,
+            stride: BigUint::one(),
+            lower_bound: BigUint::from(0xf0u32),
+            upper_bound: BigUint::from(0x90u32),
+        };
+        assert!(!si.mul(&StridedInterval::constant(8, 2u32)).is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -3274,6 +3359,40 @@ mod si_arithmetic_op_tests {
         let result = a.sub(&b);
         assert_eq!(result, StridedInterval::range(32, 5u32, 25u32));
         assert!(!result.is_integer());
+    }
+
+    #[test]
+    fn test_mul_product_beyond_the_width() {
+        // psplit leaves 127[0xff, 0xfd] with the piece 127[0x7e, 0x01], which
+        // still wraps, so wrapped_signed_mul reads its signed bounds as
+        // (126, 1) and picks the corner (1 * -128, 126 * -127). The overflow
+        // check above the conversion assumes the bounds are ordered, so -16002
+        // reached to_unsigned and panicked.
+        let a = StridedInterval::new(8, 127u32, 0xffu32, 0xfdu32);
+        let b = StridedInterval::new(8, 1u32, 0x80u32, 0x81u32);
+        let result = a.mul(&b);
+        assert_eq!(result.bits(), 8);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_urem_constant_divisor_non_constant_dividend() {
+        // [5, 9] urem 5 is {0, 1, 2, 3, 4}, not the constant 5 % 5.
+        let a = StridedInterval::range(32, 5u32, 9u32);
+        let b = StridedInterval::constant(32, 5u32);
+        let result = a.urem(&b).unwrap();
+        for x in 5u32..=9u32 {
+            assert!(
+                result.contains_value(&BigUint::from(x % 5)),
+                "urem dropped {} from [5, 9] urem 5",
+                x % 5
+            );
+        }
+
+        // Both constant still takes the exact path.
+        let a = StridedInterval::constant(32, 9u32);
+        let result = a.urem(&b).unwrap();
+        assert_eq!(result, StridedInterval::constant(32, 4u32));
     }
 }
 

@@ -7,12 +7,12 @@
    This file is part of Valgrind, a dynamic binary instrumentation
    framework.
 
-   Copyright (C) 2004-2015 OpenWorks LLP
+   Copyright (C) 2004-2017 OpenWorks LLP
       info@open-works.net
 
    This program is free software; you can redistribute it and/or
    modify it under the terms of the GNU General Public License as
-   published by the Free Software Foundation; either version 2 of the
+   published by the Free Software Foundation; either version 3 of the
    License, or (at your option) any later version.
 
    This program is distributed in the hope that it will be useful, but
@@ -21,9 +21,7 @@
    General Public License for more details.
 
    You should have received a copy of the GNU General Public License
-   along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-   02110-1301, USA.
+   along with this program; if not, see <http://www.gnu.org/licenses/>.
 
    The GNU General Public License is contained in the file COPYING.
 
@@ -360,6 +358,10 @@ void ppRetLoc ( RetLoc ska )
          vex_printf("RLPri_V128SpRel(%d)", ska.spOff); return;
       case RLPri_V256SpRel:
          vex_printf("RLPri_V256SpRel(%d)", ska.spOff); return;
+#ifdef AVX_512
+      case RLPri_V512SpRel:
+         vex_printf("RLPri_V512SpRel(%d)", ska.spOff); return;
+#endif
       default:
          vpanic("ppRetLoc");
    }
