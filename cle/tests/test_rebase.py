@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import io
 import os
 
+import archinfo
+import pytest
 import cle
 
 TEST_BASE = os.path.join(os.path.dirname(os.path.realpath(__file__)), os.path.join("..", "..", "binaries"))
@@ -69,7 +72,99 @@ def test_rebase_granularity_is_not_a_hard_object_limit():
         assert ld.find_object_containing(obj.min_addr) is obj
 
 
+def load_narrow_blob(size):
+    """
+    Load a blob of ``size`` bytes as a z80 image. The whole 16-bit address space is smaller than a
+    single default granule, so every placement in it has to ignore the granularity.
+    """
+    pytest.importorskip("pypcode")
+    arch = archinfo.ArchPcode("z80:LE:16:default")
+    ld = cle.Loader(
+        io.BytesIO(b"\0" * size),
+        main_opts={"backend": "blob", "base_addr": 0, "entry_point": 0, "arch": arch},
+    )
+    assert (ld.main_object.min_addr, ld.main_object.max_addr) == (0, size - 1)
+    return ld
+
+
+def test_address_space_narrower_than_the_granularity():
+    """
+    Aligning to the granularity in a 16-bit address space puts the extern object past the end of
+    memory, and the load fails with "Ran out of room in address space".
+    """
+    ld = load_narrow_blob(0x1500)
+
+    extern = ld.extern_object
+    assert extern.min_addr > ld.main_object.max_addr
+    assert extern.max_addr < 2**ld.main_object.arch.bits
+    ld.memory.unpack_word(extern.min_addr)
+
+
+def test_narrow_address_space_holds_more_objects_than_granules():
+    """
+    A 16-bit address space does not contain even one default granule, so it holds no object at all
+    if the granularity is treated as a constraint.
+    """
+    ld = load_narrow_blob(0x1500)
+
+    objects = []
+    for _ in range(24):
+        obj = MockBackend(0x100, arch=ld.main_object.arch)
+        ld.dynamic_load(obj)
+        objects.append(obj)
+
+    placed = sorted(objects, key=lambda o: o.min_addr)
+    assert placed[-1].max_addr < 2**ld.main_object.arch.bits
+    for lower, upper in zip(placed, placed[1:]):
+        assert lower.max_addr < upper.min_addr
+    for obj in objects:
+        assert ld.find_object_containing(obj.min_addr) is obj
+
+
+def test_the_main_binary_base_is_not_handed_out_twice():
+    """
+    A container backend loads its children through the loader, and a child can be marked as the
+    main binary: a universal Mach-O marks every slice it loads, because a Mach-O executable
+    refuses to load as anything else. The position-independent main binary has a fixed base
+    address, so the second such object was placed on top of the first.
+    """
+    path = os.path.join(TEST_BASE, "tests", "i386", "manysum")
+    ld = cle.Loader(path, auto_load_libs=False)
+
+    first = MockBackend(0x1000, arch=ld.main_object.arch, is_main_bin=True)
+    second = MockBackend(0x1000, arch=ld.main_object.arch, is_main_bin=True)
+    ld.dynamic_load(first)
+    ld.dynamic_load(second)
+
+    assert first.mapped_base == 0x400000
+    assert second.min_addr > first.max_addr
+
+
+def test_archive_members_fill_a_16_bit_address_space():
+    """
+    A page is a sixteenth of AVR's 64 KiB, so falling back to one costs a whole page per archive
+    member and leaves nowhere to put a member larger than what is left over.
+    """
+    pytest.importorskip("pypcode")
+    path = os.path.join(TEST_BASE, "tests", "avr", "libgcov_avr31.a")
+    ld = cle.Loader(path)
+
+    members = [obj for obj in ld.all_objects if obj.parent_object is ld.main_object]
+    assert len(members) == 28
+
+    placed = sorted(members, key=lambda o: o.min_addr)
+    assert placed[-1].max_addr < 2**ld.main_object.arch.bits
+    for lower, upper in zip(placed, placed[1:]):
+        assert lower.max_addr < upper.min_addr
+    for obj in members:
+        assert ld.find_object_containing(obj.min_addr, membership_check=False) is obj
+
+
 if __name__ == "__main__":
     test_sparse_main_object()
     test_sparse_main_object_unsorted_program_headers()
     test_rebase_granularity_is_not_a_hard_object_limit()
+    test_address_space_narrower_than_the_granularity()
+    test_narrow_address_space_holds_more_objects_than_granules()
+    test_the_main_binary_base_is_not_handed_out_twice()
+    test_archive_members_fill_a_16_bit_address_space()
