@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "1a3e46294f646b33b42fdc7fb2b3d20cca3ee924",
-      "committed_at": "2026-09-15T00:48:21-07:00",
-      "subject": "RegionIdentifier: Compute natural loop bodies instead of head-to-latch slices. (#7199)",
+      "commit": "96f77efe67d50acd24afb51ee210de9ce98abfc7",
+      "committed_at": "2026-09-15T00:59:34-07:00",
+      "subject": "Flirt: read enough bytes for every module's CRC region and tail bytes. (#7201)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -119,7 +119,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-09-15T07:59:43+00:00",
+  "imported_at": "2026-09-15T08:20:15+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
