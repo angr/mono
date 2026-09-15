@@ -13,6 +13,7 @@ from functools import wraps
 import archinfo
 
 import angr
+from angr.analyses.calling_convention.utils import is_sane_register_variable
 from angr.analyses.complete_calling_conventions import (
     DEAD_WORKER_GRACE_PERIOD,
     CallingConventionAnalysisMode,
@@ -194,6 +195,26 @@ class TestCallingConventionAnalysis(unittest.TestCase):
             self.check_args(func_name, self._a(funcs, func_name), args)
 
     @cca_mode("fast,variables")
+    def test_s390x_fauxware(self, *, mode):
+        binary_path = os.path.join(test_location, "s390x", "fauxware")
+        proj = angr.Project(binary_path, auto_load_libs=False, load_debug_info=False)
+
+        cfg = proj.analyses.CFG()  # fill in the default kb
+
+        proj.analyses.CompleteCallingConventions(mode=mode, recover_variables=True)
+
+        funcs = cfg.kb.functions
+
+        # check args
+        expected_args = {
+            "accepted": [],
+            "authenticate": ["r_r2", "r_r3"],
+        }
+
+        for func_name, args in expected_args.items():
+            self.check_args(func_name, self._a(funcs, func_name), args)
+
+    @cca_mode("fast,variables")
     def test_x8664_void(self, *, mode):
         binary_path = os.path.join(test_location, "x86_64", "types", "void")
         proj = angr.Project(binary_path, auto_load_libs=False, load_debug_info=False)
@@ -228,6 +249,28 @@ class TestCallingConventionAnalysis(unittest.TestCase):
                     ret_val = func.calling_convention.return_val(func.prototype.returnty)
                     assert isinstance(ret_val, SimRegArg)
                     assert ret_val.reg_name == r
+
+    def test_ppc64_argument_registers(self):
+        # r3-r10 and fpr1-fpr13 may be candidate arguments on PPC64.
+        arch = archinfo.arch_from_id("ppc64")
+        accepted = ["r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"]
+        accepted += [f"fpr{i}" for i in range(1, 14)]
+        for reg_name in accepted:
+            offset, size = arch.registers[reg_name]
+            assert is_sane_register_variable(arch, offset, size), reg_name
+        for reg_name in ["r0", "r1", "r2", "r11", "r12", "r31", "lr", "ctr", "cr0", "fpr0", "fpr14", "fpr31"]:
+            offset, size = arch.registers[reg_name]
+            assert not is_sane_register_variable(arch, offset, size), reg_name
+
+    def test_s390x_argument_registers(self):
+        # r2-r6 and f0, f2, f4, f6 may be candidate arguments on S390X.
+        arch = archinfo.arch_from_id("s390x")
+        for reg_name in ["r2", "r3", "r4", "r5", "r6", "f0", "f2", "f4", "f6"]:
+            offset, size = arch.registers[reg_name]
+            assert is_sane_register_variable(arch, offset, size), reg_name
+        for reg_name in ["r1", "r7", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "a0", "a1", "f1", "f8"]:
+            offset, size = arch.registers[reg_name]
+            assert not is_sane_register_variable(arch, offset, size), reg_name
 
     def test_x86_saved_regs(self):
         # Calling convention analysis should be able to determine calling convention of functions with registers
@@ -294,6 +337,20 @@ class TestCallingConventionAnalysis(unittest.TestCase):
 
         assert cca.prototype is not None
         assert cca.prototype.returnty is not None
+
+    def test_i386_rejected_partial_register_is_not_an_argument(self):
+        # sub_fe744 reads bx before writing it, so bx is a candidate argument. It consolidates to ebx, and
+        # cdecl passes no argument in a register, so _match drops it: the function has no arguments.
+        binary_path = os.path.join(test_location, "i386", "bios.bin.elf")
+        proj = angr.Project(binary_path, auto_load_libs=False)
+        _ = proj.analyses.CFGFast(normalize=True, regions=[(0xFE700, 0xFE800)], start_at_entry=False)
+        func = proj.kb.functions[0xFE744]
+        proj.analyses.VariableRecoveryFast(func)
+        cca = proj.analyses.CallingConvention(func, collect_facts=True)
+
+        assert isinstance(cca.cc, SimCCCdecl)
+        assert cca.prototype is not None
+        assert len(cca.prototype.args) == 0, f"sub_fe744 takes no arguments, got {cca.prototype}"
 
     def test_armhf_thumb_movcc(self):
         binary_path = os.path.join(test_location, "armhf", "amp_challenge_07.gcc")
