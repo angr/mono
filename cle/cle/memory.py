@@ -5,11 +5,42 @@ import itertools
 import struct
 from collections.abc import Iterator
 from mmap import mmap
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import archinfo
 
 __all__ = ("ClemoryBase", "Clemory", "ClemoryView", "ClemoryTranslator", "UninitializedClemory")
+
+# The word sizes struct has an integer format character for. Every other width - the 3-byte word of
+# a 24-bit architecture, or anything wider than 8 bytes - has to be composed from its bytes.
+_STRUCT_WORD_SIZES = frozenset((1, 2, 4, 8))
+
+
+def _byteorder(endness: archinfo.Endness) -> Literal["little", "big"]:
+    """
+    Translate an :class:`archinfo.Endness` into a byte order accepted by ``int.from_bytes``.
+    """
+    if endness == archinfo.Endness.BE:
+        return "big"
+    if endness == archinfo.Endness.LE:
+        return "little"
+    raise ValueError(f"Unsupported endness value {endness}.")
+
+
+def _classify_struct_error(error: struct.error, fmt: str, available: int, addr: int) -> Exception:
+    """
+    Decide what an access that raised `error` should report: a ``KeyError`` if it ran off the end of
+    its backer, and the error itself otherwise.
+
+    Return the exception rather than raising it so the caller can raise it outside its own handler,
+    where a short access does not carry the struct error as its context.
+    """
+    try:
+        fmt_size = struct.calcsize(fmt)
+    except struct.error:
+        # `fmt` itself is malformed, so this is not a question of how much room is left
+        return error
+    return KeyError(addr) if available < fmt_size else error
 
 
 class ClemoryBase:
@@ -30,6 +61,9 @@ class ClemoryBase:
         raise NotImplementedError
 
     def __contains__(self, k):
+        raise NotImplementedError
+
+    def __iter__(self):
         raise NotImplementedError
 
     def load(self, addr, n):
@@ -60,15 +94,17 @@ class ClemoryBase:
         try:
             return struct.unpack_from(fmt, backer, addr - start)
         except struct.error as e:
-            if len(backer) - (addr - start) >= struct.calcsize(fmt):
-                raise e
-            raise KeyError(addr)  # pylint: disable=raise-missing-from
+            error = _classify_struct_error(e, fmt, len(backer) - (addr - start), addr)
+        raise error
 
     def unpack_word(
         self, addr: int, size: int | None = None, signed: bool = False, endness: archinfo.Endness | None = None
     ) -> int:
         """
-        Use the ``struct`` module to unpack a single integer from the address `addr`.
+        Unpack a single integer from the address `addr`.
+
+        Any positive size works. Widths ``struct`` has no format character for are read as bytes and
+        recombined.
 
         You may override any of the attributes of the word being extracted:
 
@@ -77,26 +113,19 @@ class ClemoryBase:
         :param bool signed: Whether the data should be extracted signed/unsigned. Default unsigned
         :param archinfo.Endness endness: The endian to use in packing/unpacking. Defaults to memory endness
         """
-        if size is not None and size > 8:
-            # support larger wordsizes via recursive algorithm
-            subsize = size >> 1
-            if size != subsize << 1:
-                raise ValueError("Cannot unpack non-power-of-two sizes")
+        word_size: int = self._arch.bytes if size is None else size
+        word_endness: archinfo.Endness = self._arch.memory_endness if endness is None else endness
+        if word_size <= 0:
+            raise ValueError(f"Invalid size: {word_size}")
 
-            if endness is None:
-                endness = self._arch.memory_endness
-            if endness == archinfo.Endness.BE:
-                lo_off, hi_off = subsize, 0
-            elif endness == archinfo.Endness.LE:
-                lo_off, hi_off = 0, subsize
-            else:
-                raise ValueError(f"Unsupported endness value {endness}.")
+        if word_size not in _STRUCT_WORD_SIZES:
+            data = self.load(addr, word_size)
+            if len(data) != word_size:
+                # `load` stops at the first unmapped byte instead of raising
+                raise KeyError(addr)
+            return int.from_bytes(data, _byteorder(word_endness), signed=signed)
 
-            lo = self.unpack_word(addr + lo_off, size=subsize, signed=False, endness=endness)
-            hi = self.unpack_word(addr + hi_off, size=subsize, signed=signed, endness=endness)
-            return (hi << (subsize << 3)) | lo
-
-        return self.unpack(addr, self._arch.struct_fmt(size=size, signed=signed, endness=endness))[0]
+        return self.unpack(addr, self._arch.struct_fmt(size=word_size, signed=signed, endness=word_endness))[0]
 
     def load_null_terminated_bytes(self, addr: int, max_size: int = 4096) -> bytes:
         """
@@ -130,9 +159,8 @@ class ClemoryBase:
         try:
             return struct.pack_into(fmt, backer, addr - start, *data)
         except struct.error as e:
-            if len(backer) - (addr - start) >= struct.calcsize(fmt):
-                raise e
-            raise KeyError(addr)  # pylint: disable=raise-missing-from
+            error = _classify_struct_error(e, fmt, len(backer) - (addr - start), addr)
+        raise error
 
     def pack_word(
         self,
@@ -143,7 +171,11 @@ class ClemoryBase:
         endness: archinfo.Endness | None = None,
     ):
         """
-        Use the ``struct`` module to pack a single integer `data` into memory at the address `addr`.
+        Pack a single integer `data` into memory at the address `addr`.
+
+        Any positive size works. Widths ``struct`` has no format character for are written as bytes.
+        The whole word has to be backed; a write that would run off the end raises ``KeyError`` and
+        leaves memory alone.
 
         You may override any of the attributes of the word being packed:
 
@@ -152,9 +184,22 @@ class ClemoryBase:
         :param bool signed: Whether the data should be extracted signed/unsigned. Default unsigned
         :param archinfo.Endness endness: The endian to use in packing/unpacking. Defaults to memory endness
         """
+        word_size: int = self._arch.bytes if size is None else size
+        word_endness: archinfo.Endness = self._arch.memory_endness if endness is None else endness
+        if word_size <= 0:
+            raise ValueError(f"Invalid size: {word_size}")
+
         if not signed:
-            data &= (1 << (size * 8 if size is not None else self._arch.bits)) - 1
-        return self.pack(addr, self._arch.struct_fmt(size=size, signed=signed, endness=endness), data)
+            data &= (1 << (word_size * 8)) - 1
+
+        if word_size not in _STRUCT_WORD_SIZES:
+            if len(self.load(addr, word_size)) != word_size:
+                # `store` writes the bytes that fit before it reports the overrun, so check the whole
+                # word is backed before writing any of it
+                raise KeyError(addr)
+            return self.store(addr, data.to_bytes(word_size, _byteorder(word_endness), signed=signed))
+
+        return self.pack(addr, self._arch.struct_fmt(size=word_size, signed=signed, endness=word_endness), data)
 
     def read(self, nbytes: int):
         """
@@ -263,7 +308,10 @@ class Clemory(ClemoryBase):
             return
         if addr <= start_addr:
             return
-        if isinstance(backer, ClemoryBase):
+        # backers() recurses into nested clemories and yields the child's own backers, while remove_backer() below
+        # removes from self._backers, where the child itself sits.
+        idx = bisect.bisect_left(self._backers, start_addr, key=lambda x: x[0])
+        if idx >= len(self._backers) or self._backers[idx][1] is not backer:
             raise ValueError("Cannot split a backer which is itself a clemory")
         if addr >= start_addr + len(backer):
             return
@@ -277,7 +325,9 @@ class Clemory(ClemoryBase):
         return f"<{self.__class__.__name__} [{hex(self.min_addr)}:{hex(self.max_addr)}]>"
 
     def remove_backer(self, start):
-        backer_idx = bisect.bisect(self._backers, start, key=lambda x: x[0])
+        # bisect_left, not bisect_right: the backer starting exactly at `start` is the one to remove, and bisect_right
+        # would land on the backer after it.
+        backer_idx = bisect.bisect_left(self._backers, start, key=lambda x: x[0])
 
         if len(self._backers) <= backer_idx or self._backers[backer_idx][0] != start:
             raise ValueError("Can't find backer to remove")
@@ -286,13 +336,12 @@ class Clemory(ClemoryBase):
         self._update_min_max()
 
     def __iter__(self):
-        for start, string in self._backers:
-            if isinstance(string, bytes | list):
-                for x in range(len(string)):
-                    yield start + x
+        for start, backer in self._backers:
+            if isinstance(backer, Clemory):
+                for addr in backer:
+                    yield start + addr
             else:
-                for x in string:
-                    yield start + x
+                yield from range(start, start + len(backer))
 
     def __getitem__(self, k):
         for start, data in self._backers:
@@ -451,7 +500,7 @@ class Clemory(ClemoryBase):
 
         :param bytes data:          The bytestring to search for
         :param int search_min:      Optional: The first address to include as valid
-        :param int search_max:      Optional: The last address to include as valid
+        :param int search_max:      Optional: The address to stop searching at, exclusive
         :return Iterator[int]:      Iterates over addresses at which the bytestring occurs
         """
         if search_min is None:
@@ -467,13 +516,14 @@ class Clemory(ClemoryBase):
             elif isinstance(backer, list):
                 raise TypeError("find is not supported for list-backed clemories")
             else:
-                if search_max < start or search_min > start + len(data):
+                if search_max < start or search_min > start + len(backer):
                     continue
+                limit = min(len(backer), search_max - start)
                 ptr = search_min - start - 1
                 while True:
                     ptr += 1
                     ptr = backer.find(data, max(0, ptr))
-                    if ptr == -1 or ptr + len(data) > search_max - start - 1:
+                    if ptr == -1 or ptr >= limit or ptr + len(data) > search_max - start:
                         break
                     yield ptr + start
 
@@ -481,6 +531,13 @@ class Clemory(ClemoryBase):
         """
         Update the three properties of Clemory: consecutive, min_addr, and max_addr.
         """
+
+        if not self._backers:
+            # Removing the last backer leaves the same empty memory a freshly constructed Clemory has.
+            self.consecutive = True
+            self.min_addr = 0
+            self.max_addr = 0
+            return
 
         is_consecutive = True
         next_start = None
@@ -553,11 +610,11 @@ class ClemoryView(ClemoryBase):
     def __setitem__(self, k, v):
         if not self._offset <= k < self._endoffset:
             raise KeyError(k)
-        return self._backer[k + self._rebase]
+        self._backer[k + self._rebase] = v
 
     def __contains__(self, k):
         if not self._offset <= k < self._endoffset:
-            raise KeyError(k)
+            return False
         return k + self._rebase in self._backer
 
     def backers(self, addr=0):
@@ -570,17 +627,9 @@ class ClemoryView(ClemoryBase):
             else:
                 # clamp it via a memoryview
                 view = memoryview(backer)
-                if taddr + len(backer) - 1 >= self._endoffset:
-                    clamp_end = len(backer) - self._endoffset + taddr
-                else:
-                    clamp_end = len(backer)
-
-                if taddr < self._offset:
-                    clamp_start = self._offset - taddr
-                else:
-                    clamp_start = 0
-
-                yield taddr, view[clamp_start:clamp_end]
+                clamp_start = max(0, self._offset - taddr)
+                clamp_end = min(len(backer), self._endoffset - taddr)
+                yield taddr + clamp_start, view[clamp_start:clamp_end]
 
     def load(self, addr, n):
         if n == 0:
@@ -601,11 +650,12 @@ class ClemoryView(ClemoryBase):
         self._backer.store(addr + self._rebase, data)
 
     def find(self, data, search_min=None, search_max=None) -> Iterator[int]:
-        if search_min is None or search_min < self._start:
-            search_min = self._start
-        if search_max is None or search_max > self._end:
-            search_max = self._end
-        return self._backer.find(data, search_min=search_min + self._rebase, search_max=search_max + self._rebase)
+        if search_min is None or search_min < self._offset:
+            search_min = self._offset
+        if search_max is None or search_max > self._endoffset:
+            search_max = self._endoffset
+        for addr in self._backer.find(data, search_min=search_min + self._rebase, search_max=search_max + self._rebase):
+            yield addr - self._rebase
 
 
 class ClemoryTranslator(ClemoryBase):
@@ -724,6 +774,13 @@ class ClemoryReadOnlyView(ClemoryBase):
     def __setitem__(self, k, v):
         raise NotImplementedError("ClemoryReadOnlyView does not support item assignment")
 
+    def __contains__(self, k) -> bool:
+        try:
+            self[k]
+        except KeyError:
+            return False
+        return True
+
     def load(self, addr: int, n: int) -> bytes:
         """
         Read up to `n` bytes at address `addr` in memory and return a bytes object.
@@ -768,16 +825,12 @@ class ClemoryReadOnlyView(ClemoryBase):
     def store(self, addr, data):
         raise NotImplementedError("ClemoryReadOnlyView does not support storing")
 
+    def pack(self, addr: int, fmt: str, *data):
+        raise NotImplementedError("ClemoryReadOnlyView does not support packing")
+
     def backers(self, addr: int = 0):
-        start_pos = bisect.bisect_right(self._flattened_backers, addr, key=lambda x: x[0])
-        if start_pos > 0:
-            start_pos -= 1
-        for idx in range(start_pos, len(self._flattened_backers)):
-            start, data = self._flattened_backers[idx]
-            if start > addr:
-                break
-            if 0 <= addr - start < len(data):
-                yield start, data
+        start_pos = bisect.bisect_right(self._flattened_backers, addr, key=lambda x: x[0] + len(x[1]))
+        yield from itertools.islice(self._flattened_backers, start_pos, None)
 
     def unpack(self, addr, fmt):
         if self._last_backer_pos is not None:
@@ -786,9 +839,8 @@ class ClemoryReadOnlyView(ClemoryBase):
                 try:
                     return struct.unpack_from(fmt, data, addr - start)
                 except struct.error as ex:
-                    if len(data) - (addr - start) >= struct.calcsize(fmt):
-                        raise ex
-                    raise KeyError(addr) from ex
+                    error = _classify_struct_error(ex, fmt, len(data) - (addr - start), addr)
+                raise error
 
         idx = bisect.bisect_right(self._flattened_backers, addr, key=lambda x: x[0])
         if idx > 0:
@@ -803,9 +855,8 @@ class ClemoryReadOnlyView(ClemoryBase):
             self._last_backer_pos = idx
             return v
         except struct.error as ex:
-            if len(data) - (addr - start) >= struct.calcsize(fmt):
-                raise ex
-            raise KeyError(addr) from ex
+            error = _classify_struct_error(ex, fmt, len(data) - (addr - start), addr)
+        raise error
 
     def _flatten_backers(self):
         for start, backer in self._clemory.backers():
