@@ -30,7 +30,9 @@ class TagDict(TypedDict, total=False):
     is_prototype_guessed: bool
     keep_in_slice: bool
     orig_ins_addr: int
+    pcode_space: str
     reg_name: str
+    return_addr_assignment_removed: bool
     uninitialized: bool
     vex_block_addr: int
     vex_stmt_idx: int
