@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "04cc2782b246810a5e43355ffe13a12b398a6242",
-      "committed_at": "2026-09-14T13:05:19-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#7196)",
+      "commit": "f138c08c2bc290ee00fbe75471c7039f08f93df5",
+      "committed_at": "2026-09-14T16:17:27-07:00",
+      "subject": "Phoenix: Fix missing nodes caused by cyclic refinement not being aware of orphaning nodes in the full graph. (#7190)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -119,7 +119,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-09-14T23:17:39+00:00",
+  "imported_at": "2026-09-15T00:02:05+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
