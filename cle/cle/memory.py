@@ -32,6 +32,9 @@ class ClemoryBase:
     def __contains__(self, k):
         raise NotImplementedError
 
+    def __iter__(self):
+        raise NotImplementedError
+
     def load(self, addr, n):
         raise NotImplementedError
 
@@ -263,7 +266,10 @@ class Clemory(ClemoryBase):
             return
         if addr <= start_addr:
             return
-        if isinstance(backer, ClemoryBase):
+        # backers() recurses into nested clemories and yields the child's own backers, while remove_backer() below
+        # removes from self._backers, where the child itself sits.
+        idx = bisect.bisect_left(self._backers, start_addr, key=lambda x: x[0])
+        if idx >= len(self._backers) or self._backers[idx][1] is not backer:
             raise ValueError("Cannot split a backer which is itself a clemory")
         if addr >= start_addr + len(backer):
             return
@@ -277,7 +283,9 @@ class Clemory(ClemoryBase):
         return f"<{self.__class__.__name__} [{hex(self.min_addr)}:{hex(self.max_addr)}]>"
 
     def remove_backer(self, start):
-        backer_idx = bisect.bisect(self._backers, start, key=lambda x: x[0])
+        # bisect_left, not bisect_right: the backer starting exactly at `start` is the one to remove, and bisect_right
+        # would land on the backer after it.
+        backer_idx = bisect.bisect_left(self._backers, start, key=lambda x: x[0])
 
         if len(self._backers) <= backer_idx or self._backers[backer_idx][0] != start:
             raise ValueError("Can't find backer to remove")
@@ -286,13 +294,12 @@ class Clemory(ClemoryBase):
         self._update_min_max()
 
     def __iter__(self):
-        for start, string in self._backers:
-            if isinstance(string, bytes | list):
-                for x in range(len(string)):
-                    yield start + x
+        for start, backer in self._backers:
+            if isinstance(backer, Clemory):
+                for addr in backer:
+                    yield start + addr
             else:
-                for x in string:
-                    yield start + x
+                yield from range(start, start + len(backer))
 
     def __getitem__(self, k):
         for start, data in self._backers:
@@ -451,7 +458,7 @@ class Clemory(ClemoryBase):
 
         :param bytes data:          The bytestring to search for
         :param int search_min:      Optional: The first address to include as valid
-        :param int search_max:      Optional: The last address to include as valid
+        :param int search_max:      Optional: The address to stop searching at, exclusive
         :return Iterator[int]:      Iterates over addresses at which the bytestring occurs
         """
         if search_min is None:
@@ -467,13 +474,14 @@ class Clemory(ClemoryBase):
             elif isinstance(backer, list):
                 raise TypeError("find is not supported for list-backed clemories")
             else:
-                if search_max < start or search_min > start + len(data):
+                if search_max < start or search_min > start + len(backer):
                     continue
+                limit = min(len(backer), search_max - start)
                 ptr = search_min - start - 1
                 while True:
                     ptr += 1
                     ptr = backer.find(data, max(0, ptr))
-                    if ptr == -1 or ptr + len(data) > search_max - start - 1:
+                    if ptr == -1 or ptr >= limit or ptr + len(data) > search_max - start:
                         break
                     yield ptr + start
 
@@ -481,6 +489,13 @@ class Clemory(ClemoryBase):
         """
         Update the three properties of Clemory: consecutive, min_addr, and max_addr.
         """
+
+        if not self._backers:
+            # Removing the last backer leaves the same empty memory a freshly constructed Clemory has.
+            self.consecutive = True
+            self.min_addr = 0
+            self.max_addr = 0
+            return
 
         is_consecutive = True
         next_start = None
@@ -553,11 +568,11 @@ class ClemoryView(ClemoryBase):
     def __setitem__(self, k, v):
         if not self._offset <= k < self._endoffset:
             raise KeyError(k)
-        return self._backer[k + self._rebase]
+        self._backer[k + self._rebase] = v
 
     def __contains__(self, k):
         if not self._offset <= k < self._endoffset:
-            raise KeyError(k)
+            return False
         return k + self._rebase in self._backer
 
     def backers(self, addr=0):
@@ -570,17 +585,9 @@ class ClemoryView(ClemoryBase):
             else:
                 # clamp it via a memoryview
                 view = memoryview(backer)
-                if taddr + len(backer) - 1 >= self._endoffset:
-                    clamp_end = len(backer) - self._endoffset + taddr
-                else:
-                    clamp_end = len(backer)
-
-                if taddr < self._offset:
-                    clamp_start = self._offset - taddr
-                else:
-                    clamp_start = 0
-
-                yield taddr, view[clamp_start:clamp_end]
+                clamp_start = max(0, self._offset - taddr)
+                clamp_end = min(len(backer), self._endoffset - taddr)
+                yield taddr + clamp_start, view[clamp_start:clamp_end]
 
     def load(self, addr, n):
         if n == 0:
@@ -601,11 +608,12 @@ class ClemoryView(ClemoryBase):
         self._backer.store(addr + self._rebase, data)
 
     def find(self, data, search_min=None, search_max=None) -> Iterator[int]:
-        if search_min is None or search_min < self._start:
-            search_min = self._start
-        if search_max is None or search_max > self._end:
-            search_max = self._end
-        return self._backer.find(data, search_min=search_min + self._rebase, search_max=search_max + self._rebase)
+        if search_min is None or search_min < self._offset:
+            search_min = self._offset
+        if search_max is None or search_max > self._endoffset:
+            search_max = self._endoffset
+        for addr in self._backer.find(data, search_min=search_min + self._rebase, search_max=search_max + self._rebase):
+            yield addr - self._rebase
 
 
 class ClemoryTranslator(ClemoryBase):
@@ -724,6 +732,13 @@ class ClemoryReadOnlyView(ClemoryBase):
     def __setitem__(self, k, v):
         raise NotImplementedError("ClemoryReadOnlyView does not support item assignment")
 
+    def __contains__(self, k) -> bool:
+        try:
+            self[k]
+        except KeyError:
+            return False
+        return True
+
     def load(self, addr: int, n: int) -> bytes:
         """
         Read up to `n` bytes at address `addr` in memory and return a bytes object.
@@ -768,16 +783,12 @@ class ClemoryReadOnlyView(ClemoryBase):
     def store(self, addr, data):
         raise NotImplementedError("ClemoryReadOnlyView does not support storing")
 
+    def pack(self, addr: int, fmt: str, *data):
+        raise NotImplementedError("ClemoryReadOnlyView does not support packing")
+
     def backers(self, addr: int = 0):
-        start_pos = bisect.bisect_right(self._flattened_backers, addr, key=lambda x: x[0])
-        if start_pos > 0:
-            start_pos -= 1
-        for idx in range(start_pos, len(self._flattened_backers)):
-            start, data = self._flattened_backers[idx]
-            if start > addr:
-                break
-            if 0 <= addr - start < len(data):
-                yield start, data
+        start_pos = bisect.bisect_right(self._flattened_backers, addr, key=lambda x: x[0] + len(x[1]))
+        yield from itertools.islice(self._flattened_backers, start_pos, None)
 
     def unpack(self, addr, fmt):
         if self._last_backer_pos is not None:
