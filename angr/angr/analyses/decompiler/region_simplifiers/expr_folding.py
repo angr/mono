@@ -9,6 +9,7 @@ from angr import ailment
 from angr.ailment import AILBlockRewriter, Block, Expression
 from angr.ailment.expression import ITE, Atom, Call, Load, VirtualVariable
 from angr.ailment.statement import Assignment, Return, Statement
+from angr.ailment.utils import has_llsc_expression, has_store_conditional, is_llsc_expression
 from angr.analyses.decompiler.sequence_walker import SequenceWalker
 from angr.analyses.decompiler.structurer_nodes import (
     CascadingConditionNode,
@@ -164,15 +165,15 @@ class LoopNodeFinder(SequenceWalker):
 
     def __init__(self, node: SequenceNode):
         handlers = {
-            LoopNode: self._handle_Loop,
+            LoopNode: self._walk_Loop,
         }
         super().__init__(handlers, update_seqnode_in_place=False, force_forward_scan=True)
         self.loop_nodes: list[LoopNode] = []
 
         self.walk(node)
 
-    def _handle_Loop(self, node: LoopNode, **kwargs):
-        super()._handle_Loop(node, **kwargs)
+    def _walk_Loop(self, node: LoopNode, **kwargs):
+        yield from super()._walk_Loop(node, **kwargs)
         self.loop_nodes.append(node)
 
 
@@ -260,9 +261,9 @@ class ExpressionCounter(SequenceWalker):
     def __init__(self, node):
         handlers = {
             ConditionalBreakNode: self._handle_ConditionalBreak,
-            ConditionNode: self._handle_Condition,
-            LoopNode: self._handle_Loop,
-            SwitchCaseNode: self._handle_SwitchCase,
+            ConditionNode: self._walk_Condition,
+            LoopNode: self._walk_Loop,
+            SwitchCaseNode: self._walk_SwitchCase,
             ailment.Block: self._handle_Block,
         }
 
@@ -285,6 +286,8 @@ class ExpressionCounter(SequenceWalker):
             return
         if isinstance(stmt, ailment.Stmt.Assignment):
             if is_phi_assignment(stmt):
+                return
+            if has_llsc_expression(stmt.src):
                 return
             if isinstance(stmt.dst, ailment.Expr.VirtualVariable) and stmt.dst.was_reg:
                 # dependency
@@ -359,19 +362,19 @@ class ExpressionCounter(SequenceWalker):
         self._collect_uses(node.condition, ConditionalBreakLocation(node.addr))
         return super()._handle_ConditionalBreak(node, **kwargs)
 
-    def _handle_Condition(self, node: ConditionNode, **kwargs):
+    def _walk_Condition(self, node: ConditionNode, **kwargs):
         # collect uses on the condition expression
         self._collect_assignments(node.condition, node)
         self._collect_uses(node.condition, ConditionLocation(node.addr))
-        return super()._handle_Condition(node, **kwargs)
+        return (yield from super()._walk_Condition(node, **kwargs))
 
-    def _handle_CascadingCondition(self, node: CascadingConditionNode, **kwargs):
+    def _walk_CascadingCondition(self, node: CascadingConditionNode, **kwargs):
         for idx, (condition, _) in enumerate(node.condition_and_nodes):
             self._collect_assignments(condition, node)
             self._collect_uses(condition, ConditionLocation(node.addr, idx))
-        return super()._handle_CascadingCondition(node, **kwargs)
+        return (yield from super()._walk_CascadingCondition(node, **kwargs))
 
-    def _handle_Loop(self, node: LoopNode, **kwargs):
+    def _walk_Loop(self, node: LoopNode, **kwargs):
         # collect uses on the condition expression
         if node.initializer is not None:
             self._collect_uses(node.initializer, ConditionLocation(node.addr))
@@ -383,12 +386,12 @@ class ExpressionCounter(SequenceWalker):
 
         outer_scope = self._outer_scope
         self._outer_scope = False
-        super()._handle_Loop(node, **kwargs)
+        yield from super()._walk_Loop(node, **kwargs)
         self._outer_scope = outer_scope
 
-    def _handle_SwitchCase(self, node: SwitchCaseNode, **kwargs):
+    def _walk_SwitchCase(self, node: SwitchCaseNode, **kwargs):
         self._collect_uses(node.switch_expr, ConditionLocation(node.addr))
-        return super()._handle_SwitchCase(node, **kwargs)
+        return (yield from super()._walk_SwitchCase(node, **kwargs))
 
 
 class ExpressionSpotter(VVarUsesCollector):
@@ -409,6 +412,11 @@ class ExpressionSpotter(VVarUsesCollector):
         self.has_loads = True
         return super()._handle_Load(expr_idx, expr, stmt_idx, stmt, block)
 
+    def _handle_DirtyExpression(self, expr_idx, expr, stmt_idx, stmt, block):
+        if is_llsc_expression(expr):
+            self.has_calls = True
+        return super()._handle_DirtyExpression(expr_idx, expr, stmt_idx, stmt, block)
+
 
 class InterferenceChecker(SequenceWalker):
     """
@@ -426,9 +434,9 @@ class InterferenceChecker(SequenceWalker):
     def __init__(self, assignments: dict[int, Any], uses: dict[int, Any], node, variable_map):
         handlers = {
             ailment.Block: self._handle_Block,
-            ConditionNode: self._handle_Condition,
+            ConditionNode: self._walk_Condition,
             ConditionalBreakNode: self._handle_ConditionalBreak,
-            SwitchCaseNode: self._handle_SwitchCase,
+            SwitchCaseNode: self._walk_SwitchCase,
         }
 
         super().__init__(handlers, update_seqnode_in_place=False, force_forward_scan=True)
@@ -481,7 +489,7 @@ class InterferenceChecker(SequenceWalker):
                 for vid in self._assignment_interferences:
                     self._assignment_interferences[vid].append(stmt)
 
-            if isinstance(stmt, ailment.Stmt.Store):
+            if isinstance(stmt, ailment.Stmt.Store) or has_store_conditional(stmt):
                 # mark all existing assignments as interfered
                 for vid in self._assignment_interferences:
                     self._assignment_interferences[vid].append(stmt)
@@ -517,7 +525,7 @@ class InterferenceChecker(SequenceWalker):
         self._after_spotting(node, spotter)
         return super()._handle_ConditionalBreak(node, **kwargs)
 
-    def _handle_Condition(self, node: ConditionNode, **kwargs):
+    def _walk_Condition(self, node: ConditionNode, **kwargs):
         spotter = ExpressionSpotter()
         spotter.walk_expression(node.condition)
         self._after_spotting(node, spotter)
@@ -526,9 +534,9 @@ class InterferenceChecker(SequenceWalker):
         for vid in self._assignment_interferences:
             self._assignment_interferences[vid].append(node)
 
-        return super()._handle_Condition(node, **kwargs)
+        return (yield from super()._walk_Condition(node, **kwargs))
 
-    def _handle_CascadingCondition(self, node: CascadingConditionNode, **kwargs):
+    def _walk_CascadingCondition(self, node: CascadingConditionNode, **kwargs):
         spotter = ExpressionSpotter()
         for cond, _ in node.condition_and_nodes:  # pylint:disable=consider-using-enumerate
             spotter.walk_expression(cond)
@@ -538,9 +546,9 @@ class InterferenceChecker(SequenceWalker):
         for vid in self._assignment_interferences:
             self._assignment_interferences[vid].append(node)
 
-        return super()._handle_CascadingCondition(node, **kwargs)
+        return (yield from super()._walk_CascadingCondition(node, **kwargs))
 
-    def _handle_Loop(self, node: LoopNode, **kwargs):
+    def _walk_Loop(self, node: LoopNode, **kwargs):
         spotter = ExpressionSpotter()
 
         # iterator
@@ -557,13 +565,13 @@ class InterferenceChecker(SequenceWalker):
 
         self._after_spotting(node, spotter)
 
-        return super()._handle_Loop(node, **kwargs)
+        return (yield from super()._walk_Loop(node, **kwargs))
 
-    def _handle_SwitchCase(self, node: SwitchCaseNode, **kwargs):
+    def _walk_SwitchCase(self, node: SwitchCaseNode, **kwargs):
         spotter = ExpressionSpotter()
         spotter.walk_expression(node.switch_expr)
         self._after_spotting(node, spotter)
-        return super()._handle_SwitchCase(node, **kwargs)
+        return (yield from super()._walk_SwitchCase(node, **kwargs))
 
 
 class ExpressionReplacer(AILBlockRewriter):
@@ -660,9 +668,9 @@ class ExpressionFolder(SequenceWalker):
     def __init__(self, assignments: dict[int, Any], uses: dict[int, Any], node, variable_map):
         handlers = {
             ailment.Block: self._handle_Block,
-            ConditionNode: self._handle_Condition,
+            ConditionNode: self._walk_Condition,
             ConditionalBreakNode: self._handle_ConditionalBreak,
-            SwitchCaseNode: self._handle_SwitchCase,
+            SwitchCaseNode: self._walk_SwitchCase,
             LoopNode: self._handle_Loop,
         }
 
@@ -707,21 +715,21 @@ class ExpressionFolder(SequenceWalker):
             node.condition = r
         return super()._handle_ConditionalBreak(node, **kwargs)
 
-    def _handle_Condition(self, node: ConditionNode, **kwargs):
+    def _walk_Condition(self, node: ConditionNode, **kwargs):
         replacer = ExpressionReplacer(self._assignments, self._uses, self._variable_map)
         r = replacer.walk_expression(node.condition)
         if r is not None and r is not node.condition:
             node.condition = r
-        return super()._handle_Condition(node, **kwargs)
+        return (yield from super()._walk_Condition(node, **kwargs))
 
-    def _handle_CascadingCondition(self, node: CascadingConditionNode, **kwargs):
+    def _walk_CascadingCondition(self, node: CascadingConditionNode, **kwargs):
         replacer = ExpressionReplacer(self._assignments, self._uses, self._variable_map)
         for idx in range(len(node.condition_and_nodes)):  # pylint:disable=consider-using-enumerate
             cond, _ = node.condition_and_nodes[idx]
             r = replacer.walk_expression(cond)
             if r is not None and r is not cond:
                 node.condition_and_nodes[idx] = (r, node.condition_and_nodes[idx][1])
-        return super()._handle_CascadingCondition(node, **kwargs)
+        return (yield from super()._walk_CascadingCondition(node, **kwargs))
 
     def _handle_Loop(self, node: LoopNode, **kwargs):
         replacer = ExpressionReplacer(self._assignments, self._uses, self._variable_map)
@@ -746,27 +754,27 @@ class ExpressionFolder(SequenceWalker):
 
         # again, do not replace into the loop body
 
-    def _handle_SwitchCase(self, node: SwitchCaseNode, **kwargs):
+    def _walk_SwitchCase(self, node: SwitchCaseNode, **kwargs):
         replacer = ExpressionReplacer(self._assignments, self._uses, self._variable_map)
 
         r = replacer.walk_expression(node.switch_expr)
         if r is not None and r is not node.switch_expr:
             node.switch_expr = r
 
-        return super()._handle_SwitchCase(node, **kwargs)
+        return (yield from super()._walk_SwitchCase(node, **kwargs))
 
 
 class StoreStatementFinder(SequenceWalker):
     """
     Determine if there are any Store statements between two given statements.
 
-    This class overrides _handle_Sequence() and _handle_MultiNode() to ensure they traverse nodes from top to bottom.
+    This class overrides _walk_Sequence() and _walk_MultiNode() to ensure they traverse nodes from top to bottom.
     """
 
     def __init__(self, node, intervals: Iterable[tuple[StatementLocation, LocationBase]]):
         handlers = {
-            ConditionNode: self._handle_Condition,
-            CascadingConditionNode: self._handle_CascadingCondition,
+            ConditionNode: self._walk_Condition,
+            CascadingConditionNode: self._walk_CascadingCondition,
             ConditionalBreakNode: self._handle_ConditionalBreak,
             ailment.Block: self._handle_Block,
         }
@@ -785,18 +793,18 @@ class StoreStatementFinder(SequenceWalker):
         super().__init__(handlers)
         self.walk(node)
 
-    def _handle_Sequence(self, node, **kwargs):
+    def _walk_Sequence(self, node, **kwargs):
         i = 0
         while i < len(node.nodes):
             node_ = node.nodes[i]
-            self._handle(node_, parent=node, index=i)
+            yield node_, {"parent": node, "index": i}
             i += 1
 
-    def _handle_MultiNode(self, node, **kwargs):
+    def _walk_MultiNode(self, node, **kwargs):
         i = 0
         while i < len(node.nodes):
             node_ = node.nodes[i]
-            self._handle(node_, parent=node, index=i)
+            yield node_, {"parent": node, "index": i}
             i += 1
 
     def _handle_Block(self, node: ailment.Block, **kwargs):
@@ -813,21 +821,21 @@ class StoreStatementFinder(SequenceWalker):
                 for interval in self._active_intervals:
                     self.interval_to_hasstore[interval] = True
 
-    def _handle_Condition(self, node, **kwargs):
+    def _walk_Condition(self, node, **kwargs):
         cond_loc = ConditionLocation(node.addr)
         if cond_loc in self._end_to_starts:
             for start in self._end_to_starts[cond_loc]:
                 self._active_intervals.discard((start, cond_loc))
-        super()._handle_Condition(node, **kwargs)
+        yield from super()._walk_Condition(node, **kwargs)
 
-    def _handle_CascadingCondition(self, node: CascadingConditionNode, **kwargs):
+    def _walk_CascadingCondition(self, node: CascadingConditionNode, **kwargs):
         cond_loc = ConditionLocation(node.addr, None)
         for idx in range(len(node.condition_and_nodes)):
             cond_loc.case_idx = idx
             if cond_loc in self._end_to_starts[cond_loc]:
                 for start in self._end_to_starts[cond_loc]:
                     self._active_intervals.discard((start, cond_loc))
-        super()._handle_CascadingCondition(node, **kwargs)
+        yield from super()._walk_CascadingCondition(node, **kwargs)
 
     def _handle_ConditionalBreak(self, node: ConditionalBreakNode, **kwargs):
         cond_break_loc = ConditionalBreakLocation(node.addr)
