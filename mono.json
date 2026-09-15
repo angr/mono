@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "f138c08c2bc290ee00fbe75471c7039f08f93df5",
-      "committed_at": "2026-09-14T16:17:27-07:00",
-      "subject": "Phoenix: Fix missing nodes caused by cyclic refinement not being aware of orphaning nodes in the full graph. (#7190)",
+      "commit": "973d8429834acf593ec4d23ea53d5106b2ec96ce",
+      "committed_at": "2026-09-14T17:12:36-07:00",
+      "subject": "Phoenix: Fix another case where cyclic refinement may lead to loss of nodes. (#7197)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -119,7 +119,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-09-15T00:02:05+00:00",
+  "imported_at": "2026-09-15T00:22:15+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
