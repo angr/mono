@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "96f77efe67d50acd24afb51ee210de9ce98abfc7",
-      "committed_at": "2026-09-15T00:59:34-07:00",
-      "subject": "Flirt: read enough bytes for every module's CRC region and tail bytes. (#7201)",
+      "commit": "24737f3a28e0c7850b0ff73569598f02c2e3b473",
+      "committed_at": "2026-09-15T01:26:24-07:00",
+      "subject": "SimCppClass: Serialize the class body instead of a bare SimTypeRef. (#7202)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -119,7 +119,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-09-15T08:20:15+00:00",
+  "imported_at": "2026-09-15T08:39:18+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
