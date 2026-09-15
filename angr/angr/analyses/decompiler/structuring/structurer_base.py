@@ -37,12 +37,34 @@ from angr.analyses.decompiler.utils import (
 )
 from angr.errors import AngrDecompilationError
 from angr.knowledge_plugins.cfg import IndirectJump
+from angr.utils.ssa.tmp_uses_collector import TmpUsesCollector
 
 if TYPE_CHECKING:
     from angr.analyses.decompiler.region_overlay import RegionOverlay
     from angr.knowledge_plugins.functions import Function
 
 _l = logging.getLogger(__name__)
+
+
+def _tmp_crosses_split(statements, start_idx: int, split_idx: int) -> bool:
+    """
+    True when a temporary defined at or after ``start_idx`` and before ``split_idx`` is read after
+    ``split_idx``. Cutting a block there would separate that definition from its use, and AIL
+    temporaries do not cross block boundaries.
+    """
+    defined = set()
+    for stmt in statements[start_idx:split_idx]:
+        if isinstance(stmt, ailment.Stmt.Assignment) and isinstance(stmt.dst, ailment.Expr.Tmp):
+            defined.add(stmt.dst.tmp_idx)
+        elif isinstance(stmt, ailment.Stmt.CAS):
+            for old_val in (stmt.old_lo, stmt.old_hi):
+                if isinstance(old_val, ailment.Expr.Tmp):
+                    defined.add(old_val.tmp_idx)
+    if not defined:
+        return False
+    collector = TmpUsesCollector()
+    collector.walk(ailment.Block(0, 0, statements=list(statements[split_idx + 1 :])))
+    return any(tmp_idx in defined for tmp_idx, _ in collector.tmp_and_uselocs)
 
 
 class StructurerBase(Analysis):
@@ -233,7 +255,7 @@ class StructurerBase(Analysis):
             # of course, this only works if all nodes either end with a return or a goto that goes to the end of the
             # outer switch-case. we detect it first.
             # TODO: Implement the above logic
-            return walker._handle_Loop(node, parent=parent, index=index, label=label)
+            return None
 
         def _handle_SwitchCase(node: SwitchCaseNode, parent=None, index=0, label=None):
             # if a node inside this switch-case has a goto that goes to the end of the outer switch-case, we will
@@ -295,7 +317,7 @@ class StructurerBase(Analysis):
         :return:                    A processed SequenceNode.
         """
 
-        def _handle_Sequence(node: SequenceNode, **kwargs):
+        def _walk_Sequence(node: SequenceNode, **kwargs):
             if len(node.nodes) > 1:
                 for i in range(len(node.nodes) - 1):
                     this_node = node.nodes[i]
@@ -357,9 +379,9 @@ class StructurerBase(Analysis):
                                 **jump_stmt.tags,
                             )
 
-            return walker._handle_Sequence(node, **kwargs)
+            return (yield from walker._walk_Sequence(node, **kwargs))
 
-        def _handle_MultiNode(node: MultiNode, **kwargs):
+        def _walk_MultiNode(node: MultiNode, **kwargs):
             if len(node.nodes) > 1:
                 for i in range(len(node.nodes) - 1):
                     this_node = node.nodes[i]
@@ -421,11 +443,11 @@ class StructurerBase(Analysis):
                                 **jump_stmt.tags,
                             )
 
-            return walker._handle_MultiNode(node, **kwargs)
+            return (yield from walker._walk_MultiNode(node, **kwargs))
 
         handlers = {
-            SequenceNode: _handle_Sequence,
-            MultiNode: _handle_MultiNode,
+            SequenceNode: _walk_Sequence,
+            MultiNode: _walk_MultiNode,
         }
 
         walker = SequenceWalker(handlers=handlers)
@@ -454,6 +476,14 @@ class StructurerBase(Analysis):
                     and isinstance(stmt.target, ailment.Expr.Const)
                     and parent.nodes[index + 1].addr == stmt.target.value
                 ):
+                    continue
+                if _tmp_crosses_split(node.statements, last_nonjump_stmt_idx, stmt_idx):
+                    # rewriting this jump into a break cuts the block open here, and the piece after the cut
+                    # becomes a block of its own. AIL temporaries are block-local, so a temporary defined
+                    # before the cut and read after it leaves that piece reading one it does not define, and
+                    # block simplification raises on the missing definition. A rep-prefixed string instruction
+                    # lifts to exactly that shape: its counter guard is an internal branch between statements
+                    # of the one instruction. Leave the jump alone; it stays a goto.
                     continue
                 targets = extract_jump_targets(stmt)
                 if any(target in successor_addrs for target in targets):
@@ -489,8 +519,11 @@ class StructurerBase(Analysis):
                         new_nodes.append(break_node)
 
             if new_nodes:
-                if len(node.statements) - 1 > last_nonjump_stmt_idx:
-                    # insert the last node
+                if len(node.statements) - 1 >= last_nonjump_stmt_idx:
+                    # insert the last node. The slice below starts AT last_nonjump_stmt_idx, so the tail is
+                    # non-empty whenever that index is still within the block. A strict > skipped the tail
+                    # when exactly one statement followed the loop-exit jump, and the original block is
+                    # emptied below, so that statement was dropped without an error or a log message.
                     sub_block_statements = node.statements[last_nonjump_stmt_idx:]
                     new_sub_block = ailment.Block(
                         sub_block_statements[0].tags["ins_addr"],
