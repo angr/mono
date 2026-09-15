@@ -534,8 +534,10 @@ def _merge_ail_nodes(graph, node_a: ailment.Block, node_b: ailment.Block) -> ail
 
     a_ogs = graph.nodes[node_a].get("original_nodes", [])
     b_ogs = graph.nodes[node_b].get("original_nodes", [])
-    new_node = node_a.copy() if node_a.addr <= node_b.addr else node_b.copy()
-    old_node = node_b if new_node == node_a else node_a
+    # node_a is the predecessor of node_b. Synthetic AIL block addresses are not guaranteed to follow control-flow
+    # order, so ordering the statements by address may put node_b's terminator in the middle of the merged block.
+    new_node = node_a.copy()
+    old_node = node_b
     # remove jumps in the middle of nodes when merging
     if new_node.statements and isinstance(new_node.statements[-1], ailment.Stmt.Jump):
         new_node.statements = new_node.statements[:-1]
@@ -1011,11 +1013,13 @@ def peephole_optimize_expr(expr: ailment.Expression, expr_opts: list[PeepholeOpt
 
 def copy_graph(graph: networkx.DiGraph[Block]) -> networkx.DiGraph[Block]:
     """
-    Copy AIL Graph.
+    Copy an AIL graph, including its graph, node, and edge attributes. Blocks and their statement lists are copied;
+    attribute values retain NetworkX's shallow-copy semantics.
 
-    :return: A copy of the AIl graph.
+    :return: A copy of the AIL graph.
     """
     graph_copy = networkx.DiGraph()
+    graph_copy.graph.update(graph.graph)
     block_mapping = {}
     # copy all blocks
     for block in graph.nodes():
@@ -1023,7 +1027,7 @@ def copy_graph(graph: networkx.DiGraph[Block]) -> networkx.DiGraph[Block]:
         new_stmts = copy.copy(block.statements)
         new_block.statements = new_stmts
         block_mapping[block] = new_block
-        graph_copy.add_node(new_block)
+        graph_copy.add_node(new_block, **graph.nodes[block])
 
     # copy all edges
     for src, dst, data in graph.edges(data=True):
