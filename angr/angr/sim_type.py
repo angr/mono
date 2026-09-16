@@ -218,8 +218,8 @@ class SimType:
 
         :param type_collection: Resolve type references against this collection.
         :param memo:            Names of types that are being loaded from the type collection (recursion guard).
-        :param decoded:         Named structs decoded so far in this document. to_json() emits a reference for every
-                                repeated occurrence of a named struct, which is resolved here.
+        :param decoded:         Named aggregates decoded so far in this document. to_json() emits a reference for every
+                                repeated occurrence of a named aggregate, which is resolved here.
         """
         if memo is None:
             memo = set()
@@ -232,7 +232,7 @@ class SimType:
         if getattr(cls, "from_json", SimType.from_json) is not SimType.from_json:
             t = cls.from_json(d)
             if isinstance(t, SimTypeRef) and t.name is not None:
-                if t.name in decoded:
+                if t.name in decoded and isinstance(decoded[t.name], t.original_type):
                     return decoded[t.name]
                 if type_collection is not None and t.name not in memo:
                     # attempt to resolve the type ref
@@ -280,6 +280,15 @@ class SimType:
             decoded[obj.name] = obj
             obj.fields = OrderedDict(_decode(fields_json))
             return obj
+
+        if cls is SimUnion and kwargs.get("name"):
+            members_json = kwargs.pop("members", {})
+            union_obj = SimUnion({}, **kwargs)
+            # Anonymous unions are inlined; their shared name must not replace an enclosing struct.
+            if union_obj.name != "<anon>":
+                decoded[union_obj.name] = union_obj
+            union_obj.members = cast(dict[str, SimType], _decode(members_json))
+            return union_obj
 
         for field, value in kwargs.items():
             kwargs[field] = _decode(value)
@@ -394,6 +403,14 @@ class NamedTypeMixin:
             n = self.name.split(splitter)
             return n[-1]
         raise NotImplementedError(f"Unsupported language {lang}.")
+
+
+def type_memo_key(ty: SimStruct | SimUnion) -> str:
+    # Every anonymous struct and union is named "<anon>", so keying a memo on the name alone would
+    # collapse distinct ones onto a single slot.
+    if ty.name == "<anon>" or (isinstance(ty, SimStruct) and bool(ty.anonymous)):
+        return f"<anon>#{id(ty)}"
+    return ty.name
 
 
 class SimTypeBottom(SimType):
@@ -1732,10 +1749,15 @@ class SimStruct(NamedTypeMixin, SimType):
                 )
                 continue
             if not self._pack and ty_size > 0:
-                align = ty.alignment * self._arch.byte_width
+                align = ty.alignment
                 if align is NotImplemented:
-                    # hack!
-                    align = 1
+                    # An aggregate with no members reports no alignment, because all() over an
+                    # empty field set is vacuously true. Fall back to byte alignment: it is the
+                    # least any C ABI gives an aggregate member, and it keeps bitoffset_so_far
+                    # byte-aligned so the offset below cannot silently truncate.
+                    align = self._arch.byte_width
+                else:
+                    align *= self._arch.byte_width
                 if bitoffset_so_far % align != 0:
                     bitoffset_so_far += align - bitoffset_so_far % align
                 offsets[name] = bitoffset_so_far // self._arch.byte_width
@@ -1750,10 +1772,16 @@ class SimStruct(NamedTypeMixin, SimType):
         if memo is None:
             memo = {}
 
-        if self.name in memo:
-            return memo[self.name].to_json(fields=fields, memo=memo)
-        memo[self.name] = SimTypeRef(self.name, self.__class__)
-        d = super().to_json(fields=fields, memo=memo)
+        key = type_memo_key(self)
+        if key in memo:
+            return memo[key].to_json(fields=fields, memo=memo)
+        memo[key] = SimTypeRef(self.name, self.__class__)
+        try:
+            d = super().to_json(fields=fields, memo=memo)
+        finally:
+            # Anonymous names cannot identify later references; only memoize their active traversal.
+            if key != self.name:
+                memo.pop(key)
         if d["pack"] is False:
             d.pop("pack")
         if d["align"] is None:
@@ -1779,13 +1807,14 @@ class SimStruct(NamedTypeMixin, SimType):
         return SimStructValue(self, values=values)
 
     def _with_arch(self, arch, *, memo: dict[str, SimType]):
-        if self.name in memo:
-            return cast(SimStruct, memo[self.name])
+        key = type_memo_key(self)
+        if key in memo:
+            return cast(SimStruct, memo[key])
 
         out = SimStruct({}, name=self.name, pack=self._pack, align=self._align)
         out._arch = arch
         out._def_order = self._def_order
-        memo[self.name] = out
+        memo[key] = out
 
         out.fields = OrderedDict((k, v.with_arch(arch, memo=memo)) for k, v in self.fields.items())
 
@@ -2063,6 +2092,20 @@ class SimUnion(NamedTypeMixin, SimType):
         self._alignment = r
         return r
 
+    def to_json(self, fields: Iterable[str] | None = None, memo: dict[str, SimTypeRef] | None = None) -> dict[str, Any]:
+        if memo is None:
+            memo = {}
+
+        key = type_memo_key(self)
+        if key in memo:
+            return memo[key].to_json(fields=fields, memo=memo)
+        memo[key] = SimTypeRef(self.name, SimUnion)
+        try:
+            return super().to_json(fields=fields, memo=memo)
+        finally:
+            if key != self.name:
+                memo.pop(key)
+
     def _refine_dir(self):
         return list(self.members.keys())
 
@@ -2121,8 +2164,14 @@ class SimUnion(NamedTypeMixin, SimType):
         return f"union {self.name}"
 
     def _with_arch(self, arch, *, memo: dict[str, SimType]):
-        out = SimUnion({name: ty.with_arch(arch, memo=memo) for name, ty in self.members.items()}, self.label)
+        key = type_memo_key(self)
+        if key in memo:
+            return cast(SimUnion, memo[key])
+
+        out = SimUnion({}, name=self.name, label=self.label)
         out._arch = arch
+        memo[key] = out
+        out.members = {name: ty.with_arch(arch, memo=memo) for name, ty in self.members.items()}
         return out
 
     def copy(self):
@@ -3001,7 +3050,7 @@ GLIBC_INTERNAL_TYPES.update(
             name="_IO_iconv_t",
         ),
         "_IO_codecvt": GLIBC_INTERNAL_TYPES["_IO_codecvt"],
-        "_IO_lock_t": SimStruct({}, name="pthread_mutex_t"),
+        "_IO_lock_t": SimStruct({}, name="_IO_lock_t"),
         "__mbstate_t": GLIBC_INTERNAL_TYPES["__mbstate_t"],
         "_IO_wide_data": SimStruct(
             {
@@ -3062,7 +3111,7 @@ GLIBC_INTERNAL_TYPES.update(
                 # TODO: This should be architecture dependent (byte order)
                 "_pad0": ALL_TYPES["uint32_t"],
             },
-            name="timeval",
+            name="timespec",
         ),
         # https://github.com/bminor/glibc/blob/a01a13601c95f5d111d25557656d09fe661cfc89/bits/utmp.h#L50
         "exit_status": SimStruct(
@@ -3492,9 +3541,9 @@ GLIBC_TYPES = {
         name="winsize",
     ),
     # This type is legitimately opaque
-    "random_data": SimStruct({}),
+    "random_data": SimStruct({}, name="random_data"),
     # This type is also legitimately opaque
-    "drand48_data": SimStruct({}),
+    "drand48_data": SimStruct({}, name="drand48_data"),
     # https://github.com/bminor/glibc/blob/2d5ec6692f5746ccb11db60976a6481ef8e9d74f/posix/sys/times.h#L32
     "tms": SimStruct(
         {
@@ -3581,7 +3630,8 @@ GLIBC_TYPES = {
         {
             "iov_base": SimTypePointer(ALL_TYPES["void"], label="void *"),
             "iov_len": ALL_TYPES["size_t"],
-        }
+        },
+        name="iovec",
     ),
     # https://github.com/bminor/glibc/blob/2d5ec6692f5746ccb11db60976a6481ef8e9d74f/time/sys/time.h#L130
     "itimerval": SimStruct(
@@ -3728,7 +3778,7 @@ GLIBC_TYPES = {
             "ut_addr_v6": SimTypeArray(ALL_TYPES["int32_t"], length=4, label="int32_t[4]"),
             "__glibc_reserved": SimTypeArray(ALL_TYPES["char"], length=20, label="char[20]"),
         },
-        name="utmx",
+        name="utmpx",
     ),
     # https://github.com/bminor/glibc/blob/2d5ec6692f5746ccb11db60976a6481ef8e9d74f/pwd/pwd.h#L49
     "passwd": SimStruct(
