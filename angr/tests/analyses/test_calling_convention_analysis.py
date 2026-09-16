@@ -13,6 +13,9 @@ from functools import wraps
 import archinfo
 
 import angr
+from angr.analyses.calling_convention import CallingConventionAnalysis
+from angr.analyses.calling_convention.fact_collector import FactCollector
+from angr.analyses.calling_convention.utils import is_sane_register_variable
 from angr.analyses.complete_calling_conventions import (
     DEAD_WORKER_GRACE_PERIOD,
     CallingConventionAnalysisMode,
@@ -25,7 +28,17 @@ from angr.calling_conventions import (
     SimStackArg,
 )
 from angr.errors import AngrRuntimeError
-from angr.sim_type import SimTypeBottom, SimTypeFloat, SimTypeFunction, SimTypeInt, SimTypeLongLong
+from angr.knowledge_plugins.functions.function import PrototypeSource
+from angr.sim_type import (
+    SimTypeBottom,
+    SimTypeChar,
+    SimTypeFloat,
+    SimTypeFunction,
+    SimTypeInt,
+    SimTypeLongLong,
+    SimTypePointer,
+    parse_signature,
+)
 from angr.utils.ssa import get_reg_offset_base
 from tests.common import bin_location, requires_binaries_private
 
@@ -48,6 +61,125 @@ def cca_mode(modes: str):
 # pylint: disable=missing-class-docstring
 # pylint: disable=no-self-use
 class TestCallingConventionAnalysis(unittest.TestCase):
+    def test_main_prototype_hint(self):
+        binary = os.path.join(test_location, "x86_64", "argv_test")
+        project = angr.Project(binary, auto_load_libs=False)
+        cfg = project.analyses.CFGFast(normalize=True)
+        main = project.kb.functions["main"]
+
+        assert main.prototype is None
+        assert main.info["prototype_hint"] == "int main(int argc, char **argv, char **envp)"
+        hinted_functions = [func for func in project.kb.functions.values() if "prototype_hint" in func.info]
+        assert hinted_functions == [main]
+
+        decompiler = project.analyses.Decompiler(main, cfg=cfg.model)
+        assert main.prototype is not None
+        assert len(main.prototype.args) == 2
+        assert main.prototype.arg_names == ("argc", "argv")
+        assert main.prototype.variadic is False
+        assert isinstance(main.prototype.args[0], SimTypeInt)
+        assert isinstance(main.prototype.args[1], SimTypePointer)
+        assert isinstance(main.prototype.args[1].pts_to, SimTypePointer)
+        assert isinstance(main.prototype.args[1].pts_to.pts_to, SimTypeChar)
+        assert main.prototype_source == PrototypeSource.SIMPROC
+        assert decompiler.codegen is not None
+        decompiled_text = decompiler.codegen.text
+        assert decompiled_text is not None
+        assert "int main(int argc, char **argv)" in decompiled_text
+        assert 'strcmp(argv[1], "Yan is a noob")' in decompiled_text
+        assert "struct_0 *" not in decompiled_text
+
+    def test_main_prototype_hint_refinement_arities(self):
+        arch = archinfo.arch_from_id("amd64")
+        semantic = parse_signature("int main(int argc, char **argv, char **envp)").with_arch(arch)
+        assert isinstance(semantic, SimTypeFunction)
+
+        for arity in (0, 1, 2, 3, 5):
+            with self.subTest(arity=arity):
+                machine = SimTypeFunction(
+                    tuple(SimTypeLongLong().with_arch(arch) for _ in range(arity)),
+                    SimTypeBottom().with_arch(arch),
+                    variadic=arity == 5,
+                )
+                refined = CallingConventionAnalysis._refine_prototype_hint(  # pylint:disable=protected-access
+                    machine, semantic
+                )
+
+                assert len(refined.args) == arity
+                assert refined.args[: min(arity, 3)] == semantic.args[: min(arity, 3)]
+                assert refined.args[3:] == machine.args[3:]
+                assert refined.arg_names == tuple(
+                    ("argc", "argv", "envp")[i] if i < 3 else f"a{i}" for i in range(arity)
+                )
+                assert refined.variadic == machine.variadic
+                assert isinstance(refined.returnty, SimTypeInt)
+
+    def test_main_prototype_hint_malformed_or_absent(self):
+        binary = os.path.join(test_location, "x86_64", "argv_test")
+        for prototype_hint in (None, 42, "not a C prototype"):
+            with self.subTest(prototype_hint=prototype_hint):
+                project = angr.Project(binary, auto_load_libs=False)
+                cfg = project.analyses.CFGFast(normalize=True)
+                main = project.kb.functions["main"]
+                if prototype_hint is None:
+                    del main.info["prototype_hint"]
+                else:
+                    main.info["prototype_hint"] = prototype_hint
+
+                project.analyses.Decompiler(main, cfg=cfg.model)
+                assert main.prototype is not None
+                assert main.prototype_source != PrototypeSource.SIMPROC
+
+    def test_main_prototype_hint_requires_startup_simprocedure(self):
+        binary = os.path.join(test_location, "x86_64", "argv_test")
+        project = angr.Project(binary, auto_load_libs=False, use_sim_procedures=False)
+        project.analyses.CFGFast(normalize=True)
+        assert all("prototype_hint" not in func.info for func in project.kb.functions.values())
+
+    def test_main_prototype_hint_preserves_authoritative_prototypes(self):
+        binary = os.path.join(test_location, "x86_64", "argv_test")
+        for source in (PrototypeSource.SIMPROC, PrototypeSource.SIGNATURES, PrototypeSource.USER):
+            with self.subTest(source=source):
+                project = angr.Project(binary, auto_load_libs=False)
+                cfg = project.analyses.CFGFast(normalize=True)
+                main = project.kb.functions["main"]
+                authoritative = parse_signature("long main(short count, char *value)").with_arch(project.arch)
+                assert isinstance(authoritative, SimTypeFunction)
+                main.prototype = authoritative
+                main.prototype_source = source
+                main.prototype_libname = "authoritative-test-library"
+                main.calling_convention = None
+
+                project.analyses.Decompiler(main, cfg=cfg.model)
+                assert main.prototype == authoritative
+                assert main.prototype_source == source
+                assert main.prototype_libname == "authoritative-test-library"
+                assert main.calling_convention is not None
+
+    def test_main_prototype_hint_replaces_decompiler_inference(self):
+        binary = os.path.join(test_location, "x86_64", "argv_test")
+        project = angr.Project(binary, auto_load_libs=False)
+        cfg = project.analyses.CFGFast(normalize=True)
+        main = project.kb.functions["main"]
+        prototype_hint = main.info.pop("prototype_hint")
+        project.analyses.Decompiler(main, cfg=cfg.model, use_cache=False, update_cache=False)
+        assert main.prototype_source == PrototypeSource.CCA_DECOMPILER
+        main.info["prototype_hint"] = prototype_hint
+
+        for _ in range(2):
+            decompiler = project.analyses.Decompiler(main, cfg=cfg.model, use_cache=False, update_cache=False)
+            assert main.prototype_source == PrototypeSource.SIMPROC
+            assert main.prototype is not None
+            assert main.prototype.arg_names == ("argc", "argv")
+            assert isinstance(main.prototype.returnty, SimTypeInt)
+            assert isinstance(main.prototype.args[0], SimTypeInt)
+            assert isinstance(main.prototype.args[1], SimTypePointer)
+            assert isinstance(main.prototype.args[1].pts_to, SimTypePointer)
+            assert isinstance(main.prototype.args[1].pts_to.pts_to, SimTypeChar)
+            assert decompiler.codegen is not None
+            assert decompiler.codegen.text is not None
+            assert "struct_0 *" not in decompiler.codegen.text
+
     def test_itanium_qualified_free_function_does_not_gain_this(self):
         """Machine facts must disambiguate namespace functions from members."""
         binary = os.path.join(test_location, "x86_64", "cpp_qualified_symbols.so")
@@ -194,6 +326,26 @@ class TestCallingConventionAnalysis(unittest.TestCase):
             self.check_args(func_name, self._a(funcs, func_name), args)
 
     @cca_mode("fast,variables")
+    def test_s390x_fauxware(self, *, mode):
+        binary_path = os.path.join(test_location, "s390x", "fauxware")
+        proj = angr.Project(binary_path, auto_load_libs=False, load_debug_info=False)
+
+        cfg = proj.analyses.CFG()  # fill in the default kb
+
+        proj.analyses.CompleteCallingConventions(mode=mode, recover_variables=True)
+
+        funcs = cfg.kb.functions
+
+        # check args
+        expected_args = {
+            "accepted": [],
+            "authenticate": ["r_r2", "r_r3"],
+        }
+
+        for func_name, args in expected_args.items():
+            self.check_args(func_name, self._a(funcs, func_name), args)
+
+    @cca_mode("fast,variables")
     def test_x8664_void(self, *, mode):
         binary_path = os.path.join(test_location, "x86_64", "types", "void")
         proj = angr.Project(binary_path, auto_load_libs=False, load_debug_info=False)
@@ -228,6 +380,28 @@ class TestCallingConventionAnalysis(unittest.TestCase):
                     ret_val = func.calling_convention.return_val(func.prototype.returnty)
                     assert isinstance(ret_val, SimRegArg)
                     assert ret_val.reg_name == r
+
+    def test_ppc64_argument_registers(self):
+        # r3-r10 and fpr1-fpr13 may be candidate arguments on PPC64.
+        arch = archinfo.arch_from_id("ppc64")
+        accepted = ["r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"]
+        accepted += [f"fpr{i}" for i in range(1, 14)]
+        for reg_name in accepted:
+            offset, size = arch.registers[reg_name]
+            assert is_sane_register_variable(arch, offset, size), reg_name
+        for reg_name in ["r0", "r1", "r2", "r11", "r12", "r31", "lr", "ctr", "cr0", "fpr0", "fpr14", "fpr31"]:
+            offset, size = arch.registers[reg_name]
+            assert not is_sane_register_variable(arch, offset, size), reg_name
+
+    def test_s390x_argument_registers(self):
+        # r2-r6 and f0, f2, f4, f6 may be candidate arguments on S390X.
+        arch = archinfo.arch_from_id("s390x")
+        for reg_name in ["r2", "r3", "r4", "r5", "r6", "f0", "f2", "f4", "f6"]:
+            offset, size = arch.registers[reg_name]
+            assert is_sane_register_variable(arch, offset, size), reg_name
+        for reg_name in ["r1", "r7", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "a0", "a1", "f1", "f8"]:
+            offset, size = arch.registers[reg_name]
+            assert not is_sane_register_variable(arch, offset, size), reg_name
 
     def test_x86_saved_regs(self):
         # Calling convention analysis should be able to determine calling convention of functions with registers
@@ -294,6 +468,20 @@ class TestCallingConventionAnalysis(unittest.TestCase):
 
         assert cca.prototype is not None
         assert cca.prototype.returnty is not None
+
+    def test_i386_rejected_partial_register_is_not_an_argument(self):
+        # sub_fe744 reads bx before writing it, so bx is a candidate argument. It consolidates to ebx, and
+        # cdecl passes no argument in a register, so _match drops it: the function has no arguments.
+        binary_path = os.path.join(test_location, "i386", "bios.bin.elf")
+        proj = angr.Project(binary_path, auto_load_libs=False)
+        _ = proj.analyses.CFGFast(normalize=True, regions=[(0xFE700, 0xFE800)], start_at_entry=False)
+        func = proj.kb.functions[0xFE744]
+        proj.analyses.VariableRecoveryFast(func)
+        cca = proj.analyses.CallingConvention(func, collect_facts=True)
+
+        assert isinstance(cca.cc, SimCCCdecl)
+        assert cca.prototype is not None
+        assert len(cca.prototype.args) == 0, f"sub_fe744 takes no arguments, got {cca.prototype}"
 
     def test_armhf_thumb_movcc(self):
         binary_path = os.path.join(test_location, "armhf", "amp_challenge_07.gcc")
@@ -691,6 +879,22 @@ class TestCallingConventionAnalysis(unittest.TestCase):
         # rdi, five filler register arguments, and one 8-byte stack argument
         assert len(cca.prototype.args) == 7
         assert cca.prototype.args[-1].size == 64
+
+    @cca_mode("fast,fastish")
+    def test_cdecl_function_with_a_non_returning_endpoint(self, *, mode):
+        binary_path = os.path.join(test_location, "i386", "nl")
+        proj = angr.Project(binary_path, auto_load_libs=False)
+
+        cfg = proj.analyses.CFG(normalize=True)
+        proj.analyses.CompleteCallingConventions(mode=mode, cfg=cfg.model)
+
+        # this function returns from one endpoint and leaves the function from two others, one of which ends in a push
+        func = cfg.kb.functions["version_etc_arn"]
+        facts = proj.analyses[FactCollector].prep(kb=proj.kb)(func)
+        assert facts.extra_pop == 0
+        assert isinstance(func.calling_convention, SimCCCdecl)
+        assert func.prototype is not None
+        assert len(func.prototype.args) == 6
 
     def _check_return_type_comprehensive(self, funcs, func_name, expected_type_cls):
         func = funcs[func_name]

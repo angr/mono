@@ -16,6 +16,7 @@ from angr.sim_type import (
     SimTypeRef,
     SimUnion,
     TypeRef,
+    type_memo_key,
 )
 
 if TYPE_CHECKING:
@@ -26,6 +27,37 @@ def unpack_typeref(ty):
     if isinstance(ty, TypeRef):
         return ty.type
     return ty
+
+
+def _safe_type_size(ty) -> int:
+    sz = getattr(ty, "size", -1)
+    return sz if isinstance(sz, int) else -1
+
+
+def type_layout_key(ty, _seen: frozenset = frozenset()) -> str:
+    """
+    A structural key for a type, derived purely from its memory layout (sizes, field offsets, and the layouts of
+    field/element/pointee types) and not from any user-renamable struct or field name. Cycles through recursive
+    struct/pointer references are broken with a marker.
+
+    Two types with the same key have the same layout, so the key can stand in for the type's identity wherever a
+    name would otherwise have to: the code generator orders type definitions by it so the order does not move when
+    a struct or a field is renamed, and the type translator names generated structs by it so the name of a struct
+    depends on nothing but the struct.
+    """
+    ty = unpack_typeref(ty)
+    if isinstance(ty, SimStruct):
+        if id(ty) in _seen:
+            return "@"  # a reference back to an enclosing struct (recursive type)
+        _seen = _seen | {id(ty)}
+        offsets = ty.offsets
+        fields = sorted(f"{offsets.get(fname, -1)}:{type_layout_key(fty, _seen)}" for fname, fty in ty.fields.items())
+        return f"S[{_safe_type_size(ty)};{int(bool(getattr(ty, 'packed', False)))};{';'.join(fields)}]"
+    if isinstance(ty, SimTypePointer):
+        return f"P({type_layout_key(ty.pts_to, _seen)})"
+    if isinstance(ty, (SimTypeArray, SimTypeFixedSizeArray)):
+        return f"A{getattr(ty, 'length', None)}({type_layout_key(ty.elem_type, _seen)})"
+    return f"T:{type(ty).__name__}:{_safe_type_size(ty)}:{getattr(ty, 'signed', None)}"
 
 
 def unpack_pointer(ty: SimType, iterative: bool = False) -> SimType | None:
@@ -81,7 +113,7 @@ def squash_array_reference(ty):
 def dereference_simtype(
     t: SimType,
     type_collections: list[SimTypeCollection],
-    memo: dict[str | int, SimType] | None = None,
+    memo: dict[str, SimType] | None = None,
     keep_missing: bool = False,
 ) -> SimType:
     """
@@ -116,11 +148,12 @@ def dereference_simtype(
 
     # the following code prepares a real_type SimType object that will be returned at the end of this method
     if isinstance(t, SimStruct):
-        if t.name in memo or (t.anonymous and id(t) in memo):
-            return memo[t.name if not t.anonymous else id(t)]
+        key = type_memo_key(t)
+        if key in memo:
+            return memo[key]
 
         real_type = t.copy()
-        memo[t.name if not t.anonymous else id(t)] = real_type
+        memo[key] = real_type
         fields = OrderedDict(
             (k, dereference_simtype(v, type_collections, memo=memo, keep_missing=keep_missing))
             for k, v in t.fields.items()
@@ -135,13 +168,16 @@ def dereference_simtype(
         real_type = t.copy()
         real_type.elem_type = real_elem_type
     elif isinstance(t, SimUnion):
-        memo[t.name] = t
-        real_members = {
+        key = type_memo_key(t)
+        if key in memo:
+            return memo[key]
+
+        real_type = t.copy()
+        memo[key] = real_type
+        real_type.members = {
             k: dereference_simtype(v, type_collections, memo=memo, keep_missing=keep_missing)
             for k, v in t.members.items()
         }
-        real_type = t.copy()
-        real_type.members = real_members
     elif isinstance(t, SimTypeFunction):
         real_args = [dereference_simtype(arg, type_collections, memo=memo, keep_missing=keep_missing) for arg in t.args]
         real_return_type = (
