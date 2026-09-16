@@ -9,12 +9,6 @@ name: CI
 # jobs compiling angr's Rust extension for itself.
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-  # As angr's own ci.yml has it. Without this a merge queue would run no
-  # checks at all on the thing it is about to merge.
-  merge_group:
   workflow_dispatch:
 
 # bash everywhere, as upstream's own release workflow sets it. The Windows
