@@ -313,14 +313,14 @@ class Loader:
         3) All requests for size are passed down the chain until they reach an object which has the space to service
             it or an object which has not yet been mapped. If all objects have been mapped and are full, a new extern
             object is mapped with a fixed size.
+
+        The architecture-dependent default capacity also bounds individual optional metadata hints, preventing one
+        hint from forcing a larger-than-normal extern reservation.
+        The bound applies per hint; aggregate extern allocation may still grow beyond this capacity when many symbols
+        are allocated.
         """
         if self._extern_object is None:
-            if self.main_object.arch.bits < 32:
-                extern_size = 0x200
-            elif self.main_object.arch.bits == 32:
-                extern_size = 0x8000
-            else:
-                extern_size = 0x80000
+            extern_size = ExternObject.default_map_size(self.main_object.arch)
             self._extern_object = ExternObject(self, map_size=extern_size)
             self._internal_load(self._extern_object)
         return self._extern_object
@@ -735,28 +735,6 @@ class Loader:
             log.warning("Dynamic load failed: %r", e)
             return None
 
-    def get_loader_symbolic_constraints(self):
-        """
-        Do not use this method.
-        """
-        if not self.aslr:
-            return []
-
-        try:
-            import claripy  # pylint:disable=import-outside-toplevel
-        except ImportError:
-            claripy = None
-
-        if not claripy:
-            log.error("Please install claripy to get symbolic constraints")
-            return []
-        outputlist = []
-        for obj in self.all_objects:
-            # TODO Fix Symbolic for tls whatever
-            if obj.aslr and isinstance(obj.mapped_base_symbolic, claripy.ast.BV):
-                outputlist.append(obj.mapped_base_symbolic == obj.mapped_base)
-        return outputlist
-
     # Private stuff
 
     @staticmethod
@@ -1032,14 +1010,14 @@ class Loader:
                 base_addr = obj._custom_base_addr
             elif obj.linked_base and self._is_range_free(obj.linked_base, obj_size):
                 base_addr = obj.linked_base
-            elif not obj.is_main_bin:
-                base_addr = self._find_safe_rebase_addr(obj_size)
-            else:
+            elif obj.is_main_bin and self._is_range_free(0x400000, obj_size):
                 log.debug(
                     "The main binary is a position-independent executable. "
                     "It is being loaded with a base address of 0x400000."
                 )
                 base_addr = 0x400000
+            else:
+                base_addr = self._find_safe_rebase_addr(obj_size)
 
             obj.rebase(base_addr)
         else:
@@ -1083,9 +1061,11 @@ class Loader:
             start = self.main_object.max_addr + 1
 
         # The granularity is a preference, not a constraint: it costs up to one granule per object,
-        # which a small address space runs out of long before the space itself is full.
+        # which a small address space runs out of long before the space itself is full. The rung
+        # below it is a page, or a 4096th of an address space too small to hold many pages.
+        fallback = max(1, min(0x1000, limit >> 12))
         alignments = [self._rebase_granularity]
-        alignments += [a for a in (0x1000, 1) if a < self._rebase_granularity]
+        alignments += [min(a, fallback) for a in (0x1000, 1) if a < self._rebase_granularity]
 
         for alignment in alignments:
             for gap_start, gap_end in self._free_gaps(start, limit):
@@ -1327,8 +1307,12 @@ class Loader:
 
         with stream_or_path(spec) as stream:
             for rear in [bk for bk in ALL_BACKENDS.values() if bk is not Blob] + [Blob]:
-                if rear.is_default and rear.is_compatible(stream):
-                    return rear
+                try:
+                    if rear.is_default and rear.is_compatible(stream):
+                        return rear
+                except Exception as e:  # pylint: disable=broad-except
+                    log.warning("Skipping the %s backend for %s: %r", rear.__name__, spec, e)
+                    stream.seek(0)
 
         return None
 
@@ -1336,8 +1320,8 @@ class Loader:
     def _backend_resolver(backend: str | type[Backend], default: T | None = None) -> type[Backend] | T | None:
         if isinstance(backend, type) and issubclass(backend, Backend):
             return backend
-        elif backend in ALL_BACKENDS:
-            return ALL_BACKENDS[backend]
+        elif isinstance(backend, str) and backend.lower() in ALL_BACKENDS:
+            return ALL_BACKENDS[backend.lower()]
         elif backend is None:
             return default
         else:

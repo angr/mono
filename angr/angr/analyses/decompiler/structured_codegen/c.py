@@ -1,6 +1,7 @@
 # pylint:disable=missing-class-docstring,too-many-boolean-expressions,unused-argument,no-self-use,protected-access
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import struct
@@ -1049,15 +1050,37 @@ class CStatements(CStatement):
         self.addr = addr
 
     def c_repr_chunks(self, indent=0, asexpr=False):
+        yield from self._c_repr_chunks(indent=indent, asexpr=asexpr, terminate_trailing_label=True)
+
+    def _c_repr_chunks(self, indent=0, asexpr=False, *, terminate_trailing_label):
         indent_str = self.indent_str(indent)
         if self.codegen.display_block_addrs:
             yield indent_str, None
             yield f"/* Block {hex(self.addr) if self.addr is not None else 'unknown'} */", None
             yield "\n", None
         for stmt in self.statements:
-            yield from stmt.c_repr_chunks(indent=indent, asexpr=asexpr)
+            if isinstance(stmt, CStatements):
+                # CStatements may be a transparent sequence nested inside another sequence. A label at the end of
+                # the inner sequence still labels the next statement in the outer sequence.
+                yield from stmt._c_repr_chunks(indent=indent, asexpr=asexpr, terminate_trailing_label=False)
+            else:
+                yield from stmt.c_repr_chunks(indent=indent, asexpr=asexpr)
             if asexpr:
                 yield ", ", None
+        if not asexpr and terminate_trailing_label and isinstance(self._last_nonempty_statement(), CLabel):
+            # A C label prefixes a statement; it is not a complete statement itself. Finish it only at the boundary
+            # of the enclosing sequence, after looking through transparent nested sequences.
+            yield indent_str, None
+            yield ";\n", None
+
+    def _last_nonempty_statement(self) -> CStatement | None:
+        for stmt in reversed(self.statements):
+            if isinstance(stmt, CStatements):
+                stmt = stmt._last_nonempty_statement()
+                if stmt is None:
+                    continue
+            return stmt
+        return None
 
 
 class CAILBlock(CStatement):
@@ -2622,8 +2645,15 @@ class CConstant(CExpression):
         return self._type
 
     @staticmethod
-    def str_to_c_str(_str, prefix: str = "", maxlen: int | None = None) -> str:
+    def str_to_c_str(_str: str | bytes, prefix: str = "", maxlen: int | None = None) -> str:
+        if isinstance(_str, bytes):
+            # bytes that do not decode stay bytes, so that repr() escapes them as \xNN below
+            with contextlib.suppress(UnicodeDecodeError):
+                _str = _str.decode("utf-8")
+
         repr_str = repr(_str)
+        if isinstance(_str, bytes):
+            repr_str = repr_str[1:]  # drop the b prefix
         base_str = repr_str[1:-1]
 
         if maxlen is not None and len(base_str) > maxlen:
@@ -2637,13 +2667,13 @@ class CConstant(CExpression):
     def c_repr_chunks(self, indent=0, asexpr=False):
         def _default_output(v) -> str | None:
             if isinstance(v, MemoryData) and v.sort == MemoryDataSort.String and v.content is not None:
-                return CConstant.str_to_c_str(v.content.decode("utf-8"), maxlen=self.codegen.max_str_len)
+                return CConstant.str_to_c_str(v.content, maxlen=self.codegen.max_str_len)
             if isinstance(v, Function):
                 return get_cpp_function_name(v.demangled_name)
             if isinstance(v, str):
                 return CConstant.str_to_c_str(v, maxlen=self.codegen.max_str_len)
             if isinstance(v, bytes):
-                return CConstant.str_to_c_str(v.replace(b"\x00", b"").decode("utf-8"), maxlen=self.codegen.max_str_len)
+                return CConstant.str_to_c_str(v.replace(b"\x00", b""), maxlen=self.codegen.max_str_len)
             return None
 
         if self.collapsed:
@@ -2675,13 +2705,11 @@ class CConstant(CExpression):
                 if isinstance(self._type, SimTypePointer) and isinstance(self._type.pts_to, SimTypeChar):
                     refval = self.reference_values[self._type]
                     if isinstance(refval, MemoryData):
-                        v = refval.content.decode("utf-8") if refval.content else f"<unknown@{refval.addr:#x}>"
-                    elif isinstance(refval, bytes):
-                        v = refval.decode("latin1")
+                        v = refval.content or f"<unknown@{refval.addr:#x}>"
                     else:
-                        # it must be a string
+                        # it must be raw bytes or a string
                         v = refval
-                        assert isinstance(v, str)
+                        assert isinstance(v, (bytes, str))
                     yield CConstant.str_to_c_str(v, maxlen=self.codegen.max_str_len), self
                     return
 
@@ -3393,15 +3421,18 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
         lvalue: bool,
         renegotiate_type: Callable[[SimType, SimType], SimType] = lambda old, proposed: old,
     ) -> CExpression:
-        def _force_type_cast(src_type_: SimType, dst_type_: SimType, expr_: CExpression) -> CUnaryOp:
+        def _force_type_cast(
+            src_type_: SimType, dst_type_: SimType, expr_: CExpression, take_reference: bool
+        ) -> CUnaryOp:
             src_type_ptr = SimTypePointer(src_type_).with_arch(self.project.arch)
             dst_type_ptr = SimTypePointer(dst_type_).with_arch(self.project.arch)
+            cast_expr = CUnaryOp("Reference", expr_, codegen=self) if take_reference else expr_
             return CUnaryOp(
                 "Dereference",
                 CTypeCast(
                     src_type_ptr,
                     dst_type_ptr,
-                    CUnaryOp("Reference", expr_, codegen=self),
+                    cast_expr,
                     codegen=self,
                 ),
                 codegen=self,
@@ -3434,11 +3465,11 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
                 # case 2: we're done because we can never find it and we might as well stop early
                 if base_expr:
                     if not type_equals(base_type, data_type):
-                        return _force_type_cast(base_type, data_type, base_expr)
+                        return _force_type_cast(base_type, data_type, base_expr, True)
                     return base_expr
 
                 if not type_equals(base_type, data_type):
-                    return _force_type_cast(base_type, data_type, expr)
+                    return _force_type_cast(base_type, data_type, expr, False)
                 return CUnaryOp("Dereference", expr, codegen=self)
 
         stride = 1 if base_type.size is None else base_type.size // self.project.arch.byte_width or 1
@@ -4126,10 +4157,15 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
         else_node = (
             None
             if stmt.false_target is None
-            else CGoto(self._handle(stmt.false_target), None, tags=stmt.tags, codegen=self)
+            else CGoto(self._handle(stmt.false_target), stmt.false_target_idx, tags=stmt.tags, codegen=self)
         )
         return CIfElse(
-            [(self._handle(stmt.condition), CGoto(self._handle(stmt.true_target), None, tags=stmt.tags, codegen=self))],
+            [
+                (
+                    self._handle(stmt.condition),
+                    CGoto(self._handle(stmt.true_target), stmt.true_target_idx, tags=stmt.tags, codegen=self),
+                )
+            ],
             else_node=else_node,
             cstyle_ifs=self.cstyle_ifs,
             tags=stmt.tags,
@@ -4302,7 +4338,7 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
         self,
         expr: Expr.Const,
         type_=None,
-        reference_values: dict[SimType | str, str | bytes | int | float | Function | CExpression] | None = None,
+        reference_values: dict[SimType, str | bytes | int | float | Function | CExpression] | None = None,
         variable=None,
         likely_signed=True,
         **kwargs,
@@ -4405,16 +4441,14 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
             elif function_pointer:
                 self._function_pointers.add(expr_reference_variable)
 
-        var_access = None
         if variable is not None and not reference_values:
+            # _variable() records the variable as in use, which CFunction reads to emit declarations and
+            # CFunctionCall reads to disambiguate call target names
             cvar = self._variable(variable, None)
             offset = self._variable_map.reference_variable_offset(expr)
             var_access = self._access_constant_offset_reference(self._get_variable_reference(cvar), offset, None)
-
-        if var_access is not None:
             if expr.value >= self.min_data_addr:
                 return var_access
-            reference_values["offset"] = var_access
         return CConstant(expr.value, type_, reference_values=reference_values, tags=expr.tags, codegen=self)
 
     def _handle_Expr_UnaryOp(self, expr, type_: SimType | None = None, **kwargs):
@@ -4614,6 +4648,14 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
                     dst_type = dst_type.with_arch(self.project.arch)
                     return CTypeCast(src_type, dst_type, cvar, tags=expr.tags, codegen=self)
             return cvar
+
+        if expr.was_reg:
+            # Variable recovery does not create variables for the stack pointer, the instruction
+            # pointer or the link register, so a surviving write to one of them arrives here with
+            # nothing mapped. A register we could not name as a variable is still a register.
+            reg_name = self.project.arch.translate_register_name(expr.oident, expr.size)
+            return CRegister(reg_name or f"reg{expr.oident}", tags=expr.tags, codegen=self)
+
         return CDirtyExpression(expr, codegen=self)
 
     def _handle_Expr_StackBaseOffset(self, expr: StackBaseOffset, **kwargs):
