@@ -16,6 +16,7 @@ from angr.sim_type import (
     SimTypeRef,
     SimUnion,
     TypeRef,
+    type_memo_key,
 )
 
 if TYPE_CHECKING:
@@ -26,6 +27,37 @@ def unpack_typeref(ty):
     if isinstance(ty, TypeRef):
         return ty.type
     return ty
+
+
+def _safe_type_size(ty) -> int:
+    sz = getattr(ty, "size", -1)
+    return sz if isinstance(sz, int) else -1
+
+
+def type_layout_key(ty, _seen: frozenset = frozenset()) -> str:
+    """
+    A structural key for a type, derived purely from its memory layout (sizes, field offsets, and the layouts of
+    field/element/pointee types) and not from any user-renamable struct or field name. Cycles through recursive
+    struct/pointer references are broken with a marker.
+
+    Two types with the same key have the same layout, so the key can stand in for the type's identity wherever a
+    name would otherwise have to: the code generator orders type definitions by it so the order does not move when
+    a struct or a field is renamed, and the type translator names generated structs by it so the name of a struct
+    depends on nothing but the struct.
+    """
+    ty = unpack_typeref(ty)
+    if isinstance(ty, SimStruct):
+        if id(ty) in _seen:
+            return "@"  # a reference back to an enclosing struct (recursive type)
+        _seen = _seen | {id(ty)}
+        offsets = ty.offsets
+        fields = sorted(f"{offsets.get(fname, -1)}:{type_layout_key(fty, _seen)}" for fname, fty in ty.fields.items())
+        return f"S[{_safe_type_size(ty)};{int(bool(getattr(ty, 'packed', False)))};{';'.join(fields)}]"
+    if isinstance(ty, SimTypePointer):
+        return f"P({type_layout_key(ty.pts_to, _seen)})"
+    if isinstance(ty, (SimTypeArray, SimTypeFixedSizeArray)):
+        return f"A{getattr(ty, 'length', None)}({type_layout_key(ty.elem_type, _seen)})"
+    return f"T:{type(ty).__name__}:{_safe_type_size(ty)}:{getattr(ty, 'signed', None)}"
 
 
 def unpack_pointer(ty: SimType, iterative: bool = False) -> SimType | None:
@@ -81,7 +113,7 @@ def squash_array_reference(ty):
 def dereference_simtype(
     t: SimType,
     type_collections: list[SimTypeCollection],
-    memo: dict[str | int, SimType] | None = None,
+    memo: dict[str, SimType] | None = None,
     keep_missing: bool = False,
 ) -> SimType:
     """
@@ -116,11 +148,12 @@ def dereference_simtype(
 
     # the following code prepares a real_type SimType object that will be returned at the end of this method
     if isinstance(t, SimStruct):
-        if t.name in memo or (t.anonymous and id(t) in memo):
-            return memo[t.name if not t.anonymous else id(t)]
+        key = type_memo_key(t)
+        if key in memo:
+            return memo[key]
 
         real_type = t.copy()
-        memo[t.name if not t.anonymous else id(t)] = real_type
+        memo[key] = real_type
         fields = OrderedDict(
             (k, dereference_simtype(v, type_collections, memo=memo, keep_missing=keep_missing))
             for k, v in t.fields.items()
@@ -135,13 +168,16 @@ def dereference_simtype(
         real_type = t.copy()
         real_type.elem_type = real_elem_type
     elif isinstance(t, SimUnion):
-        memo[t.name] = t
-        real_members = {
+        key = type_memo_key(t)
+        if key in memo:
+            return memo[key]
+
+        real_type = t.copy()
+        memo[key] = real_type
+        real_type.members = {
             k: dereference_simtype(v, type_collections, memo=memo, keep_missing=keep_missing)
             for k, v in t.members.items()
         }
-        real_type = t.copy()
-        real_type.members = real_members
     elif isinstance(t, SimTypeFunction):
         real_args = [dereference_simtype(arg, type_collections, memo=memo, keep_missing=keep_missing) for arg in t.args]
         real_return_type = (
@@ -257,6 +293,67 @@ def find_type_refs(t: SimType, _seen: set[int] | None = None) -> set[str]:
     return refs
 
 
+def _defined_in_collections(name: str, type_collections: list[SimTypeCollection]) -> SimType | None:
+    """
+    The type that dereference_simtype resolves `name` to: its definition in the first collection that has it.
+    """
+    for tc in type_collections:
+        try:
+            return tc.get(name)
+        except AngrMissingTypeError:
+            continue
+    return None
+
+
+def _field_type_shape(t: SimType, type_collections: list[SimTypeCollection]) -> tuple:
+    """
+    Describe the type of a struct field: a nested struct or union by the names of its own members, a SimTypeRef by
+    what the reader would resolve it to, and everything else by what it is. Nested aggregates are described one level
+    deep and their members' types are not entered, which keeps the description finite on a recursive type.
+    """
+    if isinstance(t, SimTypeRef):
+        defined = _defined_in_collections(t.name, type_collections) if t.name is not None else None
+        if defined is None or isinstance(defined, SimTypeRef):
+            return "named", t.name
+        return _field_type_shape(defined, type_collections)
+    if isinstance(t, SimStruct):
+        return "struct", tuple(t.fields)
+    if isinstance(t, SimUnion):
+        return "union", tuple(t.members)
+    if isinstance(t, SimTypePointer):
+        return "pointer", t.label, _field_type_shape(t.pts_to, type_collections)
+    if isinstance(t, SimTypeArray):
+        return "array", t.label, t.length, _field_type_shape(t.elem_type, type_collections)
+    if isinstance(t, SimTypeFunction):
+        args = tuple(_field_type_shape(arg, type_collections) for arg in t.args)
+        returnty = _field_type_shape(t.returnty, type_collections) if t.returnty is not None else None
+        return "function", t.variadic, args, returnty
+    return type(t).__name__, t.label, getattr(t, "_name", None), getattr(t, "signed", None), getattr(t, "_size", None)
+
+
+def _struct_shape(t: SimStruct, type_collections: list[SimTypeCollection]) -> tuple:
+    return t.pack, t.align, tuple((k, _field_type_shape(v, type_collections)) for k, v in t.fields.items())
+
+
+def same_struct_in_collections(t: SimStruct, type_collections: list[SimTypeCollection]) -> bool:
+    """
+    Whether a SimTypeRef to `t.name` dereferenced against `type_collections` restores `t`: the first collection that
+    defines the name, which is the one dereference_simtype consults, defines a struct whose fields match, with a
+    nested struct or union matched on its own members' names.
+
+    A struct that only shares its name with a definition must be kept as it is, or the reader would restore the
+    definition's body in its place. The win32 generator names every inline anonymous struct `_Anonymous_e__Struct`,
+    and libc's `netent` and winsock's differ in a field width.
+    """
+    if t.anonymous:
+        # its name is not an identity, whatever it happens to be
+        return False
+    defined = _defined_in_collections(t.name, type_collections)
+    return isinstance(defined, SimStruct) and _struct_shape(defined, type_collections) == _struct_shape(
+        t, type_collections
+    )
+
+
 def make_type_reference(
     t: SimType,
     memo: dict[str, SimTypeRef] | None = None,
@@ -266,15 +363,21 @@ def make_type_reference(
     Take a SimType and convert named SimStruct instances to SimTypeRefs.
 
     :param t:                   The SimType instance to convert.
-    :param type_collections:    Only structs defined in one of these collections are converted, so that the references
-                                can be resolved later. None converts every named struct.
+    :param type_collections:    Only a struct that one of these collections defines the same way is converted, so that
+                                dereferencing the reference gives back the struct that was there. A struct that only
+                                shares its name with a collection's definition is kept. None converts every named
+                                struct.
     :return:                    A converted SimType instance.
     """
 
     if memo is None:
         memo = {}
 
-    if type(t) is SimStruct and t.name and (type_collections is None or any(t.name in tc for tc in type_collections)):
+    if (
+        type(t) is SimStruct
+        and t.name
+        and (type_collections is None or same_struct_in_collections(t, type_collections))
+    ):
         if t.name in memo:
             ref_t = memo[t.name]
         else:
