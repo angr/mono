@@ -13,6 +13,7 @@ import archinfo
 from angr import Project, load_shellcode, types
 from angr.calling_conventions import (
     SimCCMicrosoftAMD64,
+    SimCCMicrosoftCdecl,
     SimCCMicrosoftFastcall,
     SimCCN32,
     SimCCN32LinuxSyscall,
@@ -23,6 +24,7 @@ from angr.calling_conventions import (
     SimReferenceArgument,
     SimRegArg,
     SimStackArg,
+    SimStructArg,
     SimTypeFixedSizeArray,
     SimTypeFunction,
     SimTypeInt,
@@ -30,10 +32,12 @@ from angr.calling_conventions import (
 )
 from angr.sim_type import (
     SimCppClass,
+    SimStruct,
     SimStructValue,
     SimTypeChar,
     SimTypeDouble,
     SimTypeLongLong,
+    SimTypePointer,
     SimTypeRef,
     TypeRef,
     parse_file,
@@ -329,6 +333,72 @@ class TestCallingConvention(TestCase):
             n32 = self._mips_int_arg_locs(SimCCN32LinuxSyscall, archinfo.ArchMIPSN32(endness), args)
             n64 = self._mips_int_arg_locs(SimCCN64LinuxSyscall, archinfo.ArchMIPS64(endness), args)
             assert n32 == n64, f"{endness}: n32 {n32} != n64 {n64}"
+
+    def test_simcc_arg_locs_returnty_none(self):
+        # SimTypeFunction documents returnty=None as void, and SimCC.arg_session accepts it. Rust
+        # decompilation produces such prototypes: when arg0 is a return buffer the return type moves
+        # into arg0 as a reference and returnty is left None. return_in_implicit_outparam must answer
+        # False for it rather than reaching for its size.
+        func_proto = SimTypeFunction([SimTypeInt(), SimTypeInt()], None)
+
+        arch = archinfo.ArchAMD64()
+        cc = SimCCMicrosoftAMD64(arch)
+        assert cc.return_in_implicit_outparam(None) is False
+
+        reg_names = []
+        for loc in cc.arg_locs(func_proto.with_arch(arch)):
+            assert isinstance(loc, SimRegArg)
+            reg_names.append(loc.reg_name)
+        assert reg_names == ["rcx", "rdx"]
+
+        for arch_cls in [archinfo.ArchAMD64, archinfo.ArchX86, archinfo.ArchARM]:
+            proto = func_proto.with_arch(arch_cls())
+            cc_cls = default_cc(arch_cls.name)
+            assert cc_cls is not None
+            arch_cc = cc_cls(arch_cls())
+
+            # It should not raise any exception!
+            arg_locs = list(arch_cc.arg_locs(proto))
+            assert len(arg_locs) == 2
+
+    def test_microsoft_fastcall_aggregate_return(self):
+        # Regression test: __fastcall changes how arguments are passed, not how values are returned.
+        # Without a return_val override the base class refuses every aggregate return type, and a
+        # decompiled function returning a small struct comes out empty. This is the return-side
+        # counterpart of test_microsoft_fastcall_large_arg above.
+        arch = archinfo.arch_from_id("x86")
+        fastcall = SimCCMicrosoftFastcall(arch)
+        cdecl = SimCCMicrosoftCdecl(arch)
+
+        small = SimStruct({"ptr": SimTypePointer(SimTypeChar()), "len": SimTypeInt()}, name="fatptr").with_arch(arch)
+        large = SimStruct({f"f{i}": SimTypeInt() for i in range(8)}, name="big").with_arch(arch)
+
+        # An eight-byte aggregate comes back in EAX:EDX, the same as __cdecl on Windows x86.
+        small_ret = fastcall.return_val(small)
+        assert isinstance(small_ret, SimStructArg)
+        assert list(small_ret.locs.values()) == [SimRegArg("eax", 4), SimRegArg("edx", 4)]
+        cdecl_small = cdecl.return_val(small)
+        assert isinstance(cdecl_small, SimStructArg)
+        assert set(small_ret.get_footprint()) == set(cdecl_small.get_footprint())
+        assert fastcall.return_in_implicit_outparam(small) is False
+
+        # A larger one is written through a hidden pointer. That pointer is the call's first
+        # argument, so __fastcall passes it in ECX -- not in the stack slot __cdecl uses. This is
+        # why the implementation cannot simply be inherited from the cdecl convention.
+        large_ret = fastcall.return_val(large)
+        assert isinstance(large_ret, SimReferenceArgument)
+        assert large_ret.ptr_loc == SimRegArg("ecx", 4)
+        cdecl_large = cdecl.return_val(large)
+        assert isinstance(cdecl_large, SimReferenceArgument)
+        assert cdecl_large.ptr_loc == SimStackArg(0, 4)
+        assert fastcall.return_in_implicit_outparam(large) is True
+
+        # The hidden pointer consumes ECX, so the declared arguments shift along.
+        proto = SimTypeFunction([SimTypeInt(), SimTypeInt()], large).with_arch(arch)
+        assert [list(loc.get_footprint()) for loc in fastcall.arg_locs(proto)] == [
+            [SimRegArg("edx", 4)],
+            [SimStackArg(0x4, 4)],
+        ]
 
 
 if __name__ == "__main__":
