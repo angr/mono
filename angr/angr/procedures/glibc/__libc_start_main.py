@@ -9,6 +9,8 @@ from angr import claripy
 
 l = logging.getLogger(name=__name__)
 
+_MAIN_PROTOTYPE = "int main(int argc, char **argv, char **envp)"
+
 
 class __libc_start_main(angr.SimProcedure):
     # pylint:disable=arguments-differ,unused-argument,attribute-defined-outside-init,missing-class-docstring
@@ -149,7 +151,7 @@ class __libc_start_main(angr.SimProcedure):
                 self.init,
                 (self.argc[31:0], self.argv, self.envp),
                 "after_init",
-                prototype="int main(int argc, char **argv, char **envp)",
+                prototype=_MAIN_PROTOTYPE,
             )
         else:
             obj = self.project.loader.main_object
@@ -170,7 +172,7 @@ class __libc_start_main(angr.SimProcedure):
                 addr,
                 (self.argc[31:0], self.argv, self.envp),
                 "inside_init",
-                prototype="int main(int argc, char **argv, char **envp)",
+                prototype=_MAIN_PROTOTYPE,
             )
 
     def after_init(self, main, argc, argv, init, fini, exit_addr=0):
@@ -178,7 +180,7 @@ class __libc_start_main(angr.SimProcedure):
             self.main,
             (self.argc[31:0], self.argv, self.envp),
             "after_main",
-            prototype="int main(int argc, char **argv, char **envp)",
+            prototype=_MAIN_PROTOTYPE,
         )
 
     def after_main(self, main, argc, argv, init, fini, exit_addr=0):
@@ -247,16 +249,19 @@ class __libc_start_main(angr.SimProcedure):
             else:
                 break
 
-        cc = angr.default_cc(
-            self.arch.name, platform=self.project.simos.name if self.project.simos is not None else None
-        )(self.arch)
+        cc = self._resolve_cc()
         ty = angr.sim_type.parse_signature("void x(void*, void*, void*, void*, void*)").with_arch(self.arch)
         args = cc.get_args(state, ty)
         main, _, _, init, fini = self._extract_args(blank_state, *args)
 
         # skip invalid results
         result = [
-            {"address": main, "jumpkind": "Ijk_Call", "namehint": "main"},
+            {
+                "address": main,
+                "jumpkind": "Ijk_Call",
+                "namehint": "main",
+                "prototype_hint": _MAIN_PROTOTYPE,
+            },
         ]
         if init.concrete and init.concrete_value != 0:
             init_item = {"address": init, "jumpkind": "Ijk_Call", "namehint": "init"}
