@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "3a0f010612d9c8becbc662c6593cd800dae2fe35",
-      "committed_at": "2026-09-19T23:28:00-07:00",
-      "subject": "Fix data losses with CFG and Function spilling. (#7235)",
+      "commit": "60e140df7b2efbd7af8f180a892c4467966d2b88",
+      "committed_at": "2026-09-21T10:28:04-07:00",
+      "subject": "claripy: add() drops duplicate constraints before storing them (#7237)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -119,7 +119,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-09-21T05:43:43+00:00",
+  "imported_at": "2026-09-21T17:34:45+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
