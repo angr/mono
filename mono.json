@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "60e140df7b2efbd7af8f180a892c4467966d2b88",
-      "committed_at": "2026-09-21T10:28:04-07:00",
-      "subject": "claripy: add() drops duplicate constraints before storing them (#7237)",
+      "commit": "5c38d561200ad7fa9fb89c7c403261c01bb56075",
+      "committed_at": "2026-09-21T11:47:59-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#7242)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "db21882149923888de4001a6e8f9e6015e60d580",
-      "committed_at": "2026-09-17T06:55:19Z",
-      "subject": "Update version to 10.0.1.dev0 [ci skip]",
+      "commit": "25bc8aa222cfd514c3ccf06f1db7bd5e84da72da",
+      "committed_at": "2026-09-21T11:48:47-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#1739)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -48,25 +48,25 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "70594d67e7b6d7f5eea5042eb984c26ac0d63bb5",
-      "committed_at": "2026-09-17T06:55:21Z",
-      "subject": "Update version to 10.0.1.dev0 [ci skip]",
+      "commit": "3030afa4811f0496500e07c38a6952dca7574040",
+      "committed_at": "2026-09-21T11:48:04-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#387)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "claripy": {
       "upstream": "https://github.com/angr/claripy",
-      "commit": "055da809893ef4d8369e3347e0ec9a6691513bac",
-      "committed_at": "2026-09-17T06:55:24Z",
-      "subject": "Update version to 9.3.6.dev0 [ci skip]",
+      "commit": "41e43fd980b413e95ce4a717c4201f6e7cbd4fb7",
+      "committed_at": "2026-09-21T11:48:18-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#745)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "f83325b4e4f4896d61797630e7c5aac580ed5c70",
-      "committed_at": "2026-09-17T06:55:25Z",
-      "subject": "Update version to 10.0.1.dev0 [ci skip]",
+      "commit": "7c5e1a2c1e25524863ed5e778eef63b4d8bc56a1",
+      "committed_at": "2026-09-21T11:47:54-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#842)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -91,17 +91,17 @@
     },
     "pysoot": {
       "upstream": "https://github.com/angr/pysoot",
-      "commit": "fc6af297239f89b2cabffdc0d7918fcbae31851d",
-      "committed_at": "2026-09-18T11:59:49-07:00",
-      "subject": "Update jpype to 1.7.1 (#59)",
+      "commit": "38976d00b1494fdaab8f9ba543d592e72e2a2ce7",
+      "committed_at": "2026-09-21T11:47:30-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#60)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "a9e01df52d5491156f0d0062cddfcea91fe5d4fc",
-      "committed_at": "2026-09-17T06:55:27Z",
-      "subject": "Update version to 10.0.1.dev0 [ci skip]",
+      "commit": "688cc9210601a5098d761ccd1fc125a00b5bb8fe",
+      "committed_at": "2026-09-21T11:47:14-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#588)",
       "excluded": [
         ".gitmodules"
       ],
@@ -119,7 +119,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-09-21T17:34:45+00:00",
+  "imported_at": "2026-09-21T19:00:59+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
