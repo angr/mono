@@ -1,4 +1,4 @@
-# pylint:disable=raise-missing-from
+# pylint:disable=raise-missing-from,protected-access
 from __future__ import annotations
 
 import bisect
@@ -319,8 +319,8 @@ class SpillingFunctionDict(UserDict[K, Function], FunctionDictBase[K]):
         # Temporarily disable eviction during copy
         new_dict._eviction_enabled = False
         # iterate over in-memory functions and copy them
-        for address in self.cached_keys:
-            function = super().__getitem__(address)
+        for address, function in self.data.items():
+            new_dict._list.add(address)
             super(SpillingFunctionDict, new_dict).__setitem__(address, function.copy())
             new_dict._lru_order[address] = None
 
@@ -337,6 +337,7 @@ class SpillingFunctionDict(UserDict[K, Function], FunctionDictBase[K]):
                     if value is not None:
                         dst_txn.put(key, value)
                         new_dict._spilled_keys.add(addr)
+                        new_dict._list.add(addr)
 
         new_dict._eviction_enabled = True
         return new_dict
@@ -428,7 +429,7 @@ class SpillingFunctionDict(UserDict[K, Function], FunctionDictBase[K]):
         Set the maximum number of functions to keep in memory.
         """
         self._cache_limit = value
-        if self.cached_count > value + self._db_batch_size:
+        if self.cached_count > value:
             self._evict_lru()
 
     @property
@@ -483,7 +484,11 @@ class SpillingFunctionDict(UserDict[K, Function], FunctionDictBase[K]):
         with self._db_store_lock:
             evicted_any = False
             while self.cached_count > self._cache_limit:
-                if self._evict_n(min(self._db_batch_size, self.cached_count)) == 0:
+                # evict in batches, but keep the most recently used half of the cache: callers may still be holding
+                # on to recently loaded functions (e.g. a small cache_limit with a large batch size would otherwise
+                # evict a function right after loading it)
+                n = min(self._db_batch_size, max(1, self.cached_count // 2))
+                if self._evict_n(n) == 0:
                     break
                 evicted_any = True
             return evicted_any
@@ -915,11 +920,8 @@ class FunctionManager[K: (int, SootMethodDescriptor)](KnowledgeBasePlugin, colle
         """
         if self._kb is None or self._kb._project is None:
             return max_limit
-        limit = self._kb._project.get_function_cache_limit()
-        if limit is None:
-            return limit
-        limit = max(limit, 100)
-        return min(max_limit, limit)
+        project = self._kb._project
+        return project.get_function_cache_limit()
 
     def _generate_callmap_sif(self, filepath):
         """
@@ -1035,11 +1037,14 @@ class FunctionManager[K: (int, SootMethodDescriptor)](KnowledgeBasePlugin, colle
             from_node = self._kb._project.factory.snippet(from_node)
         if isinstance(retn_node, self.address_types):
             retn_node = self._kb._project.factory.snippet(retn_node)
+        if to_addr is not None:
+            # load or create the callee before fetching the caller: loading it may evict the caller, and a caller
+            # fetched earlier would then be mutated after it was written out
+            self.function(addr=to_addr, create=True, syscall=syscall)
         func = self._function_map[function_addr]
         func._add_call_site(from_node.addr, to_addr, retn_node.addr if retn_node else None)
 
         if to_addr is not None:
-            self.function(addr=to_addr, create=True, syscall=syscall)
             dest_func_node = FuncNode(to_addr)
             func._call_to(
                 from_node,
@@ -1443,6 +1448,9 @@ class FunctionManager[K: (int, SootMethodDescriptor)](KnowledgeBasePlugin, colle
         for func in self._function_map.values():
             if func.block_addrs_set:
                 for node in func.transition_graph:
+                    if isinstance(node, HookNode) and node.addr == func.addr:
+                        # the start node of a hooked function, not a callee
+                        continue
                     if isinstance(node, (HookNode, FuncNode)) and self.contains_addr(node.addr):
                         self.callgraph.add_edge(func.addr, node.addr)
                     else:

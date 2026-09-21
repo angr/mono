@@ -2881,6 +2881,9 @@ class RustStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
         cstyle_void_param: bool = True,
         indent_size: int = INDENT_DELTA,
         variable_map: VariableMap | None = None,
+        # accepted so that the "codegen" decompilation options apply uniformly to both flavors; the Rust renderer has
+        # no C++ STL field accesses to name
+        stl_accessor_calls: bool = False,  # pylint:disable=unused-argument
     ):
         super().__init__(
             flavor=flavor,
@@ -4588,6 +4591,16 @@ class RustStructuredCodeWalker:
         obj.cond = cls.handle(obj.cond)
         obj.iftrue = cls.handle(obj.iftrue)
         obj.iffalse = cls.handle(obj.iffalse)
+        return obj
+
+    @classmethod
+    def handle_RustVectorConvert(cls, obj):
+        obj.operand = cls.handle(obj.operand)
+        return obj
+
+    @classmethod
+    def handle_RustVEXCCallExpression(cls, obj):
+        obj.operands = [cls.handle(operand) for operand in obj.operands]
         return obj
 
 

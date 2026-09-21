@@ -1739,9 +1739,8 @@ class TestDecompiler(unittest.TestCase):
         # getopt_long() == -1 case should be entirely left outside the loop. by ensuring the call to error(0x1) is
         # within the last few lines of decompilation output, we ensure the -1 case is indeed outside the loop.
         last_lines = "\n".join(line.strip(" ") for line in d.codegen.text.split("\n")[-10:])
-        assert 'error(1, *(__errno_location()), "%s");' in last_lines or re.search(
-            r"(\w+) = __errno_location\(\);\s*error\(1, \*\(\1\), \"%s\"\);", last_lines
-        )
+        # the dereference of __errno_location() renders as `errno`
+        assert 'error(1, errno, "%s");' in last_lines
 
     @structuring_algo("phoenix")
     def test_decompiling_fmt_paragraph_dowhile(self, decompiler_options=None):
@@ -2499,7 +2498,13 @@ class TestDecompiler(unittest.TestCase):
         )
         print_decompilation_result(d)
 
-        assert d.codegen.text.count("goto") == 0
+        # Without the CrossJumpReverter this function structures with four gotos. The pass used to bring that to
+        # zero only because the copies it made of the goto target had no outgoing edge: the two duplicated
+        # find_bracketed_repeat() calls fell out of their branches and skipped the `if (!err)` handling that follows
+        # the call. With the copies wired to the target's successor the join stays, and three gotos remain.
+        assert d.codegen is not None and d.codegen.text is not None
+        assert d.codegen.text.count("goto") < 4
+        assert d.codegen.text.count("find_bracketed_repeat(") == 3
 
     @structuring_algo("sailr")
     def test_decompiling_sha384sum_digest_bsd_split_3(self, decompiler_options=None):
@@ -2942,11 +2947,12 @@ class TestDecompiler(unittest.TestCase):
         print_decompilation_result(d)
 
         assert "goto" not in d.codegen.text
+        assert d.codegen is not None and d.codegen.text is not None
+        # the dereference of __errno_location() now renders as `errno`, so the
+        # comma expression this test is about reads `(v = NULL, !errno)`
         assert (
-            re.search(r"if \(\w+ != 0xffffffff \|\| \(\w+ = NULL, !\*\(\(int \*\)\w+\)\)\)", d.codegen.text) is not None
-            or re.search(r"if \(\w+ != 0xffffffff \|\| \(\w+ = NULL, !\*\(\w+\)\)\)", d.codegen.text) is not None
-            or re.search(r"if \(\w+ != -1 \|\| \(\w+ = NULL, !\*\(\(int \*\)\w+\)\)\)", d.codegen.text) is not None
-            or re.search(r"if \(\w+ != -1 \|\| \(\w+ = NULL, !\*\(\w+\)\)\)", d.codegen.text) is not None
+            re.search(r"if \(\w+ != 0xffffffff \|\| \(\w+ = NULL, !errno\)\)", d.codegen.text) is not None
+            or re.search(r"if \(\w+ != -1 \|\| \(\w+ = NULL, !errno\)\)", d.codegen.text) is not None
         )
 
     @for_all_structuring_algos
@@ -4029,7 +4035,7 @@ class TestDecompiler(unittest.TestCase):
 
         # Locate every emitted `typedef struct NAME { ... } NAME;` block.
         typedef_blocks = {}
-        for m in re.finditer(r"typedef struct (struct_\w+) \{", text):
+        for m in re.finditer(r"typedef struct (st_\w+) \{", text):
             name = m.group(1)
             end_marker = "} " + name + ";"
             end = text.index(end_marker, m.start()) + len(end_marker)
@@ -4869,6 +4875,11 @@ class TestDecompiler(unittest.TestCase):
             ]
         )
 
+        # the small constant 0x1234 is tied to g_1234; the codegen must still serialize (#5199 stashed a str-keyed
+        # CExpression in CConstant.reference_values, which broke DecompilationCache spilling)
+        back = type(d.codegen).parse(d.codegen.serialize(), project=proj, kb=proj.kb)
+        assert back.text == d.codegen.text
+
     def test_decompiling_rust_binary_rust_probestack(self, decompiler_options=None):
         bin_path = os.path.join(
             test_location, "x86_64", "1cbbf108f44c8f4babde546d26425ca5340dccf878d306b90eb0fbec2f83ab51"
@@ -5511,10 +5522,14 @@ class TestDecompiler(unittest.TestCase):
         # good output:
         #     else if (g_14002bf04)
         #     {
-        #         return GetCurrentThreadId();
+        #         GetCurrentThreadId();
         #     }
+        #
+        # (the function is void: the call's result is only compared, and its callers ignore rax. It used to read
+        # `return GetCurrentThreadId();` while rax-written-last alone decided the return value.)
         assert "None" not in dec.codegen.text
-        assert "return GetCurrentThreadId();" in dec.codegen.text
+        assert "GetCurrentThreadId();" in dec.codegen.text
+        assert "return GetCurrentThreadId();" not in dec.codegen.text
 
     def test_decompiling_many_consecutive_regions(self, decompiler_options=None):
         bin_path = os.path.join(
@@ -6110,8 +6125,8 @@ class TestDecompiler(unittest.TestCase):
 
         # ensure structs are deduplicated
         #
-        # Collect every emitted `typedef struct struct_N { ... } struct_N;` definition and its (normalized) body.
-        struct_defs = re.findall(r"typedef struct (struct_\w+) \{(.*?)\}\s*\1;", text, re.DOTALL)
+        # Collect every emitted `typedef struct st_<addr>_N { ... } st_<addr>_N;` definition and its (normalized) body.
+        struct_defs = re.findall(r"typedef struct (st_\w+) \{(.*?)\}\s*\1;", text, re.DOTALL)
         struct_names = [name for name, _ in struct_defs]
 
         # Exactly 3 struct typedefs survive: the two genuine, distinct, dereferenced structs plus one shared

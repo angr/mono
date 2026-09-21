@@ -281,10 +281,23 @@ class SimType:
             obj.fields = OrderedDict(_decode(fields_json))
             return obj
 
+        if cls is SimUnion and kwargs.get("name") not in (None, _UNION_ANON_NAME):
+            # same as above, for unions. anonymous unions are not registered: they all share the name "<anon>",
+            # so the first one would answer every later reference to it
+            members_json = kwargs.pop("members", {})
+            obj = SimUnion({}, **kwargs)
+            decoded[obj.name] = obj
+            obj.members = _decode(members_json)
+            return obj
+
         for field, value in kwargs.items():
             kwargs[field] = _decode(value)
         obj = cls(**kwargs)
-        if isinstance(obj, SimStruct) and obj.name:
+        # an anonymous union is never registered: they all share the name "<anon>", so the first one would answer
+        # every later reference to it
+        if (isinstance(obj, SimStruct) and obj.name) or (
+            isinstance(obj, SimUnion) and obj.name not in (None, _UNION_ANON_NAME)
+        ):
             decoded[obj.name] = obj
         return obj
 
@@ -1752,7 +1765,8 @@ class SimStruct(NamedTypeMixin, SimType):
 
         if self.name in memo:
             return memo[self.name].to_json(fields=fields, memo=memo)
-        memo[self.name] = SimTypeRef(self.name, self.__class__)
+        if not self.anonymous:
+            memo[self.name] = SimTypeRef(self.name, self.__class__)
         d = super().to_json(fields=fields, memo=memo)
         if d["pack"] is False:
             d.pop("pack")
@@ -1788,15 +1802,20 @@ class SimStruct(NamedTypeMixin, SimType):
         memo[self.name] = out
 
         out.fields = OrderedDict((k, v.with_arch(arch, memo=memo)) for k, v in self.fields.items())
+        out.fixup_bitfield_offsets(arch)
+        return out
 
-        # Fixup the offsets to byte aligned addresses for all SimTypeNumOffset types
+    def fixup_bitfield_offsets(self, arch: Arch) -> None:
+        """
+        Fix up the offsets of all SimTypeNumOffset fields to byte aligned addresses. Call this after replacing the
+        fields of an arch-ed struct.
+        """
         offset_so_far = 0
-        for ty in out.fields.values():
+        for ty in self.fields.values():
             if isinstance(ty, SimTypeNumOffset):
-                out._pack = True
+                self._pack = True
                 ty.offset = offset_so_far % arch.byte_width
                 offset_so_far += ty.size
-        return out
 
     def __repr__(self):
         return f"struct {self.name}"
@@ -1996,6 +2015,9 @@ class SimStructValue:
         return SimStructValue(self._struct, values=defaultdict(lambda: None, self._values))
 
 
+_UNION_ANON_NAME = "<anon>"
+
+
 class SimUnion(NamedTypeMixin, SimType):
     fields = ("members", "name")
     _args = ("members", "name", "label", "qualifier")
@@ -2006,7 +2028,7 @@ class SimUnion(NamedTypeMixin, SimType):
         :param members:     The members of the union, as a mapping name -> type
         :param name:        The name of the union
         """
-        super().__init__(label, name=name if name is not None else "<anon>")
+        super().__init__(label, name=name if name is not None else _UNION_ANON_NAME)
         self.members = members
         if qualifier:
             self.qualifier = qualifier
@@ -2018,6 +2040,19 @@ class SimUnion(NamedTypeMixin, SimType):
 
         # cached alignment
         self._alignment: int | None = None
+
+    def to_json(self, fields: Iterable[str] | None = None, memo: dict[str, SimTypeRef] | None = None) -> dict[str, Any]:
+        if memo is None:
+            memo = {}
+
+        if self.name in memo:
+            return memo[self.name].to_json(fields=fields, memo=memo)
+        if self.name != _UNION_ANON_NAME:
+            memo[self.name] = SimTypeRef(self.name, self.__class__)
+        d = super().to_json(fields=fields, memo=memo)
+        if "q" in d and not d["q"]:
+            d.pop("q")
+        return d
 
     @property
     def size(self):
@@ -2121,8 +2156,14 @@ class SimUnion(NamedTypeMixin, SimType):
         return f"union {self.name}"
 
     def _with_arch(self, arch, *, memo: dict[str, SimType]):
-        out = SimUnion({name: ty.with_arch(arch, memo=memo) for name, ty in self.members.items()}, self.label)
+        # anonymous unions all share the name "<anon>", so they are memoized by identity instead
+        key = self.name if self.name not in (None, _UNION_ANON_NAME) else f"<anon union {id(self)}>"
+        if key in memo:
+            return memo[key]
+        out = SimUnion({}, name=self.name, label=self.label)
         out._arch = arch
+        memo[key] = out
+        out.members = {name: ty.with_arch(arch, memo=memo) for name, ty in self.members.items()}
         return out
 
     def copy(self):

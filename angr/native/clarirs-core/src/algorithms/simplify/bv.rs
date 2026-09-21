@@ -1,5 +1,5 @@
 use num_bigint::{BigInt, BigUint};
-use num_traits::{Num, One, Zero};
+use num_traits::{Num, One, ToPrimitive, Zero};
 
 use crate::{algorithms::simplify::SimplifyError, prelude::*};
 
@@ -445,8 +445,6 @@ pub(crate) fn simplify_bv<'c>(
                     }
                 }
                 _ => {
-                    // Check if there's an all-ones BVV among the args - if so, extract it
-                    // and apply NOT to the XOR of the remaining args
                     if changed {
                         state.rerun(ctx.xor(sym_args)?)
                     } else {
@@ -932,14 +930,14 @@ pub(crate) fn simplify_bv<'c>(
                 // Base value is zero
                 (AstOp::BVV(v), _) if v.is_zero() => Ok(arc),
                 // Shift by zero or multiple of size
-                (_, AstOp::BVV(v))
-                    if v.is_zero() || v.to_bigint() % arc.size() == BigInt::zero() =>
-                {
+                (_, AstOp::BVV(v)) if v.is_zero() || (v.to_biguint() % arc.size()).is_zero() => {
                     Ok(arc.clone())
                 }
                 // Fully concrete case
                 (AstOp::BVV(value_bv), AstOp::BVV(rotate_bv)) => {
-                    let rotate_u32 = rotate_bv.to_u64().unwrap_or(0) as u32;
+                    let rotate_u32 = (rotate_bv.to_biguint() % value_bv.len())
+                        .to_u32()
+                        .unwrap_or(0);
                     let rotated_bv = value_bv.rotate_left(rotate_u32)?;
                     Ok(ctx.bvv(rotated_bv)?)
                 }
@@ -948,16 +946,16 @@ pub(crate) fn simplify_bv<'c>(
                 (AstOp::RotateLeft(inner, inner_amt), AstOp::BVV(outer_amt)) => {
                     if let AstOp::BVV(inner_amt_val) = inner_amt.op() {
                         let size = arc.size();
-                        let combined_amt = (inner_amt_val.to_bigint() + outer_amt.to_bigint())
-                            % BigInt::from(size);
+                        let combined_amt =
+                            (inner_amt_val.to_biguint() + outer_amt.to_biguint()) % size;
                         let combined_amt_bv = BitVec::from((combined_amt, arc1.size()));
                         state.rerun(ctx.rotate_left(inner.clone(), ctx.bvv(combined_amt_bv)?)?)
                     } else {
                         // Inner rotation amount is not concrete, fall through
-                        let rotate_amount_u32 = outer_amt.to_u64().unwrap_or(0) as u32;
-                        let bottom = ctx.extract(&arc, rotate_amount_u32 - 1, 0)?;
-                        let top = ctx.extract(&arc, arc.size() - 1, rotate_amount_u32)?;
-                        state.rerun(ctx.concat2(bottom, top)?)
+                        let c = (outer_amt.to_biguint() % arc.size()).to_u32().unwrap_or(0);
+                        let low = ctx.extract(&arc, arc.size() - 1 - c, 0)?;
+                        let high = ctx.extract(&arc, arc.size() - 1, arc.size() - c)?;
+                        state.rerun(ctx.concat2(low, high)?)
                     }
                 }
                 // Fallback case
@@ -973,14 +971,14 @@ pub(crate) fn simplify_bv<'c>(
                 // Base value is zero
                 (AstOp::BVV(v), _) if v.is_zero() => Ok(arc),
                 // Shift by zero or multiple of size
-                (_, AstOp::BVV(v))
-                    if v.is_zero() || v.to_bigint() % arc.size() == BigInt::zero() =>
-                {
+                (_, AstOp::BVV(v)) if v.is_zero() || (v.to_biguint() % arc.size()).is_zero() => {
                     Ok(arc.clone())
                 }
                 // Fully concrete case
                 (AstOp::BVV(value_bv), AstOp::BVV(rotate_amount_bv)) => {
-                    let rotate_u32 = rotate_amount_bv.to_u64().unwrap_or(0) as u32;
+                    let rotate_u32 = (rotate_amount_bv.to_biguint() % value_bv.len())
+                        .to_u32()
+                        .unwrap_or(0);
                     let rotated_bv = value_bv.rotate_right(rotate_u32)?;
                     Ok(ctx.bvv(rotated_bv)?)
                 }
@@ -989,17 +987,16 @@ pub(crate) fn simplify_bv<'c>(
                 (AstOp::RotateRight(inner, inner_amt), AstOp::BVV(outer_amt)) => {
                     if let AstOp::BVV(inner_amt_val) = inner_amt.op() {
                         let size = arc.size();
-                        let combined_amt = (inner_amt_val.to_bigint() + outer_amt.to_bigint())
-                            % BigInt::from(size);
+                        let combined_amt =
+                            (inner_amt_val.to_biguint() + outer_amt.to_biguint()) % size;
                         let combined_amt_bv = BitVec::from((combined_amt, arc1.size()));
                         state.rerun(ctx.rotate_right(inner.clone(), ctx.bvv(combined_amt_bv)?)?)
                     } else {
                         // Inner rotation amount is not concrete, fall through
-                        let rotate_amount_u32 = outer_amt.to_u64().unwrap_or(0) as u32;
-                        let bottom = ctx.extract(&arc, arc.size() - rotate_amount_u32, 0)?;
-                        let top =
-                            ctx.extract(&arc, arc.size() - 1, arc.size() - rotate_amount_u32)?;
-                        state.rerun(ctx.concat2(top, bottom)?)
+                        let c = (outer_amt.to_biguint() % arc.size()).to_u32().unwrap_or(0);
+                        let high = ctx.extract(&arc, c - 1, 0)?;
+                        let low = ctx.extract(&arc, arc.size() - 1, c)?;
+                        state.rerun(ctx.concat2(high, low)?)
                     }
                 }
                 // Fallback case
@@ -1475,7 +1472,6 @@ pub(crate) fn simplify_bv<'c>(
                     // Attempt to parse the string as a decimal integer
                     let value = BigUint::from_str_radix(string, 10)
                         .or_else(|_| BigUint::from_str_radix(string, 16)) // Try hexadecimal if decimal fails
-                        .or_else(|_| BigUint::from_str_radix(string, 2)) // Try binary if hexadecimal fails
                         .unwrap_or_else(|_| {
                             BigUint::from_str_radix("ffffffffffffffff", 16).unwrap()
                         });

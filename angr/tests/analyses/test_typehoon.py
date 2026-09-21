@@ -262,6 +262,35 @@ class TestTypehoon(unittest.TestCase):
         assert isinstance(sol.basetype.fields[8], Pointer64)
         assert sol.basetype.fields[8].basetype == sol.basetype
 
+    def test_wrapped_negative_field_offset_does_not_become_a_giant_struct(self):
+        # an offset that wrapped around into the unsigned range is a negative offset in disguise; taking it at face
+        # value builds a struct spanning almost 2 ** 64 bytes, whose field offsets no longer fit in an int64
+        func_f = TypeVariable(name="F")
+        t0 = TypeVariable(name="T0")
+        type_constraints = {
+            func_f: {
+                Subtype(DerivedTypeVariable(t0, None, labels=[Store(), HasField(64, 0)]), t0),
+                Subtype(DerivedTypeVariable(t0, None, labels=[Store(), HasField(64, 8)]), t0),
+                Subtype(DerivedTypeVariable(t0, None, labels=[Load(), HasField(8, 0xFFFF_FFFF_FFFF_FFE8)]), Int32()),
+            },
+        }
+        proj = angr.load_shellcode(b"\x90\x90", "AMD64")
+        typehoon = proj.analyses.Typehoon(type_constraints, func_f)
+
+        sol = typehoon.solution[t0]
+        assert isinstance(sol, Pointer64)
+        assert isinstance(sol.basetype, BottomType)
+
+    def test_huge_field_offset_does_not_become_a_giant_struct(self):
+        # "rcl byte ptr [rax+0x1ce95fe0], 0xe4; ret", lifted verbatim from junk code that an opaque predicate
+        # guards in a stripped PE: the displacement is a leftover constant, not a struct field offset
+        proj = angr.load_shellcode(b"\xc0\x90\xe0\x5f\xe9\x1c\xe4\xc3", "AMD64", load_address=0x400000)
+        cfg = proj.analyses.CFGFast(normalize=True)
+        dec = proj.analyses.Decompiler(cfg.functions[0x400000], cfg=cfg.model, fail_fast=True)
+
+        assert dec.codegen is not None and dec.codegen.text is not None
+        assert "typedef struct" not in dec.codegen.text
+
     def test_solving_cascading_type_constraints(self):
         p = angr.Project(os.path.join(test_location, "x86_64", "decompiler", "tiny_aes_test.elf"), auto_load_libs=False)
         cfg = p.analyses.CFG(data_references=True, normalize=True)
@@ -302,9 +331,14 @@ class TestTypehoon(unittest.TestCase):
             for tv in sols
             if not isinstance(tv, DerivedTypeVariable) and tv.name is None and isinstance(sols[tv], SimTypePointer)
         ]
-        assert len(tvs) == 3
-        assert sols[tvs[1]] == sols[tvs[2]]
-        sol = sols[tvs[1]]
+        # cgc_insert returns nothing: what sits in rax at its ret is the base register of the last store, and every
+        # caller overwrites rax right away, so the calling-convention analysis makes the prototype void and there is
+        # no return-value type variable to count
+        assert "void cgc_insert(" in dec.codegen.text
+        assert len(tvs) == 2
+        assert sols is not None
+        assert sols[tvs[0]] == sols[tvs[1]]
+        sol = sols[tvs[0]]
         assert isinstance(sol, SimTypePointer)
         assert isinstance(sol.pts_to, SimStruct)
         assert len(sol.pts_to.fields) == 2
@@ -367,8 +401,11 @@ class TestTypehoon(unittest.TestCase):
             ],
             key=lambda x: x.idx,
         )
-        assert len(tvs) == 4  # the last two tvs are for the NULL pointers
-        sol = sols[tvs[1]]
+        # cgc_remove returns nothing either (see the note in the insert test above)
+        assert "void cgc_remove(" in dec.codegen.text
+        assert len(tvs) == 3  # the last two tvs are for the NULL pointers
+        assert sols is not None
+        sol = sols[tvs[0]]
         assert isinstance(sol, SimTypePointer)
         assert isinstance(sol.pts_to, SimStruct)
         assert len(sol.pts_to.fields) == 2

@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "24737f3a28e0c7850b0ff73569598f02c2e3b473",
-      "committed_at": "2026-09-15T01:26:24-07:00",
-      "subject": "SimCppClass: Serialize the class body instead of a bare SimTypeRef. (#7202)",
+      "commit": "3a0f010612d9c8becbc662c6593cd800dae2fe35",
+      "committed_at": "2026-09-19T23:28:00-07:00",
+      "subject": "Fix data losses with CFG and Function spilling. (#7235)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "744e9864899a3d14c2967e7dd265ccc58694d3ab",
-      "committed_at": "2026-09-14T13:06:14-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#1732)",
+      "commit": "db21882149923888de4001a6e8f9e6015e60d580",
+      "committed_at": "2026-09-17T06:55:19Z",
+      "subject": "Update version to 10.0.1.dev0 [ci skip]",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -48,25 +48,25 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "06d921965fedb3b937944ab2b5b20aede14c89a6",
-      "committed_at": "2026-09-14T23:40:54-07:00",
-      "subject": "x86/amd64: Add endbr32/endbr64 as a function prologue. (#386)",
+      "commit": "70594d67e7b6d7f5eea5042eb984c26ac0d63bb5",
+      "committed_at": "2026-09-17T06:55:21Z",
+      "subject": "Update version to 10.0.1.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "claripy": {
       "upstream": "https://github.com/angr/claripy",
-      "commit": "0a2d0c6f3b619f358c9ee2f10e97b26a6290c416",
-      "committed_at": "2026-09-02T20:21:21Z",
-      "subject": "Update version to 9.3.5.dev0 [ci skip]",
+      "commit": "055da809893ef4d8369e3347e0ec9a6691513bac",
+      "committed_at": "2026-09-17T06:55:24Z",
+      "subject": "Update version to 9.3.6.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "3e7bce920733fdafa37283fd23dc9d86f1cab88b",
-      "committed_at": "2026-09-14T23:40:38-07:00",
-      "subject": "ELF: load .eh_frame function hints without DWARF loading. (#839)",
+      "commit": "f83325b4e4f4896d61797630e7c5aac580ed5c70",
+      "committed_at": "2026-09-17T06:55:25Z",
+      "subject": "Update version to 10.0.1.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -91,17 +91,17 @@
     },
     "pysoot": {
       "upstream": "https://github.com/angr/pysoot",
-      "commit": "820499f6d92a034404698dcd3b66f31bdc4fb829",
-      "committed_at": "2026-09-14T13:05:33-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#58)",
+      "commit": "fc6af297239f89b2cabffdc0d7918fcbae31851d",
+      "committed_at": "2026-09-18T11:59:49-07:00",
+      "subject": "Update jpype to 1.7.1 (#59)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "24e2bd862aaedc14887bd247f1f1130445f94db6",
-      "committed_at": "2026-09-14T13:05:51-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#583)",
+      "commit": "a9e01df52d5491156f0d0062cddfcea91fe5d4fc",
+      "committed_at": "2026-09-17T06:55:27Z",
+      "subject": "Update version to 10.0.1.dev0 [ci skip]",
       "excluded": [
         ".gitmodules"
       ],
@@ -119,13 +119,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-09-15T08:39:18+00:00",
+  "imported_at": "2026-09-21T05:43:43+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "496378f5cb30bb057e0d5bf76637b4e2c3c224d5",
-      "committed_at": "2026-09-15T07:49:56Z",
-      "subject": "Add more test binaries.",
+      "commit": "213d9d4c310eca1be489aefe42ab91d214cd4c6a",
+      "committed_at": "2026-09-17T06:55:23Z",
+      "subject": "Update version to 9.3.6.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }

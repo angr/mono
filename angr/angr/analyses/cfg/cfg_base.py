@@ -801,14 +801,14 @@ class CFGBase(Analysis):
         binaries = self.project.loader.all_objects if objects is None else objects
 
         memory_regions = []
-        has_executable = False
+        examined_any_object = False
 
         for b in binaries:
             if not b.has_memory:
                 continue
+            examined_any_object = True
 
             if isinstance(b, ELF):
-                has_executable = True
                 # If we have sections, we get result from sections
                 sections = []
                 if not force_segment and b.sections:
@@ -841,7 +841,6 @@ class CFGBase(Analysis):
                             memory_regions.append(segment)
 
             elif isinstance(b, (Coff, PE)):
-                has_executable = True
                 for section in b.sections:
                     if section.is_executable:
                         max_mapped_addr = section.min_addr + min(section.memsize, section.filesize)
@@ -849,7 +848,6 @@ class CFGBase(Analysis):
                         memory_regions.append(tpl)
 
             elif isinstance(b, XBE):
-                has_executable = True
                 # some XBE files will mark the data sections as executable
                 for section in b.sections:
                     if (
@@ -861,7 +859,6 @@ class CFGBase(Analysis):
                         memory_regions.append(tpl)
 
             elif isinstance(b, MachO):
-                has_executable = True
                 if b.segments:
                     # Get all executable segments
                     for seg in b.segments:
@@ -920,7 +917,7 @@ class CFGBase(Analysis):
                 tpl = (b.min_addr, b.max_addr + 1)
                 memory_regions.append(tpl)
 
-        if not memory_regions and not has_executable:
+        if not memory_regions and not examined_any_object:
             memory_regions = [(start, start + len(backer)) for start, backer in self.project.loader.memory.backers()]
 
         # A section or segment that maps no bytes, such as the empty .text of a data-only relocatable, is not a region.
@@ -1262,11 +1259,13 @@ class CFGBase(Analysis):
             func = functions.get_by_addr(func_addr)
             returning = self._determine_function_returning(func, all_funcs_completed=all_funcs_completed)
 
+            if returning is not None:
+                # _determine_function_returning() may have evicted func from a SpillingFunctionDict; write to a
+                # fresh instance
+                functions.get_by_addr(func_addr).returning = returning
             if returning:
-                func.returning = True
                 changes["functions_return"].append(func.addr)
             elif returning is False:
-                func.returning = False
                 changes["functions_do_not_return"].append(func.addr)
 
             if returning is not None and func.addr in functions.callgraph:
@@ -1353,6 +1352,22 @@ class CFGBase(Analysis):
                 all_nodes = sorted(all_nodes, key=lambda node: node.addr, reverse=True)
                 smallest_node = all_nodes[0]  # take the one that has the highest address
                 other_nodes = all_nodes[1:]
+
+                # sanity check: there are cases where a node starts in the middle of an instruction of another node.
+                # in such cases, we do not want to break the other node by limiting its size to cut into the middle of
+                # a legitimate instruction. so we further drop any nodes from other_nodes whose last instruction
+                # address does not exist in the smallest_node's instruction_addrs list.
+                # example: 1817a5bf9c01035bcf8a975c9f1d94b0ce7f6a200339485d8f93859f8f6d730c, 0x21514B6908 and
+                # 0x21514B690C (the source of this jump is at 0x21514B3A67)
+                if smallest_node.instruction_addrs:
+                    other_nodes = [
+                        n
+                        for n in other_nodes
+                        if n.instruction_addrs and n.instruction_addrs[-1] in smallest_node.instruction_addrs
+                    ]
+                if not other_nodes:
+                    del end_addr_to_nodes[key_to_find]
+                    continue
 
                 self._normalize_core(
                     graph, callstack_key, smallest_node, other_nodes, smallest_nodes, end_addr_to_nodes
@@ -1920,13 +1935,21 @@ class CFGBase(Analysis):
                 # alignments
                 return False
 
+            # note that the size of block may change after calling _is_noop_block, because _is_noop_block attempts to
+            # lift the block at the end of the method!
+
             # TODO: We may want to add support for filtering dummy PLT stubs for other architectures, but I haven't
             # TODO: seen any need for those.
-            return not (
-                arch_.name in {"X86", "AMD64"}
-                and len(block.vex.instruction_addresses) == 2
-                and block.vex.jumpkind == "Ijk_Boring"
-            )
+            try:
+                return not (
+                    arch_.name in {"X86", "AMD64"}
+                    and block.size > 0
+                    and len(block.instruction_addrs) == 2
+                    and block.vex.jumpkind == "Ijk_Boring"
+                )
+            except SimError:
+                # catch any exceptions that may raise during VEX block lifting
+                return False
 
         to_remove = set()
 

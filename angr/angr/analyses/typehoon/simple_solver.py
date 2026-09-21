@@ -13,7 +13,7 @@ import networkx
 from sortedcontainers import SortedDict
 
 import angr
-from angr.utils.constants import MAX_POINTSTO_BITS
+from angr.utils.constants import MAX_FIELD_OFFSET, MAX_POINTSTO_BITS
 
 from ._typehash import type_tag
 from .dfa import DFAConstraintSolver, EmptyEpsilonNFAError
@@ -2266,13 +2266,13 @@ class SimpleSolver:
                 # be either a struct or an array
                 # see TestDecompiler.test_simple_strcpy for an example with only one member in fields and a +1 access,
                 # due to ptr arithmetic
-                if any(off < 0 for off in ptr_offs):
+                if any(self._is_negative_offset(off) for off in ptr_offs):
                     # we see references to negative offsets
                     # we resolve this guy as a pointer to an Int8 type
                     result = self._pointer_class()(Int8_)
                 else:
                     for off in ptr_offs:
-                        if off not in fields:
+                        if off not in fields and off <= MAX_FIELD_OFFSET:
                             # missing field at this offset
                             fields[off] = Int8_  # not sure how it's accessed
 
@@ -2282,7 +2282,7 @@ class SimpleSolver:
                     repr_tv = equivalence_classes.get(node.typevar, node.typevar)
                     self._solution_cache[repr_tv] = result
                     solution[node.typevar] = result
-            elif any(off < 0 for off in fields) or any(fld is Bottom_ for fld in fields.values()):
+            elif any(self._is_negative_offset(off) for off in fields) or any(fld is Bottom_ for fld in fields.values()):
                 result = self._pointer_class()(Bottom_)
                 for node in nodes:
                     repr_tv = equivalence_classes.get(node.typevar, node.typevar)
@@ -2369,6 +2369,10 @@ class SimpleSolver:
                     paths.append((new_labels, succ))
 
         return paths
+
+    def _is_negative_offset(self, offset: int) -> bool:
+        # offsets that wrapped around into the unsigned range are negative offsets in disguise
+        return offset < 0 or offset >= 1 << (self.bits - 1)
 
     def _pointer_class(self) -> type[Pointer32 | Pointer64]:
         if self.bits == 32:
