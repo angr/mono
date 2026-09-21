@@ -7,13 +7,17 @@ __package__ = __package__ or "tests.analyses.decompiler"  # pylint:disable=redef
 import os
 import unittest
 
+import archinfo
 import networkx
 
 import angr
 import angr.analyses.decompiler
-from angr.ailment import Manager
+from angr import claripy
+from angr.ailment import Block, Manager
 from angr.analyses import Decompiler
+from angr.analyses.decompiler.condition_processor import ConditionProcessor
 from angr.analyses.decompiler.decompilation_options import get_structurer_option
+from angr.analyses.decompiler.structurer_nodes import CodeNode, SequenceNode
 from angr.analyses.decompiler.structuring import DreamStructurer
 from tests.common import bin_location, load_project_with_scoped_cfg, print_decompilation_result
 
@@ -47,6 +51,48 @@ def D(*edge):
 
 
 class TestStructurer(unittest.TestCase):
+    def test_dream_does_not_replace_reaching_condition_with_concrete_guard(self):
+        arch = archinfo.ArchAMD64()
+        condition_processor = ConditionProcessor(arch, Manager())
+        structurer = object.__new__(DreamStructurer)
+        structurer.cond_proc = condition_processor
+
+        block = Block(0x1000, 1)
+        reaching_condition = claripy.Or(claripy.BoolS("first"), claripy.BoolS("second"))
+        for guarding_condition in (claripy.true(), claripy.false()):
+            with self.subTest(guarding_condition=guarding_condition):
+                condition_processor.guarding_conditions = {block: guarding_condition}
+                code_node = CodeNode(block, reaching_condition)
+                sequence = SequenceNode(block.addr, nodes=[code_node])
+
+                structurer._replace_complex_reaching_conditions(sequence)
+
+                self.assertIs(code_node.reaching_condition, reaching_condition)
+
+    def test_dream_replaces_reaching_condition_with_simpler_symbolic_guard(self):
+        arch = archinfo.ArchAMD64()
+        condition_processor = ConditionProcessor(arch, Manager())
+        structurer = object.__new__(DreamStructurer)
+        structurer.cond_proc = condition_processor
+
+        first = claripy.BoolS("first")
+        second = claripy.BoolS("second")
+        third = claripy.BoolS("third")
+        reaching_condition = claripy.Or(
+            claripy.And(first, second), claripy.And(first, claripy.Not(second)), claripy.And(first, third)
+        )
+        guarding_condition = first
+        self.assertFalse(claripy.Solver().satisfiable(extra_constraints=(reaching_condition != guarding_condition,)))
+
+        block = Block(0x1000, 1)
+        condition_processor.guarding_conditions = {block: guarding_condition}
+        code_node = CodeNode(block, reaching_condition)
+        sequence = SequenceNode(block.addr, nodes=[code_node])
+
+        structurer._replace_complex_reaching_conditions(sequence)
+
+        self.assertIs(code_node.reaching_condition, guarding_condition)
+
     def test_region_identifier_0(self):
         g = networkx.DiGraph()
 
@@ -402,6 +448,29 @@ class TestStructurer(unittest.TestCase):
         dec = proj.analyses[Decompiler].prep(fail_fast=True)(0x4055A5, cfg=cfg.model, preset="full")
         # it should not raise any exceptions
         assert dec.codegen is not None and dec.codegen.text is not None
+
+    def test_phoenix_nested_switch_exit_breaks_from_outer_switch(self):
+        # print_info in GnuTLS certtool: case 1 of the outer switch ends with a nested switch whose every arm exits to
+        # the end of the outer switch. the breaks that replace those gotos leave only the nested switch, so an outer
+        # break must follow it; without one, case 1 falls through into case 2
+        bin_path = os.path.join(test_location, "x86_64", "decompiler", "gnutls_certtool_O0")
+        proj, cfg = load_project_with_scoped_cfg(bin_path, 0x41D658, include_plt=True)
+        dec = proj.analyses[Decompiler].prep(fail_fast=True)(0x41D658, cfg=cfg.model, preset="full")
+        assert dec.codegen is not None and dec.codegen.text is not None
+        expected = "        default:\n            break;\n        }\n        break;\n    case 2:\n"
+        assert expected in dec.codegen.text
+
+    def test_phoenix_nested_switch_exit_breaks_from_outer_switch_in_else_branch(self):
+        # formatted_print_percent in morton: the nested switch sits in the else branch of case 74, and every arm of it
+        # exits to the end of the outer switch, so an outer break follows the nested switch inside that branch
+        bin_path = os.path.join(test_location, "x86_64", "decompiler", "morton")
+        proj, cfg = load_project_with_scoped_cfg(bin_path, 0x4055A5)
+        dec = proj.analyses[Decompiler].prep(fail_fast=True)(0x4055A5, cfg=cfg.model, preset="full")
+        assert dec.codegen is not None and dec.codegen.text is not None
+        expected = (
+            "            default:\n                break;\n            }\n            break;\n        }\n    case 80:\n"
+        )
+        assert expected in dec.codegen.text
 
 
 if __name__ == "__main__":
