@@ -14,7 +14,10 @@ from angr.ailment.statement import Assignment, ConditionalJump, Jump, Label, Ret
 from angr.analyses.decompiler.block_io_finder import BlockIOFinder
 from angr.analyses.decompiler.block_similarity import index_of_similar_stmts, is_similar, longest_ail_subseq
 from angr.analyses.decompiler.counters.boolean_counter import BooleanCounter
-from angr.analyses.decompiler.optimization_passes.optimization_pass import StructuringOptimizationPass
+from angr.analyses.decompiler.optimization_passes.optimization_pass import (
+    StructuringOptimizationPass,
+    StructuringOptimizationPassResult,
+)
 from angr.analyses.decompiler.utils import remove_labels, to_ail_supergraph
 from angr.knowledge_plugins.key_definitions.atoms import MemoryLocation
 from angr.utils.graph import dominates
@@ -26,8 +29,8 @@ from .utils import (
     copy_graph_and_nodes,
     correct_jump_targets,
     deepcopy_ail_anyjump,
-    find_block_in_successors_by_addr,
     replace_node_in_graph,
+    set_conditional_jump_target_addrs,
 )
 
 _l = logging.getLogger(name=__name__)
@@ -85,7 +88,7 @@ class DuplicationReverter(StructuringOptimizationPass):
     # Main Analysis
     #
 
-    def _analyze(self, cache=None) -> bool:
+    def _analyze(self, cache=None) -> StructuringOptimizationPassResult:
         """
         This function is the main analysis function for this deoptimization which implements SAILR's ISD deoptimization.
         There are generally three steps to this deoptimization:
@@ -100,9 +103,8 @@ class DuplicationReverter(StructuringOptimizationPass):
         In these cases, we bail. In stage 3, we reinsert the merged candidate into the original graph. This stage is
         also a little messy because need to correct every jump address.
 
-        Finally, the _analyze function returns True if the analysis was successful and a change was made to the graph.
-        In this case, we return True if this optimization requires another iteration, and False if it does not.
-        It can be True even if no changes were made to the graph.
+        Finally, the _analyze function reports whether analysis should stop, retry another candidate, or retain an
+        updated graph.
         """
         # construct graphs for writing and reading so we can corrupt the write graph
         # but still have a clean copy to read from
@@ -113,7 +115,7 @@ class DuplicationReverter(StructuringOptimizationPass):
         # phase 1: search for candidates to merge based on the ISD-schema
         candidate = self._search_for_deduplication_candidate()
         if candidate is None:
-            return False
+            return StructuringOptimizationPassResult.STOP
 
         # phase 2: construct the middle graph/node that is merged from the duplicate candidate
         try:
@@ -121,16 +123,16 @@ class DuplicationReverter(StructuringOptimizationPass):
         except SAILRSemanticError as e:
             _l.debug("Skipping this candidate because of %s...", e)
             self.candidate_blacklist.add(tuple(candidate))
-            return True
+            return StructuringOptimizationPassResult.RETRY
 
         # phase 3: reinsert the merged candidate into the original graph
         success = self._reinsert_merged_candidate(ail_merge_graph, candidate)
         if not success:
             self.candidate_blacklist.add(tuple(candidate))
-            return True
+            return StructuringOptimizationPassResult.RETRY
 
         self.out_graph = to_ail_supergraph(self.write_graph)
-        return True
+        return StructuringOptimizationPassResult.UPDATED
 
     def _search_for_deduplication_candidate(self) -> tuple[Block, Block] | None:
         candidates = self._find_initial_candidates()
@@ -326,8 +328,16 @@ class DuplicationReverter(StructuringOptimizationPass):
                 self.write_graph.add_edge(orig_pred, new_succ)
 
         self.write_graph = self._correct_all_broken_jumps(self.write_graph)
-        # do not change the address of the function entry block
-        entry_blocks = {node for node in self.read_graph.nodes if node.addr == self._func.addr}
+        # do not change the address of the function entry block. Find it in the write graph by location: the
+        # reinsertion above may have replaced the entry with a copy whose jump was retargeted, and a copy with
+        # different statements is no longer equal to the block in the read graph.
+        entry_blocks = {node for node in self.write_graph.nodes if (node.addr, node.idx) == self.entry_node_addr}
+        if len(entry_blocks) != 1:
+            _l.debug(
+                "Expected one entry block at %s after reinsertion, found %d", self.entry_node_addr, len(entry_blocks)
+            )
+            self.write_graph = self.read_graph.copy()
+            return False
         self.write_graph = self._uniquify_addrs(self.write_graph, keep=entry_blocks)
         _l.info("Candidate merge successful on blocks: %s", candidate)
         return True
@@ -720,11 +730,15 @@ class DuplicationReverter(StructuringOptimizationPass):
             other_successor = next(iter(graph.successors(blocks[1])))
             conditional_block, true_target = self._construct_best_condition_block_for_merge(blocks, graph)
             if true_target == blocks[0]:
-                conditional_block.statements[-1].true_target.value = base_successor.addr
-                conditional_block.statements[-1].false_target.value = other_successor.addr
+                true_successor, false_successor = base_successor, other_successor
             else:
-                conditional_block.statements[-1].true_target.value = other_successor.addr
-                conditional_block.statements[-1].false_target.value = base_successor.addr
+                true_successor, false_successor = other_successor, base_successor
+
+            conditional_block.statements[-1] = set_conditional_jump_target_addrs(
+                conditional_block.statements[-1],
+                true_successor.addr,
+                false_successor.addr,
+            )
 
             ail_merge_graph.graph.add_edge(new_node, conditional_block)
             return ail_merge_graph
@@ -804,8 +818,14 @@ class DuplicationReverter(StructuringOptimizationPass):
                 # unlink src -X-> dst
                 graph.remove_edge(src, dst)
                 # correct the targets of the src
-                target = getattr(src.statements[-1], target_type)
-                target.value = nop_blk.addr
+                last_stmt = src.statements[-1]
+                true_target = last_stmt.true_target.value
+                false_target = last_stmt.false_target.value
+                if target_type == "true_target":
+                    true_target = nop_blk.addr
+                else:
+                    false_target = nop_blk.addr
+                src.statements[-1] = set_conditional_jump_target_addrs(last_stmt, true_target, false_target)
 
         return True
 
@@ -829,16 +849,15 @@ class DuplicationReverter(StructuringOptimizationPass):
 
         return []
 
-    def _block_has_goto_edge(self, block: ailment.Block, other_ends, graph=None):
+    def _block_has_goto_edge(self, block: ailment.Block, other_ends, graph):
         # case1:
         # A -> (goto) -> B.
         # if goto edge coming from end block, from any instruction in the block
         # since instructions can shift...
-        last_stmt = block.statements[-1]
-
-        gotos = self._goto_manager.gotos_in_block(block)
+        assert self._goto_manager is not None
+        gotos = self._goto_manager.gotos_in_block(block, graph=graph)
         for goto in gotos:
-            target_block = find_block_in_successors_by_addr(goto.dst_addr, block, graph)
+            target_block = self._goto_manager.find_destination_block(graph, goto)
             if any(self._has_single_successor_path(end, target_block, graph) for end in other_ends):
                 return True
 
@@ -847,36 +866,24 @@ class DuplicationReverter(StructuringOptimizationPass):
         #
         # Some condition ends in a goto to one of the ends of the merge graph. In this case,
         # we consider it a modified version of case2
-        if graph:
-            for pred in graph.predecessors(block):
-                last_stmt = pred.statements[-1]
-                if isinstance(last_stmt, ConditionalJump):
-                    gotos = self._goto_manager.gotos_in_block(pred)
-                    # TODO: this is only valid for duplication reverter, but it should be better
-                    if gotos and block.idx is not None:
+        for pred in graph.predecessors(block):
+            last_stmt = pred.statements[-1]
+            if isinstance(last_stmt, ConditionalJump):
+                gotos = self._goto_manager.gotos_in_block(pred, graph=graph)
+                for goto in gotos:
+                    if self._goto_manager.find_destination_block(graph, goto) is block:
                         return True
 
-                    for goto in gotos:
-                        if goto.dst_addr in (block.addr, block.statements[0].tags["ins_addr"]):
-                            return True
-
-            for succ in graph.successors(block):
-                last_stmt = succ.statements[-1]
-                if isinstance(last_stmt, ConditionalJump):
-                    gotos = self._goto_manager.gotos_in_block(succ)
-                    # TODO: this is only valid for duplication reverter, but it should be better
-                    if gotos and block.idx is not None:
+        for succ in graph.successors(block):
+            last_stmt = succ.statements[-1]
+            if isinstance(last_stmt, ConditionalJump):
+                gotos = self._goto_manager.gotos_in_block(succ, graph=graph)
+                for goto in gotos:
+                    target_block = self._goto_manager.find_destination_block(graph, goto)
+                    if target_block is None:
+                        continue
+                    if other_ends and all(target_block in graph.successors(other_end) for other_end in other_ends):
                         return True
-
-                    for goto in gotos:
-                        for other_end in other_ends:
-                            found = False
-                            for other_succ in graph.successors(other_end):
-                                if other_succ.addr == goto.dst_addr:
-                                    found = True
-
-                            if not found:
-                                break
 
         return False
 
@@ -884,12 +891,13 @@ class DuplicationReverter(StructuringOptimizationPass):
         """
         Checks if these gotos could be fixed by eager returns
         """
+        assert self._goto_manager is not None
+        assert self.out_graph is not None
         endnodes = [node for node in self.out_graph.nodes() if self.out_graph.out_degree[node] == 0]
-        blocks_by_addr = {blk.addr: blk for blk in self.out_graph.nodes()}
 
         bad_gotos = set()
         for goto in self._goto_manager.gotos:
-            goto_end_block = blocks_by_addr.get(goto.dst_addr)
+            goto_end_block = self._goto_manager.find_destination_block(self.out_graph, goto)
             # skip gotos that don't exist
             if not goto_end_block:
                 continue
