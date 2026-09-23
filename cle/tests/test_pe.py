@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import unittest
@@ -348,6 +349,86 @@ class TestPEBackend(unittest.TestCase):
         assert isinstance(ld.main_object, cle.PE)
         assert ld.main_object.arch.name == "RISCV64"
         assert ld.main_object.os == "uefi"
+
+    def test_readytorun_machine_os_override(self):
+        dll = os.path.join(TEST_BASE, "tests", "x86_64", "readytorun_linux_x64.dll")
+        with open(dll, "rb") as f:
+            header = f.read(0x200)
+        machine = struct.unpack_from("<H", header, struct.unpack_from("<I", header, 0x3C)[0] + 4)[0]
+        # published for linux-x64, so the machine type is AMD64 exclusive-ored with the .NET
+        # override constant for Linux
+        assert machine == 0x8664 ^ 0x7B79
+
+        ld = cle.Loader(dll, auto_load_libs=False)
+        assert isinstance(ld.main_object, cle.PE)
+        assert ld.main_object.arch.name == "AMD64"
+        assert ld.main_object.is_dotnet
+
+    def test_mapped_image_covers_max_addr(self):
+        exe = os.path.join(TEST_BASE, "tests", "i386", "simple_windows.exe")
+        ld = cle.Loader(exe, auto_load_libs=False)
+        obj = ld.main_object
+
+        mapped_size = obj.max_addr - obj.min_addr + 1
+        assert len(ld.memory.load(obj.min_addr, mapped_size)) == mapped_size
+
+    def test_mapped_image_covers_uninitialized_tail(self):
+        exe = os.path.join(TEST_BASE, "tests", "i386", "windows", "rain32.upx")
+        ld = cle.Loader(exe, auto_load_libs=False)
+        obj = ld.main_object
+
+        rsrc = ld.main_object.sections_map[".rsrc"]
+        assert rsrc.memsize == 0x1000
+        assert rsrc.filesize == 0x600
+        tail = rsrc.memsize - rsrc.filesize
+        assert ld.memory.load(rsrc.vaddr + rsrc.filesize, tail) == bytes(tail)
+
+        mapped_size = obj.max_addr - obj.min_addr + 1
+        assert len(ld.memory.load(obj.min_addr, mapped_size)) == mapped_size
+
+
+# pylint: disable=no-self-use
+class TestPESectionMappedSize(unittest.TestCase):
+    """
+    A PE section is mapped over the larger of its virtual size and its raw size, and never past
+    the end of the image the optional header declares.
+    """
+
+    def test_raw_size_larger_than_virtual_size(self):
+        # .text states VirtualSize 0x7dcf and SizeOfRawData 0x7e00. The loader copies the raw
+        # bytes to the section's address, so the section is mapped over the larger of the two.
+        # .data states the reverse -- VirtualSize 0xa19 against SizeOfRawData 0x400 -- and keeps
+        # its virtual size, because the tail is zero-filled rather than read from the file.
+        exe = os.path.join(TEST_BASE, "tests", "x86_64", "windows", "fauxware.exe")
+        ld = cle.Loader(exe, auto_load_libs=False)
+        sections = ld.main_object.sections_map
+
+        assert sections[".text"].memsize == 0x7E00
+        assert sections[".text"].filesize == 0x7E00
+        assert sections[".data"].memsize == 0xA19
+        assert sections[".data"].filesize == 0x400
+
+    def test_raw_size_past_the_end_of_the_image(self):
+        # This one appends 14 MiB to the file and counts it in .reloc's SizeOfRawData, which
+        # reaches 0xe25000 against a SizeOfImage of 0x4f02e. Windows maps SizeOfImage bytes and
+        # no more, so the section stops at the end of the image and the object does not grow.
+        exe = os.path.join(
+            TEST_BASE,
+            "tests",
+            "i386",
+            "windows",
+            "aa893de523f58ee14972b94fef7ecdbb930cbdc700d8be097eb8a6de2549ce73",
+        )
+        ld = cle.Loader(exe, auto_load_libs=False)
+        obj = ld.main_object
+        reloc = obj.sections_map[".reloc"]
+
+        # .text in the same file grows the ordinary way, from VirtualSize 0x1a55d to the raw
+        # size 0x1a600, so this covers both halves of the rule on one object.
+        assert obj.sections_map[".text"].memsize == 0x1A600
+        assert reloc.memsize == 0x202E
+        assert reloc.filesize == 0xE25000
+        assert obj.max_addr - obj.mapped_base < 0x4F02E
 
 
 if __name__ == "__main__":
