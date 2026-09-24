@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from collections import OrderedDict
 from typing import cast
 
 import archinfo
@@ -12,7 +13,15 @@ from archinfo import Endness
 
 import angr
 from angr import AngrMissingTypeError
+from angr.rust.sim_type import RustSimStruct
 from angr.sim_type import (
+    BASIC_TYPES,
+    CXX_TYPES,
+    GLIBC_EXTERNAL_BASIC_TYPES,
+    GLIBC_INTERNAL_BASIC_TYPES,
+    GLIBC_INTERNAL_TYPES,
+    GLIBC_TYPES,
+    STDINT_TYPES,
     SimCppClass,
     SimStruct,
     SimType,
@@ -51,6 +60,7 @@ class TestTypes(unittest.TestCase):
         assert isinstance(pyproto, SimTypeFunction)
         assert isinstance(pyproto.args[0], SimTypeInt)
         assert isinstance(pyproto.args[1], SimTypePointer)
+        assert isinstance(pyproto.args[1].pts_to, SimTypePointer)
         assert isinstance(pyproto.args[1].pts_to.pts_to, SimTypeChar)
         assert isinstance(pyproto.returnty, SimTypeInt)
 
@@ -245,6 +255,7 @@ class TestTypes(unittest.TestCase):
         assert isinstance(struct_llist, SimStruct)
         assert isinstance(struct_llist.fields["next"], SimTypePointer)
         next_struct_llist = struct_llist.fields["next"].pts_to
+        assert isinstance(next_struct_llist, SimStruct)
         assert len(next_struct_llist.fields) == 2
         assert isinstance(next_struct_llist.fields["data"], SimTypeInt)
         assert isinstance(next_struct_llist.fields["next"], SimTypePointer)
@@ -253,6 +264,7 @@ class TestTypes(unittest.TestCase):
         assert isinstance(union_heap, SimUnion)
         assert isinstance(union_heap.members["forward"], SimTypePointer)
         forward_union_heap = union_heap.members["forward"].pts_to
+        assert isinstance(forward_union_heap, SimUnion)
         assert len(forward_union_heap.members) == 2
         assert isinstance(forward_union_heap.members["data"], SimTypeInt)
         assert isinstance(forward_union_heap.members["forward"], SimTypePointer)
@@ -450,6 +462,32 @@ class TestTypes(unittest.TestCase):
         union_type = union_type.with_arch(archinfo.ArchAMD64())
         assert union_type.size == 8  # fall back to architecture word size
 
+    def test_struct_offsets_with_unaligned_aggregate_field(self):
+        # An aggregate with no members reports NotImplemented for its alignment, because
+        # all() over an empty field set is vacuously true. Two supported shapes produce one:
+        # an opaque C++ class, whose layout is unknown so its size is forced, and an empty
+        # union. Laying out a struct that holds either must not depend on multiplying that
+        # sentinel by the byte width.
+        arch = archinfo.ArchX86()
+
+        opaque_class = SimCppClass(unique_name="Opaque", name="Opaque", members={}, size=32)
+        assert opaque_class.with_arch(arch).alignment is NotImplemented
+        holds_class = SimStruct(
+            {"a": SimTypeInt(), "b": opaque_class, "c": SimTypeInt()}, name="holds_class"
+        ).with_arch(arch)
+        assert isinstance(holds_class, SimStruct)
+        assert holds_class.offsets == {"a": 0, "b": 4, "c": 8}
+
+        empty_union = SimUnion({}, name="OpaqueUnion")
+        assert empty_union.with_arch(arch).alignment is NotImplemented
+        holds_union = SimStruct(
+            {"a": SimTypeChar(), "b": empty_union, "c": SimTypeInt()}, name="holds_union"
+        ).with_arch(arch)
+        assert isinstance(holds_union, SimStruct)
+        offsets = holds_union.offsets
+        assert set(offsets) == {"a", "b", "c"}
+        assert offsets["a"] == 0 and offsets["a"] < offsets["b"] < offsets["c"]
+
     def test_widechar_extraction(self):
         proj = angr.load_shellcode(b"\x90\x90\x90\x90", arch="AMD64")
         state = proj.factory.blank_state()
@@ -514,6 +552,134 @@ class TestTypes(unittest.TestCase):
         back_empty = SimType.from_json(json.loads(json.dumps(empty.to_json())))
         assert isinstance(back_empty, SimCppClass)
         assert back_empty.size == 0
+
+    def test_serialize_self_referential_rust_struct(self):
+        # struct Node { next: &Node }. A control: this is fixed on the base by #7181, and guards it.
+        node = RustSimStruct(OrderedDict(), name="Node")
+        node.fields["next"] = SimTypePointer(node)
+
+        d = node.to_json()  # shall not raise
+        assert d["fields"]["next"]["pts_to"] == {"_t": "_ref", "name": "Node", "ot": "rust_struct"}
+
+    def test_serialize_self_referential_anonymous_union(self):
+        # an anonymous union is named "<anon>", which to_json skipped memoizing, so a cycle never terminated
+        union = SimUnion({})
+        union.members["next"] = SimTypePointer(union)
+
+        d = union.to_json()  # shall not raise RecursionError
+        assert d["members"]["next"]["pts_to"] == {"_t": "_ref", "name": "<anon>", "ot": "union"}
+
+    def test_serialize_self_referential_anonymous_struct(self):
+        # same for a struct that really carries the anonymous flag, which is the win32 parser's case
+        struct = SimStruct(OrderedDict(), anonymous=True)
+        struct.fields["next"] = SimTypePointer(struct)
+
+        d = struct.to_json()  # shall not raise RecursionError
+        assert d["fields"]["next"]["pts_to"] == {"_t": "_ref", "name": "<anon>", "ot": "struct"}
+
+    def test_serialize_self_referential_union(self):
+        union_heap = angr.types.parse_type("union heap { int data; union heap *forward; }")
+        d = union_heap.to_json()  # shall not raise
+        assert d["members"]["forward"]["pts_to"] == {"_t": "_ref", "name": "heap", "ot": "union"}
+
+        restored = SimType.from_json(json.loads(json.dumps(d)))
+        assert isinstance(restored, SimUnion)
+        assert cast(SimTypePointer, restored.members["forward"]).pts_to is restored
+
+    def test_repeated_union_json_roundtrip(self):
+        t = angr.types.parse_type("struct outer { union named { int x; char c; } a; union named b; }")
+        restored = SimType.from_json(json.loads(json.dumps(t.to_json())))
+        assert isinstance(restored, SimStruct)
+        first, second = restored.fields["a"], restored.fields["b"]
+        assert isinstance(first, SimUnion) and isinstance(second, SimUnion)
+        assert list(first.members) == list(second.members) == ["x", "c"]
+
+    def test_anonymous_union_preserves_enclosing_struct_reference(self):
+        outer = SimStruct({})
+        outer.fields["u"] = SimUnion({"back": SimTypePointer(outer)})
+        outer.fields["next"] = SimTypePointer(outer)
+        restored = cast(SimStruct, SimType.from_json(json.loads(json.dumps(outer.to_json()))))
+        union = cast(SimUnion, restored.fields["u"])
+        assert cast(SimTypePointer, union.members["back"]).pts_to is restored
+        assert cast(SimTypePointer, restored.fields["next"]).pts_to is restored
+
+    def test_union_with_arch_keeps_the_name_and_label(self):
+        union_heap = angr.types.parse_type("union heap { int data; union heap *forward; }")
+        assert cast(SimUnion, union_heap.with_arch(archinfo.ArchAMD64())).name == "heap"  # shall not raise
+
+        u = SimUnion({"i": SimTypeInt()}, name="heap", label="lbl")
+        arched = cast(SimUnion, u.with_arch(archinfo.ArchAMD64()))
+        assert (arched.name, arched.label) == ("heap", "lbl")
+
+    def test_serialize_keeps_distinct_anonymous_aggregates_apart(self):
+        # every anonymous aggregate is named "<anon>", so a name-keyed memo would serialize the
+        # second one as a reference to the first and lose its members
+        t = angr.types.parse_type("struct outer { struct { int x; } a; struct { char c; } b; }")
+        d = t.to_json()
+        assert d["fields"]["b"]["_t"] == "struct"
+
+        restored = cast(SimStruct, SimType.from_json(d))
+        assert isinstance(cast(SimStruct, restored.fields["b"]).fields["c"], SimTypeChar)
+
+    def test_with_arch_keeps_distinct_anonymous_structs_apart(self):
+        t = angr.types.parse_type("struct outer { struct { int x; } a; struct { char c; } b; }")
+        arched = cast(SimStruct, t.with_arch(archinfo.ArchAMD64()))
+        assert arched.fields["a"] is not arched.fields["b"]
+        assert list(cast(SimStruct, arched.fields["b"]).fields) == ["c"]
+
+    def test_with_arch_keeps_distinct_anonymous_cpp_classes_apart(self):
+        # SimCppClass overrides _with_arch, so it needs the anonymity guard of its own
+        outer = SimStruct(
+            {"a": SimCppClass(members={"x": SimTypeInt()}), "b": SimCppClass(members={"y": SimTypeChar()})},
+            name="outer",
+        )
+        arched = cast(SimStruct, outer.with_arch(archinfo.ArchAMD64()))
+        assert arched.fields["a"] is not arched.fields["b"]
+        assert list(cast(SimCppClass, arched.fields["b"]).members) == ["y"]
+
+    def test_repeated_anonymous_aggregate_json_roundtrip(self):
+        for aggregate_type in (SimStruct, SimUnion, RustSimStruct):
+            with self.subTest(aggregate_type=aggregate_type):
+                first = aggregate_type({"x": SimTypeInt()})
+                second = aggregate_type({"y": SimTypeChar()})
+                outer = SimStruct({"a": first, "b": second, "c": first}, name="outer")
+                restored = cast(SimStruct, SimType.from_json(json.loads(json.dumps(outer.to_json()))))
+                for field, member in (("a", "x"), ("b", "y"), ("c", "x")):
+                    value = restored.fields[field]
+                    assert isinstance(value, aggregate_type)
+                    members = value.members if isinstance(value, SimUnion) else value.fields
+                    assert list(members) == [member]
+
+    def test_dereference_keeps_distinct_anonymous_structs_apart(self):
+        t = angr.types.parse_type("struct outer { struct { struct { int x; } deep; } mid; int y; }")
+        mid = cast(SimStruct, cast(SimStruct, dereference_simtype(t, [])).fields["mid"])
+        assert mid.fields["deep"] is not mid
+        assert isinstance(cast(SimStruct, mid.fields["deep"]).fields["x"], SimTypeInt)
+
+    def test_dereference_recursive_union_keeps_missing_references(self):
+        union_heap = cast(SimUnion, angr.types.parse_type("union heap { int data; union heap *forward; }"))
+        missing = SimTypeRef("missing_type", SimStruct)
+        union_heap.members["extra"] = SimStruct({"ptr": SimTypePointer(missing)})
+
+        restored = cast(SimUnion, dereference_simtype(union_heap, [], keep_missing=True))
+        assert restored is not union_heap
+        assert cast(SimTypePointer, restored.members["forward"]).pts_to is restored
+        extra = cast(SimStruct, restored.members["extra"])
+        assert cast(SimTypePointer, extra.fields["ptr"]).pts_to is missing
+        with self.assertRaises(AngrMissingTypeError):
+            dereference_simtype(union_heap, [])
+
+    def test_distinct_anonymous_unions(self):
+        t = angr.types.parse_type("struct outer { union { int x; } a; union { char c; } b; }")
+        for converted in (
+            t.with_arch(archinfo.ArchAMD64()),
+            dereference_simtype(t, []),
+            SimType.from_json(t.to_json()),
+        ):
+            outer = cast(SimStruct, converted)
+            assert outer.fields["a"] is not outer.fields["b"]
+            assert list(cast(SimUnion, outer.fields["a"]).members) == ["x"]
+            assert list(cast(SimUnion, outer.fields["b"]).members) == ["c"]
 
     def test_simstruct_cmp_recursion_error(self):
         t0 = SimStruct(fields={"a": SimTypeBottom()})
@@ -636,6 +802,26 @@ class TestTypes(unittest.TestCase):
         assert isinstance(new_u, SimUnion)
         assert set(new_u.members) == {"i", "self"}
         assert cast(SimTypePointer, new_u.members["self"]).pts_to is new_u
+
+    def test_type_table_struct_names_match_their_keys(self):
+        checked = 0
+        for table in (
+            BASIC_TYPES,
+            STDINT_TYPES,
+            GLIBC_INTERNAL_BASIC_TYPES,
+            GLIBC_EXTERNAL_BASIC_TYPES,
+            CXX_TYPES,
+            GLIBC_INTERNAL_TYPES,
+            GLIBC_TYPES,
+        ):
+            for key, ty in table.items():
+                if not isinstance(ty, (SimStruct, SimUnion)):
+                    continue
+                checked += 1
+                assert key in (ty.name, f"struct {ty.name}", f"union {ty.name}"), (
+                    f"{key} is modelled by a {type(ty).__name__} named {ty.name}"
+                )
+        assert checked > 50, "the type tables moved; this test is no longer checking them"
 
 
 if __name__ == "__main__":

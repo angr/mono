@@ -17,7 +17,6 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use crate::ailment::CachedHash;
 use crate::ailment::ail_expr::{
     AilExpression, CFGTarget, ExprHeader, ExprInner, RoundingModeOrExpr,
 };
@@ -29,6 +28,7 @@ use crate::ailment::manager::Manager;
 use crate::ailment::tags::{TagExtra, TagKey, Tags};
 use crate::ailment::vex_ffi::{self, IRExpr, IRSB};
 use crate::ailment::vexop::{self, SimOpInfo};
+use crate::ailment::{Addr, CachedHash};
 
 const DEFAULT_STATEMENT: i64 = -2;
 const IRTEMP_INVALID: u32 = 0xFFFF_FFFF;
@@ -141,7 +141,7 @@ enum ExprKind<E> {
 
 enum StmtKind<E> {
     IMark {
-        addr: i64,
+        addr: Addr,
         delta: i64,
     },
     AbiHint,
@@ -217,7 +217,7 @@ enum StmtKind<E> {
 trait IrReader {
     type E: Clone;
 
-    fn block_addr(&self) -> i64;
+    fn block_addr(&self) -> Addr;
     fn block_size(&self) -> Option<i64>;
     fn jumpkind(&self) -> String;
     fn next_expr(&self) -> Self::E;
@@ -289,8 +289,8 @@ struct Conv<'py, 'r, R: IrReader> {
     // The Manager is always the Rust pyclass (the typed `run()` signature
     // enforces it), so no per-atom Python `next_atom()` round-trip is needed.
     atom: i64,
-    ins_addr: Option<i64>,
-    block_addr: i64,
+    ins_addr: Option<Addr>,
+    block_addr: Addr,
     vex_stmt_idx: i64,
 }
 
@@ -516,8 +516,8 @@ impl<'py, 'r, R: IrReader> Conv<'py, 'r, R> {
                     to_size,
                     signed,
                     shifted,
-                    ConvertType::TypeInt,
-                    ConvertType::TypeInt,
+                    convert_type_of(simop.from_type.as_deref()),
+                    convert_type_of(simop.to_type.as_deref()),
                     None,
                     self.tags(),
                 ));
@@ -531,8 +531,8 @@ impl<'py, 'r, R: IrReader> Conv<'py, 'r, R> {
                 to_size,
                 signed,
                 operand,
-                ConvertType::TypeInt,
-                ConvertType::TypeInt,
+                convert_type_of(simop.from_type.as_deref()),
+                convert_type_of(simop.to_type.as_deref()),
                 None,
                 self.tags(),
             ));
@@ -996,13 +996,13 @@ impl<'py, 'r, R: IrReader> Conv<'py, 'r, R> {
             } => {
                 let (load_bits, convert_bits, signed) = loadg_sizes(&cvt)?;
                 let dst_var = self.make_tmp(dst as i64, dst_bits)?;
-                // Python arg eval order: Load(next_atom(), convert(addr), ...,
-                // guard=convert(guard), alt=convert(alt)).
+                // Preserve the historical LoadG operand conversion order: address, guard, then alternative.
                 let lidx = self.next_atom();
                 let a = self.convert_expr(&addr)?;
                 let g = self.convert_expr(&guard)?;
                 let al = self.convert_expr(&alt)?;
-                // Load has NO tags in the Python converter for LoadG.
+                // LoadG is represented as an ITE over an unconditional load. The load, optional conversion, and ITE
+                // are synthesized expressions and therefore have no source tags.
                 let size = (load_bits / 8) as i32;
                 let load = AilExpression {
                     header: ExprHeader::new(
@@ -1014,12 +1014,11 @@ impl<'py, 'r, R: IrReader> Conv<'py, 'r, R> {
                     inner: ExprInner::Load {
                         addr: Arc::new(a),
                         endness: end,
-                        guard: Some(Arc::new(g)),
-                        alt: Some(Arc::new(al)),
+                        guard: None,
+                        alt: None,
                     },
                 };
-                let src = if convert_bits != load_bits {
-                    // ... and neither has this Convert.
+                let iftrue = if convert_bits != load_bits {
                     let cidx = self.next_atom();
                     new_convert(
                         cidx,
@@ -1034,6 +1033,17 @@ impl<'py, 'r, R: IrReader> Conv<'py, 'r, R> {
                     )
                 } else {
                     load
+                };
+                let iidx = self.next_atom();
+                let depth = g.header.depth.max(al.header.depth).max(iftrue.header.depth) + 1;
+                let bits = iftrue.header.bits;
+                let src = AilExpression {
+                    header: ExprHeader::new(iidx, depth, bits, Tags::default()),
+                    inner: ExprInner::ITE {
+                        cond: Arc::new(g),
+                        iffalse: Arc::new(al),
+                        iftrue: Arc::new(iftrue),
+                    },
                 };
                 let idx = self.next_atom();
                 out.push(new_stmt(
@@ -1217,11 +1227,12 @@ impl<'py, 'r, R: IrReader> Conv<'py, 'r, R> {
             let kind = self.reader.stmt_kind(self.py, vex_idx)?;
             match &kind {
                 StmtKind::IMark { addr: a, delta } => {
+                    let ins_addr = a.wrapping_add(*delta as Addr);
                     if first_imark {
-                        addr = a + delta;
+                        addr = ins_addr;
                         first_imark = false;
                     }
-                    self.ins_addr = Some(a + delta);
+                    self.ins_addr = Some(ins_addr);
                     continue;
                 }
                 StmtKind::AbiHint | StmtKind::NoOp => continue,
@@ -1759,6 +1770,38 @@ fn effect_name(fx: u32) -> String {
     .to_string()
 }
 
+fn llsc_kind<E: Clone>(
+    result: u32,
+    result_bits: u32,
+    addr: E,
+    storedata: Option<(E, u32)>,
+    endness: &str,
+) -> StmtKind<E> {
+    let mut args = vec![addr.clone()];
+    let (operation, mfx, msize) = match storedata {
+        None => ("load_linked", "Ifx_Read", (result_bits / 8) as i64),
+        Some((data, data_bits)) => {
+            args.push(data);
+            ("store_conditional", "Ifx_Write", (data_bits / 8) as i64)
+        }
+    };
+    let suffix = match endness {
+        "Iend_LE" => "le",
+        "Iend_BE" => "be",
+        _ => "unknown_endness",
+    };
+    StmtKind::Dirty {
+        callee: format!("{operation}_{suffix}"),
+        args,
+        guard: None,
+        mfx: Some(mfx.to_string()),
+        maddr: Some(addr),
+        msize: Some(msize),
+        tmp: Some(result),
+        tmp_bits: result_bits,
+    }
+}
+
 fn loadg_cvt_name(cvt: u32) -> String {
     match cvt {
         0x1D01 => "ILGop_IdentV128",
@@ -1778,10 +1821,10 @@ fn loadg_cvt_name(cvt: u32) -> String {
 impl IrReader for CReader {
     type E = *mut IRExpr;
 
-    fn block_addr(&self) -> i64 {
+    fn block_addr(&self) -> Addr {
         // VEX IRSB has no addr field; the caller supplies it via first IMark.
         // We seed from the lift address stored separately.
-        unsafe { (*self.irsb).offs_ip as i64 } // placeholder; overwritten below
+        unsafe { (*self.irsb).offs_ip as Addr } // placeholder; overwritten below
     }
 
     fn block_size(&self) -> Option<i64> {
@@ -1808,7 +1851,7 @@ impl IrReader for CReader {
         Ok(unsafe {
             match tag {
                 IST_IMARK => StmtKind::IMark {
-                    addr: ist.imark.addr as i64,
+                    addr: ist.imark.addr,
                     delta: ist.imark.delta as i64,
                 },
                 IST_ABIHINT => StmtKind::AbiHint,
@@ -1893,6 +1936,24 @@ impl IrReader for CReader {
                         endness: endness_str(d.end).to_string(),
                     }
                 }
+                IST_LLSC => {
+                    let result = ist.llsc.result;
+                    let result_bits = type_size_bits(self.tyenv_lookup(result));
+                    let addr = ist.llsc.addr;
+                    let storedata = if ist.llsc.storedata.is_null() {
+                        None
+                    } else {
+                        let data = ist.llsc.storedata;
+                        Some((data, self.result_bits(&data)))
+                    };
+                    llsc_kind(
+                        result,
+                        result_bits,
+                        addr,
+                        storedata,
+                        endness_str(ist.llsc.end),
+                    )
+                }
                 IST_DIRTY => {
                     let d = &*ist.dirty.details;
                     let callee = cstr((*d.cee).name);
@@ -1929,7 +1990,7 @@ impl IrReader for CReader {
                     }
                 }
                 _ => {
-                    // MBE / LLSC / PutI etc.: the Python converter labels these
+                    // MBE / PutI etc.: the Python converter labels these
                     // with ``str(stmt)`` (e.g. "MBusEvent-Imbe_Fence"), which we
                     // can't faithfully reproduce from the C struct. Error out so
                     // the caller falls back to the Python-IRSB path. (run() only
@@ -2124,7 +2185,7 @@ impl VEXIRSBConverter {
     fn run<R: IrReader>(
         py: Python<'_>,
         reader: &R,
-        block_addr_override: Option<i64>,
+        block_addr_override: Option<Addr>,
         manager: &Bound<'_, Manager>,
         arch: Bound<'_, PyAny>,
     ) -> PyResult<Block> {
@@ -2284,7 +2345,7 @@ impl VEXIRSBConverter {
         };
         // The C IRSB has no addr; the AIL block addr is the lift address
         // (matches pyvex IRSB.addr / the first IMark).
-        VEXIRSBConverter::run(py, &reader, Some(addr as i64), &manager, arch)
+        VEXIRSBConverter::run(py, &reader, Some(addr), &manager, arch)
     }
 
     /// Fallback: convert a cached pyvex Python `IRSB` object.
@@ -2297,7 +2358,7 @@ impl VEXIRSBConverter {
         vex_ffi::init_symbols(py);
         let arch = irsb.getattr("arch")?;
         let tyenv = irsb.getattr("tyenv")?;
-        let block_addr: i64 = irsb.getattr("addr")?.extract()?;
+        let block_addr: Addr = irsb.getattr("addr")?.extract()?;
         // Keep manager state in sync with the legacy converter.
         {
             let mut m = manager.borrow_mut();
@@ -2342,7 +2403,7 @@ impl<'py> PyReader<'py> {
 impl<'py> IrReader for PyReader<'py> {
     type E = Py<PyAny>;
 
-    fn block_addr(&self) -> i64 {
+    fn block_addr(&self) -> Addr {
         self.irsb
             .getattr("addr")
             .and_then(|a| a.extract())
@@ -2462,6 +2523,20 @@ impl<'py> IrReader for PyReader<'py> {
                     endness: stmt.getattr("endness")?.extract()?,
                 }
             }
+            "LLSC" => {
+                let result: u32 = stmt.getattr("result")?.extract()?;
+                let result_bits = self.tyenv.call_method1("sizeof", (result,))?.extract()?;
+                let addr = stmt.getattr("addr")?.unbind();
+                let storedata_obj = stmt.getattr("storedata")?;
+                let endness: String = stmt.getattr("endness")?.extract()?;
+                let storedata = if storedata_obj.is_none() {
+                    None
+                } else {
+                    let store_bits = self.result_size(&storedata_obj);
+                    Some((storedata_obj.unbind(), store_bits))
+                };
+                llsc_kind(result, result_bits, addr, storedata, &endness)
+            }
             "Dirty" => {
                 let tmp_raw: u32 = stmt.getattr("tmp")?.extract()?;
                 let (tmp, tmp_bits) = if tmp_raw != IRTEMP_INVALID {
@@ -2479,9 +2554,9 @@ impl<'py> IrReader for PyReader<'py> {
                     callee: stmt.getattr("cee")?.getattr("name")?.extract()?,
                     args,
                     guard,
-                    mfx: Some(stmt.getattr("mFx")?.extract()?),
+                    mfx: stmt.getattr("mFx")?.extract()?,
                     maddr,
-                    msize: Some(stmt.getattr("mSize")?.extract()?),
+                    msize: stmt.getattr("mSize")?.extract()?,
                     tmp,
                     tmp_bits,
                 }
