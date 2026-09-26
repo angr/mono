@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import pickle
 import struct
 from io import BytesIO
 
@@ -11,8 +12,10 @@ import pytest
 import cle
 from cle import MachO
 from cle.backends.backend import FunctionHintSource
+from cle.backends.macho.encrypted_sentinel_backer import CryptSentinel, EncryptedDataAccessException
 from cle.backends.macho.macho_enums import LoadCommands, MachoFiletype, SectionAttributes, SectionType
 from cle.backends.macho.section import MachOSection
+from cle.backends.macho.symbol import SYMBOL_TYPE_SECT, SymbolTableSymbol
 
 TEST_BASE = os.path.join(os.path.dirname(os.path.realpath(__file__)), os.path.join("..", "..", "binaries"))
 
@@ -304,6 +307,65 @@ def test_instruction_sections():
     assert macho.sections_map["__TEXT,__cstring"].attributes == 0
 
 
+def test_symbol_is_function():
+    machofile = os.path.join(TEST_BASE, "tests", "x86_64", "fauxware.macho")
+    ld = cle.Loader(machofile, auto_load_libs=False)
+    macho = ld.main_object
+    assert isinstance(macho, cle.MachO)
+
+    symbols = {sym.name: sym for sym in macho.symbols if isinstance(sym, SymbolTableSymbol)}
+
+    # The four symbols defined in a section that holds instructions, and nothing else.
+    assert {name for name, sym in symbols.items() if sym.is_function} == {
+        "_authenticate",
+        "_accepted",
+        "_rejected",
+        "_main",
+    }
+
+    # _sneaky is an N_SECT symbol too, but its section holds data.
+    assert symbols["_sneaky"].section is not None
+    assert symbols["_sneaky"].section.full_name == "__DATA,__data"
+    assert not symbols["_sneaky"].is_function
+
+    # __mh_execute_header names the first section of __TEXT and addresses the Mach-O header in front of it.
+    header = symbols["__mh_execute_header"]
+    assert header.sym_type == SYMBOL_TYPE_SECT
+    assert header.section is not None
+    assert header.section.full_name == "__TEXT,__text"
+    assert not header.section.contains_addr(header.rebased_addr)
+    assert not header.is_function
+
+    # An undefined symbol defines nothing here, so it names no code here either.
+    assert symbols["_printf"].is_import
+    assert symbols["_printf"].section is None
+    assert not symbols["_printf"].is_function
+
+
+def test_arm_thumb_definition_carries_the_flag_in_its_address():
+    machofile = os.path.join(TEST_BASE, "tests", "armhf", "FileProtection-05.armv7.macho")
+    ld = cle.Loader(machofile, auto_load_libs=False)
+    macho = ld.main_object
+    assert isinstance(macho, cle.MachO)
+    assert macho.arch.name == "ARMEL"
+
+    symbols = {sym.name: sym for sym in macho.symbols if isinstance(sym, SymbolTableSymbol)}
+
+    # n_value is 0x83a8 and n_desc says Thumb. ELF would have stated both in st_value.
+    main = symbols["_main"]
+    assert main.is_function
+    assert main.is_thumb_definition
+    assert main.rebased_addr == 0x83A9
+
+    # The one ARM-mode definition in this image keeps the address the file gives it.
+    helpers = symbols[" stub helpers"]
+    assert helpers.is_function
+    assert not helpers.is_thumb_definition
+    assert helpers.rebased_addr == 0xA2F0
+
+    assert sum(1 for sym in symbols.values() if sym.is_function) == 74
+
+
 def test_find_symbol():
     machofile = os.path.join(TEST_BASE, "tests", "x86_64", "fauxware.macho")
     ld = cle.Loader(machofile, auto_load_libs=False)
@@ -480,3 +542,122 @@ def test_relocatable_object():
         # The defined symbols carry real section-relative addresses; undefined externals stay at 0.
         defined = {sym.name for sym in obj.symbols if sym.rebased_addr}
         assert defined, "no defined symbol carries an address"
+
+
+def test_encryption_guard_survives_pickling():
+    """
+    This binary carries an LC_ENCRYPTION_INFO_64 command with cryptid 0, so it records an encrypted
+    range and holds nothing encrypted. Its memory is a CryptSentinel all the same, and every read of
+    that range has to work. Pickling the loader used to lose the sentinel's crypt fields, so the
+    first load after unpickling raised
+    AttributeError: 'CryptSentinel' object has no attribute '_is_encrypted'.
+    """
+    machofile = os.path.join(TEST_BASE, "tests", "armhf", "FileProtection-05.arm64.macho")
+    ld = cle.Loader(machofile, auto_load_libs=False)
+    assert isinstance(ld.main_object, cle.MachO)
+    base = ld.main_object.mapped_base
+
+    # 0x4688 is the first non-zero byte in the range the load command records, [0x4000, 0x8000).
+    assert ld.memory[base + 0x4688] == 0xF6
+    assert base + 0x4688 in ld.memory
+    assert ld.memory.load(base + 0x4688, 4) == b"\xf6W\xbd\xa9"
+
+    ld = pickle.loads(pickle.dumps(ld))
+    base = ld.main_object.mapped_base
+    assert ld.memory[base + 0x4688] == 0xF6
+    assert base + 0x4688 in ld.memory
+    assert ld.memory.load(base + 0x4688, 4) == b"\xf6W\xbd\xa9"
+
+
+def test_encrypted_range_refuses_every_read():
+    """
+    The same binary with cryptid set to 1, which is what a genuinely encrypted one looks like. Every
+    read touching [0x4000, 0x8000) must raise rather than hand back the bytes on disk, which are
+    ciphertext. Single-byte reads and reads through the loader's own memory used to walk past the
+    guard and return them.
+    """
+    machofile = os.path.join(TEST_BASE, "tests", "armhf", "FileProtection-05.arm64.macho")
+    ld = cle.Loader(machofile, auto_load_libs=False)
+    obj = ld.main_object
+    assert isinstance(obj, cle.MachO)
+    memory = obj.memory
+    assert isinstance(memory, CryptSentinel)
+    base = obj.mapped_base
+
+    # The range the file's own load command records, with cryptid flipped on.
+    memory.set_crypt_info(1, 0x4000, 0x4000)
+
+    with pytest.raises(EncryptedDataAccessException):
+        memory.load(0x4688, 4)
+    with pytest.raises(EncryptedDataAccessException):
+        _ = memory[0x4688]
+    with pytest.raises(EncryptedDataAccessException):
+        _ = ld.memory[base + 0x4688]
+    with pytest.raises(EncryptedDataAccessException):
+        ld.memory.load_null_terminated_bytes(base + 0x4688)
+    with pytest.raises(EncryptedDataAccessException):
+        iter(memory)
+
+    # A word read starting two bytes before the range still covers its first two bytes.
+    with pytest.raises(EncryptedDataAccessException):
+        memory.unpack_word(0x3FFE, size=4)
+    with pytest.raises(EncryptedDataAccessException):
+        memory.pack_word(0x3FFE, 0, size=4)
+
+    # A read ending exactly where the range starts does not touch it, and neither does one after it.
+    assert memory.load(0x3FFC, 4) == b"\x00" * 4
+    assert memory.unpack_word(0x3FFC, size=4) == 0
+    assert memory.load(0x8000, 4) == bytes((0xA0, 0x00, 0x10, 0x00))
+
+    # Refusing to read an address does not stop the loader knowing which object holds it.
+    assert ld.find_object_containing(base + 0x4688) is obj
+
+
+def test_encrypted_range_answers_membership_across_a_gap():
+    """
+    A Mach-O whose object memory has holes in it. Refusing to read an encrypted address must not
+    stop the loader answering which object maps it, and Clemory.__contains__ only probes
+    __getitem__ when the memory is not consecutive, so this is the file that reaches that path.
+    """
+    machofile = os.path.join(TEST_BASE, "tests", "aarch64", "langdetect_go.macho")
+    ld = cle.Loader(machofile, auto_load_libs=False)
+    obj = ld.main_object
+    assert isinstance(obj, cle.MachO)
+    memory = obj.memory
+    assert isinstance(memory, CryptSentinel)
+    assert not memory.consecutive
+
+    base = obj.mapped_base
+    # The second backer ends at 0x16b718 and the third starts at 0x16c000, so 0x16b728 is mapped by
+    # no backer at all. Declare a range covering both it and a backed address.
+    backed, unmapped = 0x4688, 0x16B728
+    memory.set_crypt_info(1, 0x4000, 0x168000)
+
+    with pytest.raises(EncryptedDataAccessException):
+        _ = memory[backed]
+    assert backed in memory
+    assert unmapped not in memory
+    assert ld.find_object_containing(base + backed) is obj
+    assert ld.find_object_containing(base + unmapped) is None
+
+
+def test_relocatable_object_no_symtab():
+    """
+    LC_SYMTAB is optional, and a relocatable object whose translation unit defines no symbols does
+    not carry one. Treating the symbol count as unknown rather than zero used to raise TypeError out
+    of _parse_symbols and lose the whole load.
+    """
+    machofile = os.path.join(TEST_BASE, "tests", "x86_64", "relocatable_object_no_symtab.macho")
+    ld = cle.Loader(machofile, auto_load_libs=False)
+    obj = ld.main_object
+    assert isinstance(obj, MachO)
+    assert obj.filetype == MachoFiletype.MH_OBJECT
+
+    # _load_symtab sets both of these, so their absence is what makes this fixture the input here.
+    assert obj.symtab_offset is None
+    assert obj.symtab_nsyms == 0
+    assert not list(obj.symbols)
+
+    # The rest of the object still loads: one unnamed segment holding __text and the DWARF sections.
+    assert len(obj.segments) == 1
+    assert {"__text", "__apple_names", "__apple_types"} <= {sec.name for sec in obj.sections}

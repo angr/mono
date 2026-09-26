@@ -132,6 +132,15 @@ class AllocHelper:
         raise TypeError(type(val))
 
 
+def opaque_cpp_class(ty: SimType) -> bool:
+    """Whether ``ty`` is a C++ class whose definition angr never saw.
+
+    ``sim_type`` builds one of these from a demangled name it cannot resolve: no members, and a
+    size forced to one word. There is no layout to lay out.
+    """
+    return isinstance(ty, SimCppClass) and not ty.fields and bool(ty.size)
+
+
 def refine_locs_with_struct_type(
     arch: archinfo.Arch,
     locs: list,
@@ -831,6 +840,9 @@ class SimCC:
     def next_arg(self, session: ArgSession, arg_type: SimType) -> SimFunctionArgument:
         if isinstance(arg_type, (SimTypeArray, SimTypeFixedSizeArray)):  # hack
             arg_type = SimTypePointer(arg_type.elem_type).with_arch(self.arch)
+        if opaque_cpp_class(arg_type):
+            assert arg_type.size is not None
+            arg_type = SimTypeNum(arg_type.size, signed=False)
         if isinstance(arg_type, (SimStruct, SimUnion, SimTypeFixedSizeArray)):
             raise TypeError(
                 f"{self} doesn't know how to store aggregate type {type(arg_type)}. Consider overriding next_arg to "
@@ -1279,7 +1291,7 @@ class SimCC:
             # this is a PCode SimCC where cls.ARCH is directly callable
             stack_arg_size = cls.ARCH().bytes  # type: ignore
         else:
-            stack_arg_size = cls.ARCH(archinfo.Endness.LE).bytes
+            stack_arg_size = cls.ARCH(cls.ARCH.default_endness).bytes
         stack_args = [a for a in args if isinstance(a, SimStackArg)]
         stack_arg_count = (max(a.stack_offset for a in stack_args) // stack_arg_size + 1) if stack_args else 0
         return min(limit, max(len(args), stack_arg_count))
@@ -1578,7 +1590,7 @@ class SimCCMicrosoftAMD64(SimCC):
     def return_in_implicit_outparam(self, ty):
         if isinstance(ty, TypeRef):
             ty = ty.type
-        if isinstance(ty, (SimTypeBottom, SimTypeRef, SimTypeFloat)):
+        if ty is None or isinstance(ty, (SimTypeBottom, SimTypeRef, SimTypeFloat)):
             return False
         size = ty.size
         return size is not None and size > self.STRUCT_RETURN_THRESHOLD
@@ -1839,9 +1851,7 @@ class SimCCSystemVAMD64(SimCC):
             return ["SSE"] + ["SSEUP"] * (nchunks - 1)
         if isinstance(ty, (SimTypeReg, SimTypeNum, SimTypeBottom, SimTypeEnum, SimTypeBitfield)):
             return ["INTEGER"] * nchunks
-        if isinstance(ty, SimCppClass) and not ty.fields and ty.size:
-            # this is an opaque C++ class (likely unresolved); we cannot lay it out. so we must treat it as a native
-            # integer.
+        if opaque_cpp_class(ty):
             return ["INTEGER"]
         if isinstance(ty, SimTypeArray) or (isinstance(ty, SimType) and isinstance(ty, NamedTypeMixin)):
             # NamedTypeMixin covers SimUnion, SimStruct, SimCppClass, and other struct-like classes
@@ -2380,10 +2390,110 @@ class SimCCARMWindowsSyscall(SimCCSyscall):
 
 class SimCCAArch64(SimCC):
     ARG_REGS = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
-    FP_ARG_REGS = []  # TODO: ???
+    FP_ARG_REGS = ["v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"]
     RETURN_ADDR = SimRegArg("lr", 8)
     RETURN_VAL = SimRegArg("x0", 8)
+    FP_RETURN_VAL = SimRegArg("v0", 8)
     ARCH = archinfo.ArchAArch64
+    MAX_HFA_MEMBERS = 4
+
+    def stack_space(self, args):
+        stack_end = max(
+            (
+                loc.stack_offset + loc.size
+                for arg in args
+                for loc in arg.get_footprint()
+                if isinstance(loc, SimStackArg)
+            ),
+            default=self.STACKARG_SP_DIFF,
+        )
+        return (stack_end + self.arg_slot_size - 1) // self.arg_slot_size * self.arg_slot_size + self.STACKARG_SP_BUFF
+
+    # https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst#parameter-passing
+    def next_arg(self, session, arg_type):
+        members = self._hfa_members(arg_type)
+        if members is None:
+            return super().next_arg(session, arg_type)
+        if session.fp_iter.getstate() + len(members) > len(self.FP_ARG_REGS):
+            # the registers an aggregate was too large to fit into are not offered to any later argument
+            session.fp_iter.setstate(len(self.FP_ARG_REGS))
+            size = arg_type.size
+            assert size is not None
+            words = (size // self.arch.byte_width + self.arch.bytes - 1) // self.arch.bytes
+            return refine_locs_with_struct_type(self.arch, [next(session.both_iter) for _ in range(words)], arg_type)
+        return self._refine_hfa(arg_type, iter([next(session.fp_iter) for _ in members]))
+
+    def _hfa_members(self, arg_type: SimType) -> list[SimTypeFloat] | None:
+        """
+        The members of a homogeneous floating-point aggregate, or None if this type is not one.
+
+        A composite is one when it flattens to at most MAX_HFA_MEMBERS members that are all the same
+        floating-point type. An array argument is a pointer in C, so only a struct or a union can be one.
+        """
+        if not isinstance(arg_type, (SimStruct, SimUnion)) or arg_type.size is None:
+            return None
+        members = self._flatten_floats(arg_type)
+        if members is None or not 1 <= len(members) <= self.MAX_HFA_MEMBERS or members[0].size is None:
+            return None
+        return members if all(member.size == members[0].size for member in members) else None
+
+    def _flatten_floats(self, ty: SimType) -> list[SimTypeFloat] | None:
+        if isinstance(ty, SimTypeFloat):
+            return [ty]
+        if isinstance(ty, SimTypeFixedSizeArray):
+            if ty.length is None or ty.length > self.MAX_HFA_MEMBERS:
+                return None
+            members = self._flatten_floats(ty.elem_type)
+            return None if members is None else members * ty.length
+        if isinstance(ty, SimUnion):
+            widest = self._hfa_union_member(ty)
+            return None if widest is None else self._flatten_floats(widest)
+        if not isinstance(ty, SimStruct):
+            return None
+        flattened: list[SimTypeFloat] = []
+        for field in ty.fields.values():
+            members = self._flatten_floats(field)
+            if members is None:
+                return None
+            flattened += members
+            if len(flattened) > self.MAX_HFA_MEMBERS:
+                return None
+        return flattened
+
+    def _hfa_union_member(self, ty: SimUnion) -> SimType | None:
+        """
+        The member that decides a union's layout, which is the one with the most floating-point members.
+
+        Every member of a union counts towards its homogeneity, so one that is not floating-point, or one
+        whose floating-point type differs, disqualifies the whole union.
+        """
+        widest, widest_count, sizes = None, 0, set()
+        for member in ty.members.values():
+            members = self._flatten_floats(member)
+            if members is None:
+                return None
+            sizes.update(one.size for one in members)
+            if len(members) > widest_count:
+                widest, widest_count = member, len(members)
+        return widest if len(sizes) == 1 else None
+
+    def _refine_hfa(self, ty: SimType, locs: Iterator[SimRegArg]) -> SimFunctionArgument:
+        """
+        Give each member of a homogeneous floating-point aggregate a register of its own, rather than
+        packing them into words the way an aggregate in the general-purpose registers is packed.
+        """
+        if isinstance(ty, SimTypeFloat):
+            assert ty.size is not None
+            return next(locs).refine(ty.size // self.arch.byte_width, arch=self.arch, is_fp=True)
+        if isinstance(ty, SimTypeFixedSizeArray):
+            assert ty.length is not None
+            return SimArrayArg([self._refine_hfa(ty.elem_type, locs) for _ in range(ty.length)])
+        if isinstance(ty, SimUnion):
+            widest = self._hfa_union_member(ty)
+            assert widest is not None
+            return self._refine_hfa(widest, locs)
+        assert isinstance(ty, SimStruct)
+        return SimStructArg(ty, {name: self._refine_hfa(field, locs) for name, field in ty.fields.items()})
 
 
 class SimCCAArch64LinuxSyscall(SimCCSyscall):
@@ -2534,7 +2644,8 @@ class SimCCRISCV64(SimCC):
         session.both_iter.setstate(aligned_offset)
 
         size_bits = arg_type.size
-        n_slots = (size_bits + self.arch.bits - 1) // self.arch.bits
+        # one slot for a type with no computable size, as in _classify
+        n_slots = 1 if size_bits is None else (size_bits + self.arch.bits - 1) // self.arch.bits
         locs = [next(session.both_iter) for _ in range(n_slots)]
         return refine_locs_with_struct_type(self.arch, locs, arg_type)
 
@@ -2573,6 +2684,10 @@ class SimCCRISCV64(SimCC):
             return ["FLOAT"]
 
         size_bits = arg_type.size
+        if size_bits is None:
+            # treat a type with no computable size, BOT included, as one XLEN integer
+            return ["INTEGER"]
+
         # > 2 * _XLEN (Bytes)
         # REFERENCE from psABI:
         # Scalars wider than 2 * XLEN bits are passed by reference
