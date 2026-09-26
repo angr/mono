@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 import angr
+from angr.engines.failure import is_failure_jumpkind
 from angr.errors import AngrError, SimError
 
 # pylint: disable=arguments-differ,unused-argument,no-self-use,inconsistent-return-statements
@@ -39,25 +40,29 @@ class pthread_create(angr.SimProcedure):
         # Execute each block
         state = blank_state
         for b in blocks:
+            # the engine dispatches hooks on the state's instruction pointer, not on the block it is handed
+            state.regs.ip = b.addr
             try:
-                irsb = self.project.factory.default_engine.process(state, b, force_addr=b.addr)
+                irsb = self.project.factory.default_engine.process(state, irsb=b, force_addr=b.addr)
             except (AngrError, SimError) as ex:
                 _l.debug("pthread_create.static_exits: cannot execute block %#x: %s", b.addr, ex)
                 break
-            # VEX turns every aligned SSE access into a guarded Ijk_SigSEGV exit,
-            # so an -O2 block routinely yields several fault successors *before*
-            # its real one, and they sort first. Continuing from a faulted state
-            # is meaningless (its argument registers describe a path that traps),
-            # and the failure engine refuses to execute Ijk_Sig* at all, which
-            # is what used to abort the whole CFG one block later.
-            succ = next((s for s in irsb.successors if not s.history.jumpkind.startswith("Ijk_Sig")), None)
+            # VEX turns every aligned SSE access into a guarded Ijk_SigSEGV exit and
+            # every x86 segment override into a guarded Ijk_MapFail one, so a block
+            # routinely yields several fault successors *before* its real one, and
+            # they sort first. Continuing from a faulted state is meaningless (its
+            # argument registers describe a path that traps), and the failure engine
+            # refuses to execute any of them, which is what used to abort the whole
+            # CFG one block later. is_failure_jumpkind is that engine's own rule, so
+            # the two cannot drift apart.
+            succ = next((s for s in irsb.successors if not is_failure_jumpkind(s.history.jumpkind)), None)
             if succ is None:
                 break
             state = succ
 
-        assert self.cc is not None and self.arch is not None
+        assert self.arch is not None
         try:
-            callfunc = self.cc.get_args(state, self.prototype)[2]
+            callfunc = self._resolve_cc().get_args(state, self.prototype)[2]
             retaddr = state.memory.load(state.regs.sp, size=self.arch.bytes)
         except (AngrError, SimError) as ex:
             _l.debug("pthread_create.static_exits: cannot recover the thread entry point: %s", ex)

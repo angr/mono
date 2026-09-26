@@ -10,8 +10,9 @@ from unittest import TestCase, main
 
 import archinfo
 
-from angr import Project, load_shellcode, types
+from angr import Project, claripy, load_shellcode, types
 from angr.calling_conventions import (
+    SimCCAArch64,
     SimCCMicrosoftAMD64,
     SimCCMicrosoftCdecl,
     SimCCMicrosoftFastcall,
@@ -19,7 +20,10 @@ from angr.calling_conventions import (
     SimCCN32LinuxSyscall,
     SimCCN64,
     SimCCN64LinuxSyscall,
+    SimCCPowerPC,
+    SimCCPowerPC64,
     SimCCRISCV64,
+    SimCCS390X,
     SimCCSystemVAMD64,
     SimReferenceArgument,
     SimRegArg,
@@ -37,7 +41,9 @@ from angr.sim_type import (
     SimTypeBottom,
     SimTypeChar,
     SimTypeDouble,
+    SimTypeFloat,
     SimTypeLongLong,
+    SimTypeNum,
     SimTypePointer,
     SimTypeRef,
     SimUnion,
@@ -270,6 +276,141 @@ class TestCallingConvention(TestCase):
         assert abs(c_float - 102.3) < 0.00001
         assert (a3_val >> 32) == 60
 
+    def test_aarch64_float_args(self):
+        arch = archinfo.arch_from_id("aarch64")
+        cc = SimCCAArch64(arch)
+
+        def locs(*args):
+            return cc.arg_locs(SimTypeFunction(list(args), SimTypeInt()).with_arch(arch))
+
+        integer = SimTypeInt()
+        double = SimTypeDouble()
+        pair = SimStruct({"a": SimTypeDouble(), "b": SimTypeDouble()}, name="Pair")
+        triple = SimStruct({"x": SimTypeFloat(), "y": SimTypeFloat(), "z": SimTypeFloat()}, name="Triple")
+        array = SimStruct({"v": SimTypeFixedSizeArray(SimTypeDouble(), 3)}, name="Array")
+
+        # Floating-point arguments have eight registers of their own and do not consume integer ones.
+        assert locs(double, integer, double) == [SimRegArg("v0", 8), SimRegArg("x0", 4), SimRegArg("v1", 8)]
+        assert locs(*[double] * 9)[8] == SimStackArg(0, 8)
+
+        # Every member of a homogeneous floating-point aggregate takes a register of its own.
+        assert locs(pair)[0].get_footprint() == {SimRegArg("v0", 8), SimRegArg("v1", 8)}
+        assert locs(triple)[0].get_footprint() == {SimRegArg("v0", 4), SimRegArg("v1", 4), SimRegArg("v2", 4)}
+        assert locs(array)[0].get_footprint() == {SimRegArg("v0", 8), SimRegArg("v1", 8), SimRegArg("v2", 8)}
+
+        # Seven doubles leave one register free, which a two-member aggregate cannot use: it goes on the
+        # stack, and the register it skipped is not given to the argument after it either.
+        spilled = locs(*[double] * 7, pair, double)
+        assert spilled[6] == SimRegArg("v6", 8)
+        assert spilled[7].get_footprint() == {SimStackArg(0, 8), SimStackArg(8, 8)}
+        assert spilled[8] == SimStackArg(0x10, 8)
+
+        assert cc.return_val(SimTypeDouble().with_arch(arch)) == SimRegArg("v0", 8)
+        assert cc.return_val(SimTypeFloat().with_arch(arch)) == SimRegArg("v0", 4)
+
+    def test_aarch64_spilled_aggregate_stack_space(self):
+        proj = Project(os.path.join(test_location, "aarch64", "hfa_args_aarch64.so"), auto_load_libs=False)
+        cc = SimCCAArch64(proj.arch)
+        double = SimTypeDouble()
+        payload = b"ABCDEFGHIJKLMNO"
+        for member_type, slot_counts in ((SimTypeFloat(), (1, 1, 2, 2)), (double, (1, 2, 3, 4))):
+            for count, slots in enumerate(slot_counts, 1):
+                aggregate = SimStruct({str(i): member_type for i in range(count)}, name="Aggregate")
+                for trailing_double in (False, True):
+                    with self.subTest(member_type=member_type, count=count, trailing_double=trailing_double):
+                        arg_types = [SimTypePointer(SimTypeChar())] + [double] * 8 + [aggregate]
+                        args = [payload] + [float(i) for i in range(8)] + [tuple(float(i) for i in range(count))]
+                        if trailing_double:
+                            arg_types.append(double)
+                            args.append(10.0)
+                        prototype = SimTypeFunction(arg_types, double).with_arch(proj.arch)
+                        state = proj.factory.call_state(proj.entry, *args, cc=cc, prototype=prototype)
+                        pointer = state.solver.eval(state.regs.x0)
+                        assert (
+                            state.solver.eval(state.memory.load(pointer, len(payload) + 1), cast_to=bytes)
+                            == payload + b"\0"
+                        )
+                        assert cc.stack_space(cc.arg_locs(prototype)) == (slots + int(trailing_double)) * 8
+
+    def test_aarch64_homogeneous_float_aggregates(self):
+        arch = archinfo.arch_from_id("aarch64")
+        cc = SimCCAArch64(arch)
+        floats = SimStruct({"a": SimTypeFloat(), "b": SimTypeFloat()}, name="TwoFloats")
+
+        # A union is one only if every member is, and the member with the most of them decides the layout.
+        homogeneous = SimUnion({"p": floats, "q": SimTypeFloat()}, name="Homogeneous")
+        proto = SimTypeFunction([homogeneous], SimTypeInt()).with_arch(arch)
+        assert cc.arg_locs(proto)[0].get_footprint() == {SimRegArg("v0", 4), SimRegArg("v1", 4)}
+
+        # None of these is homogeneous, so none of them goes in the SIMD registers: a member of another
+        # kind, a member of another floating-point type, or more than four members.
+        for name, aggregate in (
+            ("mixed union", SimUnion({"f": SimTypeFloat(), "i": SimTypeInt()}, name="MixedUnion")),
+            ("widened union", SimUnion({"f": SimTypeFloat(), "d": SimTypeDouble()}, name="WidenedUnion")),
+            ("mixed struct", SimStruct({"a": SimTypeDouble(), "n": SimTypeLongLong()}, name="MixedStruct")),
+            ("five doubles", SimStruct({k: SimTypeDouble() for k in "abcde"}, name="FiveDoubles")),
+            ("long array", SimStruct({"v": SimTypeFixedSizeArray(SimTypeDouble(), 5)}, name="LongArray")),
+        ):
+            assert cc._hfa_members(aggregate.with_arch(arch)) is None, name  # pylint: disable=protected-access
+
+    def test_aarch64_float_args_reach_the_callee(self):
+        proj = Project(os.path.join(test_location, "aarch64", "hfa_args_aarch64.so"), auto_load_libs=False)
+        double = SimTypeDouble()
+        pair = SimStruct({"a": SimTypeDouble(), "b": SimTypeDouble()}, name="Pair")
+        triple = SimStruct({"x": SimTypeFloat(), "y": SimTypeFloat(), "z": SimTypeFloat()}, name="Triple")
+        cases = [
+            ("take_pair", SimTypeFunction([pair], double), [(1.5, 2.25)], 3.75),
+            ("take_triple", SimTypeFunction([triple], SimTypeFloat()), [(1.0, 2.0, 4.0)], 7.0),
+            (
+                "take_mixed",
+                SimTypeFunction([SimTypeLongLong(), triple, double], double),
+                [10, (1.0, 2.0, 4.0), 0.5],
+                17.5,
+            ),
+            (
+                "spill_pair",
+                SimTypeFunction([double] * 7 + [pair, double], double),
+                [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, (8.0, 9.0), 10.0],
+                55.0,
+            ),
+        ]
+        for name, prototype, args, expected in cases:
+            symbol = proj.loader.main_object.get_symbol(name)
+            assert symbol is not None
+            result = proj.factory.callable(symbol.rebased_addr, prototype=prototype)(*args)
+            assert isinstance(result, claripy.ast.FP) and not result.symbolic
+            assert result.args[0] == expected
+
+    def test_riscv64_unsized_argument_takes_one_integer_slot(self):
+        # Type inference produces BOT for an argument it cannot size, and the convention has to
+        # lay one out anyway: SimCC.next_arg treats BOT as an int, and SimCCSystemVAMD64 and
+        # SimCCO32 each classify it as one INTEGER chunk. SimCCRISCV64 instead read ``.size`` and
+        # compared it with ``2 * arch.bits``, raising "'>' not supported between instances of
+        # 'NoneType' and 'int'" -- which ReachingDefinitions raised through
+        # initialize_all_function_arguments and the decompiler swallowed, losing the function.
+        arch = archinfo.ArchRISCV64()
+        cc = SimCCRISCV64(arch)
+
+        def slots(prototype):
+            out = []
+            for loc in cc.arg_locs(prototype.with_arch(arch)):
+                if isinstance(loc, SimRegArg):
+                    out.append(("reg", loc.reg_name))
+                elif isinstance(loc, SimStackArg):
+                    out.append(("stack", loc.stack_offset))
+                else:
+                    out.append(loc)
+            return out
+
+        # Nine arguments, so the ninth is past a0-a7 and goes through _allocate_on_stack: that
+        # method read the size the same way, so guarding only _classify moves the error there.
+        nine = SimTypeFunction([SimTypeBottom()] * 9, SimTypeInt())
+        assert slots(nine) == [("reg", f"a{i}") for i in range(8)] + [("stack", 0)]
+
+        # An unsized argument takes exactly one slot, so the arguments after it do not shift.
+        mixed = SimTypeFunction([SimTypeInt(), SimTypeBottom(), SimTypeInt()], SimTypeInt())
+        assert slots(mixed) == [("reg", "a0"), ("reg", "a1"), ("reg", "a2")]
+
     def test_simcc_arg_locs_returnty_unresolved_simtyperef(self):
         func_proto = SimTypeFunction([], SimTypeRef("std::wstring_t", SimCppClass))
 
@@ -289,6 +430,32 @@ class TestCallingConvention(TestCase):
             proto = SimTypeFunction([SimTypeInt()], TypeRef("class Base::Type", inner)).with_arch(arch)
             assert not cc.return_in_implicit_outparam(proto.returnty)
             assert len(cc.arg_locs(proto)) == 1
+
+    def test_opaque_cpp_class_argument_is_placed_like_an_integer(self):
+        # sim_type invents one of these for a class a demangled C++ name mentions and angr never
+        # saw the definition of: no members, and a size forced to one word.
+        def locs(cc, arch, arg_ty):
+            proto = SimTypeFunction([SimTypeInt(), arg_ty], SimTypeInt()).with_arch(arch)
+            return [loc.get_footprint() for loc in cc.arg_locs(proto)]
+
+        # the four default conventions that inherit SimCC.next_arg rather than overriding it
+        for arch_cls, cc_cls in (
+            (archinfo.ArchS390X, SimCCS390X),
+            (archinfo.ArchPPC32, SimCCPowerPC),
+            (archinfo.ArchPPC64, SimCCPowerPC64),
+            (archinfo.ArchMIPS64, SimCCN64),
+        ):
+            arch = arch_cls()
+            cc = cc_cls(arch)
+            opaque = SimCppClass(unique_name="Opaque", name="Opaque", members={}, size=32)
+            placed = locs(cc, arch, opaque)
+            assert placed == locs(cc, arch, SimTypeNum(32)), f"{arch.name}: {placed}"
+
+            # a class angr does have the members of is a real aggregate, and a convention that has
+            # not been taught how to lay one out still says so
+            pair = SimStruct({"a": SimTypeInt(), "b": SimTypeInt()}, name="Pair")
+            with self.assertRaises(TypeError):
+                locs(cc, arch, pair)
 
     def _mips_int_arg_locs(self, cc_cls, arch, arg_types):
         proto = SimTypeFunction(arg_types, SimTypeInt()).with_arch(arch)
@@ -389,6 +556,33 @@ class TestCallingConvention(TestCase):
             [SimRegArg("edx", 4)],
             [SimStackArg(0x4, 4)],
         ]
+
+    def test_simcc_arg_locs_returnty_none(self):
+        # SimTypeFunction documents returnty=None as void, and SimCC.arg_session accepts it. Rust
+        # decompilation produces such prototypes: when arg0 is a return buffer the return type moves
+        # into arg0 as a reference and returnty is left None. return_in_implicit_outparam must answer
+        # False for it rather than reaching for its size.
+        func_proto = SimTypeFunction([SimTypeInt(), SimTypeInt()], None)
+
+        arch = archinfo.ArchAMD64()
+        cc = SimCCMicrosoftAMD64(arch)
+        assert cc.return_in_implicit_outparam(None) is False
+
+        reg_names = []
+        for loc in cc.arg_locs(func_proto.with_arch(arch)):
+            assert isinstance(loc, SimRegArg)
+            reg_names.append(loc.reg_name)
+        assert reg_names == ["rcx", "rdx"]
+
+        for arch_cls in [archinfo.ArchAMD64, archinfo.ArchX86, archinfo.ArchARM]:
+            proto = func_proto.with_arch(arch_cls())
+            cc_cls = default_cc(arch_cls.name)
+            assert cc_cls is not None
+            arch_cc = cc_cls(arch_cls())
+
+            # It should not raise any exception!
+            arg_locs = list(arch_cc.arg_locs(proto))
+            assert len(arg_locs) == 2
 
 
 if __name__ == "__main__":
