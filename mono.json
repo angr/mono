@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "be7190ce9833487330448d6dac01b77645838df3",
-      "committed_at": "2026-09-21T13:49:16-07:00",
-      "subject": "icicle: detect pcode Cortex-M by pcode_id, not the pcode_arch method (#7243)",
+      "commit": "c27ea568fe2c8e757d5ffffc290aa294aa861c44",
+      "committed_at": "2026-09-24T21:53:29-07:00",
+      "subject": "Add RISC-V FCLASS.S and FCLASS.D CCall support (#7249)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -119,7 +119,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-09-21T20:59:18+00:00",
+  "imported_at": "2026-09-26T20:47:22+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
