@@ -89,6 +89,28 @@ def _defaultdict_set():
     return defaultdict(set)
 
 
+_SYMBOL_VERSION = re.compile(r"@@?[^@]*$")
+
+
+def variable_name_from_label(label: str) -> str:
+    """
+    Derive a variable name from the symbol label at the variable's address.
+
+    MSVC decorates a variable with its enclosing scopes, at-separated and innermost first, behind a
+    leading question mark, as in ?count@detail@ns@@3HA; those become the :: spelling the code
+    generators use for scoped names elsewhere. Every other label is a plain symbol name, and the
+    only at-separated suffix it can carry is the version an ELF reference resolved against, written
+    into the name as stderr@GLIBC_2.2.5 or stderr@@GLIBC_2.2.5. That names the same object as the
+    plain symbol, which cle keeps the version on separately.
+    """
+    if label.startswith("?"):
+        name = label[1:]
+        if "@@" in name:
+            name = name[: name.index("@@")]
+        return "::".join(name.split("@")[::-1])
+    return _SYMBOL_VERSION.sub("", label)
+
+
 class VariableManagerInternal(Serializable):
     """
     Manage variables for a function. It is meant to be used internally by VariableManager, but it's common to be
@@ -594,6 +616,76 @@ class VariableManagerInternal(Serializable):
                 self._unified_variables.discard(old_unified)
             self._variables_to_unified_variables[variable] = old_unified
 
+    def replace_variable(self, variable: SimVariable, replacement: SimVariable) -> None:
+        """
+        Point every record of `variable` at `replacement`, and forget `variable`.
+
+        `replacement` must already be a variable of this function, and the two must start at the
+        same address: recorded byte offsets are carried over as they are, so a replacement that
+        starts elsewhere would move every access that refers to it.
+        """
+
+        if variable is replacement or variable == replacement:
+            return
+
+        self._variables.discard(variable)
+        self._variables_without_writes.discard(variable)
+        if isinstance(variable, SimStackVariable):
+            self._stack_region.remove_variable(variable.offset, variable)
+        elif isinstance(variable, SimComboRegisterVariable):
+            self._register_region.remove_variable(variable.reg_offsets[0], variable)
+        elif isinstance(variable, SimRegisterVariable):
+            self._register_region.remove_variable(variable.reg, variable)
+        elif isinstance(variable, SimMemoryVariable):
+            self._global_region.remove_variable(variable.addr, variable)
+        if variable.ident is not None and self._ident_to_variable.get(variable.ident) == variable:
+            del self._ident_to_variable[variable.ident]
+
+        for access in self._variable_accesses.pop(variable, set()):
+            self._variable_accesses[replacement].add(
+                VariableAccess(
+                    replacement, access.access_type, access.location, access.offset, atom_hash=access.atom_hash
+                )
+            )
+
+        def repoint(var_and_offsets: set[tuple[SimVariable, int | None]]) -> None:
+            for var, offset in list(var_and_offsets):
+                if var == variable:
+                    var_and_offsets.discard((var, offset))
+                    var_and_offsets.add((replacement, offset))
+
+        for var_and_offsets in self._insn_to_variable.values():
+            repoint(var_and_offsets)
+        for var_and_offsets in self._stmt_to_variable.values():
+            repoint(var_and_offsets)
+        for by_atom_hash in self._atom_to_variable.values():
+            for var_and_offsets in by_atom_hash.values():
+                repoint(var_and_offsets)
+        for key in self._variable_to_stmt.pop(variable, set()):
+            self._variable_to_stmt[replacement].add(key)
+
+        for vvar_id in self._variable_to_vvarids.pop(variable, set()):
+            self._vvarid_to_variable[vvar_id] = replacement
+            self._variable_to_vvarids[replacement].add(vvar_id)
+
+        for subvariables in self._phi_variables.values():
+            if variable in subvariables:
+                subvariables.discard(variable)
+                subvariables.add(replacement)
+        for phi in self._variables_to_phivars.pop(variable, set()):
+            self._variables_to_phivars[replacement].add(phi)
+
+        vartype = self.variable_to_types.pop(variable, None)
+        if vartype is not None and replacement not in self.variable_to_types:
+            self.variable_to_types[replacement] = vartype
+        if variable in self.variables_with_manual_types:
+            self.variables_with_manual_types.discard(variable)
+            self.variables_with_manual_types.add(replacement)
+
+        unified = self._variables_to_unified_variables.pop(variable, None)
+        if unified is not None and all(u is not unified for u in self._variables_to_unified_variables.values()):
+            self._unified_variables.discard(unified)
+
     def set_variable(self, sort, start, variable: SimVariable):
         if sort == "stack":
             region = self._stack_region
@@ -1075,13 +1167,7 @@ class VariableManagerInternal(Serializable):
                     continue
                 if labels is not None and var.addr in labels:
                     var.renamed = True
-                    var.name = labels[var.addr]
-                    # poor man's demangling
-                    var.name = var.name.removeprefix("?")
-                    if "@@" in var.name:
-                        var.name = var.name[: var.name.index("@@")]
-                    if "@" in var.name:
-                        var.name = "::".join(var.name.split("@")[::-1])
+                    var.name = variable_name_from_label(labels[var.addr])
                 elif isinstance(var.addr, int):
                     var.name = f"g_{var.addr:x}"
                 elif var.ident is not None:
@@ -1144,9 +1230,7 @@ class VariableManagerInternal(Serializable):
                     continue
                 # assign names directly
                 if labels is not None and var.addr in labels:
-                    var.name = labels[var.addr]
-                    if "@@" in var.name:
-                        var.name = var.name[: var.name.index("@@")]
+                    var.name = variable_name_from_label(labels[var.addr])
                 elif var.ident:
                     var.name = var.ident
                 else:
@@ -1295,12 +1379,16 @@ class VariableManagerInternal(Serializable):
                 congruence_classes[v] = canon_partition
 
         if interference is not None:
-            # unify variables based on phi nodes
+            # unify variables based on phi nodes. a phi's sub-variables are whatever the merged values
+            # named, which is not always a variable of this function: make_phi_node() absorbs the
+            # variables of a later merge into an existing phi, so a register phi can hold a global, and
+            # a global belongs to the global manager rather than to any congruence class here.
             for v, subvs in self._phi_variables.items():
                 if not isinstance(v, (SimRegisterVariable, SimStackVariable)):
                     continue
                 for subv in subvs:
-                    unify(subv, v)
+                    if subv in congruence_classes:
+                        unify(subv, v)
 
             # unify stack variables at the same offsets only if their corresponding vvars do not interfere
             stack_vars_by_offset: dict[int, set[SimStackVariable]] = defaultdict(set)

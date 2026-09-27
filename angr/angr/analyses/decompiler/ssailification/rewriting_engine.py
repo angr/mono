@@ -47,6 +47,7 @@ from angr.ailment.tagged_object import TaggedObject
 from angr.analyses.decompiler.variable_map import variable_map_of
 from angr.calling_conventions import call_clobbered_regs
 from angr.engines.light.engine import SimEngineNostmtAIL
+from angr.utils.ail import is_head_controlled_loop_jump
 
 from .consts import MAX_STACK_VAR_SIZE
 from .rewriting_state import RewritingState
@@ -98,19 +99,6 @@ class SimEngineSSARewriting(
     @property
     def current_vvar_id(self) -> int:
         return self._current_vvar_id
-
-    #
-    # Util functions
-    #
-
-    @staticmethod
-    def _is_head_controlled_loop_jump(block, jump_stmt: ConditionalJump) -> bool:
-        concrete_targets = []
-        if isinstance(jump_stmt.true_target, Const):
-            concrete_targets.append(jump_stmt.true_target.value)
-        if isinstance(jump_stmt.false_target, Const):
-            concrete_targets.append(jump_stmt.false_target.value)
-        return not all(block.addr <= t < block.addr + block.original_size for t in concrete_targets)
 
     #
     # Handlers
@@ -256,7 +244,7 @@ class SimEngineSSARewriting(
         new_true_target = self._expr(stmt.true_target) if stmt.true_target is not None else None
         new_false_target = self._expr(stmt.false_target) if stmt.false_target is not None else None
 
-        if self.stmt_idx != len(self.block.statements) - 1 and self._is_head_controlled_loop_jump(self.block, stmt):
+        if self.stmt_idx != len(self.block.statements) - 1 and is_head_controlled_loop_jump(stmt):
             # the conditional jump is in the middle of the block (e.g., the block generated from lifting rep stosq).
             # we need to make a copy of the state and use the state of this point in its successor
             self.hclb_side_exit_state = self.state.copy()
@@ -522,10 +510,18 @@ class SimEngineSSARewriting(
             else:
                 new_operands.append(operand)
 
+        guard_in = expr.guard
         new_guard = None
-        if expr.guard is not None:
-            new_guard = self._expr(expr.guard)
+        if guard_in is not None:
+            new_guard = self._expr(guard_in)
             if new_guard is not None:
+                updated = True
+
+        maddr_in = expr.maddr
+        new_maddr = None
+        if maddr_in is not None:
+            new_maddr = self._expr(maddr_in)
+            if new_maddr is not None:
                 updated = True
 
         if updated:
@@ -533,9 +529,9 @@ class SimEngineSSARewriting(
                 expr.idx,
                 expr.callee,
                 new_operands,
-                guard=new_guard,
+                guard=new_guard if new_guard is not None else guard_in,
                 mfx=expr.mfx,
-                maddr=expr.maddr,
+                maddr=new_maddr if new_maddr is not None else maddr_in,
                 msize=expr.msize,
                 bits=expr.bits,
                 **expr.tags,

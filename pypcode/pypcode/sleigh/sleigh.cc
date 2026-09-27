@@ -365,13 +365,37 @@ void SleighBuilder::appendBuild(OpTpl *bld,int4 secnum)
   walker->popOperand();
 }
 
+/// \brief Restore a SleighBuilder's walker and unique offset when the enclosing scope exits
+///
+/// A delay slot or a CROSSBUILD is built through a ParserWalker that lives on the stack frame of
+/// the builder method, so the builder must point back at its original walker before that frame
+/// goes away, including when the nested build throws.  Otherwise Sleigh::oneInstruction reports
+/// the failure through a walker that no longer exists.
+class WalkerScope {
+  ParserWalker *&curwalker;		///< The builder's current walker
+  uintb &curuniqueoffset;		///< The builder's current unique offset
+  ParserWalker *oldwalker;		///< The walker in use when this scope was entered
+  uintb olduniqueoffset;		///< The unique offset in use when this scope was entered
+public:
+  /// Record the walker and unique offset to put back
+  WalkerScope(ParserWalker *&w,uintb &off) : curwalker(w), curuniqueoffset(off) {
+    oldwalker = w;
+    olduniqueoffset = off;
+  }
+  /// Put back the recorded walker and unique offset
+  ~WalkerScope(void) {
+    curwalker = oldwalker;
+    curuniqueoffset = olduniqueoffset;
+  }
+};
+
 void SleighBuilder::delaySlot(OpTpl *op)
 
 {
   // Append pcode for an entire instruction (delay slot)
   // in the middle of the current instruction
   ParserWalker *tmp = walker;
-  uintb olduniqueoffset = uniqueoffset;
+  WalkerScope scope(walker,uniqueoffset);	// Restore original context on every exit
 
   Address baseaddr = tmp->getAddr();
   int4 fallOffset = tmp->getLength();
@@ -392,8 +416,6 @@ void SleighBuilder::delaySlot(OpTpl *op)
     fallOffset += len;
     bytecount += len;
   } while(bytecount < delaySlotByteCnt);
-  walker = tmp;			// Restore original context
-  uniqueoffset = olduniqueoffset;
 }
 
 void SleighBuilder::setLabel(OpTpl *op)
@@ -416,7 +438,7 @@ void SleighBuilder::appendCrossBuild(OpTpl *bld,int4 secnum)
   uintb addr = spc->wrapOffset( vn->getOffset().fix(*walker) );
 
   ParserWalker *tmp = walker;
-  uintb olduniqueoffset = uniqueoffset;
+  WalkerScope scope(walker,uniqueoffset);	// Restore original context on every exit
 
   Address newaddr(spc,addr);
   setUniqueOffset(newaddr);
@@ -434,8 +456,6 @@ void SleighBuilder::appendCrossBuild(OpTpl *bld,int4 secnum)
     buildEmpty(ct,secnum);
   else
     build(construct,secnum);
-  walker = tmp;
-  uniqueoffset = olduniqueoffset;
 }
 
 /// \param min is the minimum number of allocations before a reuse is expected
@@ -453,7 +473,12 @@ void DisassemblyCache::initialize(int4 min,int4 hashsize)
   hashtable = new ParserContext *[hashsize];
   for(int4 i=0;i<minimumreuse;++i) {
     ParserContext *pos = new ParserContext(contextcache,translate);
-    pos->initialize(75,20,constspace);
+    // A register list is spelled out as one Constructor per register in several languages, so the
+    // node count runs well past the handful an ordinary instruction needs: ARM vldmia with 31
+    // single-precision registers takes 109 nodes, and the largest tree seen across the shipped
+    // languages is an NDS32 register-list instruction at 120.  512 keeps several times that in
+    // reserve, for about 140KB per cached parse tree.
+    pos->initialize(512,20,constspace);
     list[i] = pos;
   }
   ParserContext *pos = list[0];
