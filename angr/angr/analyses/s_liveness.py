@@ -10,7 +10,7 @@ from angr.ailment.statement import Assignment, ConditionalJump, Jump, SideEffect
 from angr.analyses.analysis import Analysis, register_analysis
 from angr.knowledge_plugins.functions.function import Function
 from angr.utils.ail import is_head_controlled_loop_block, is_phi_assignment
-from angr.utils.ssa import VVarUsesCollector, phi_assignment_get_src
+from angr.utils.ssa import VVarUsesCollector, clobber_def_ids, phi_assignment_get_src
 
 
 class SLivenessModel:
@@ -127,6 +127,7 @@ class SLivenessAnalysis(Analysis):
                 elif isinstance(stmt, SideEffectStatement) and isinstance(stmt.ret_expr, VirtualVariable):
                     live.discard(stmt.ret_expr.varid)
                 live.difference_update(stmt.tags.get("extra_defs", ()))
+                live.difference_update(clobber_def_ids(stmt))
 
                 phi_expr = phi_assignment_get_src(stmt)
                 if phi_expr is not None:
@@ -182,14 +183,19 @@ class SLivenessAnalysis(Analysis):
         self.model.live_ins = live_ins
         self.model.live_outs = live_outs
 
-    def interference_graph(self) -> networkx.Graph[int]:
+    def interference_graph(self, vvar_ids: set[int] | None = None) -> networkx.Graph[int]:
         """
         Generate an interference graph based on the liveness analysis result.
 
+        :param vvar_ids:    When given, only keep edges whose both endpoints are in this set. The full graph is
+                            quadratic in the number of live vvars, so restrict it to the vvars whose interference the
+                            caller will actually query.
         :return: A networkx.Graph instance.
         """
 
         graph = networkx.Graph()
+        if vvar_ids is not None and not vvar_ids:
+            return graph
 
         # a single collector is reused for every statement (reset before each walk)
         vvar_use_collector = VVarUsesCollector()
@@ -208,7 +214,7 @@ class SLivenessAnalysis(Analysis):
                 stmts = block.statements
 
             for stmt in reversed(stmts):
-                def_vvars = list(stmt.tags.get("extra_defs", []))
+                def_vvars = list(stmt.tags.get("extra_defs", [])) + clobber_def_ids(stmt)
                 if isinstance(stmt, Assignment) and isinstance(stmt.dst, VirtualVariable):
                     def_vvars.append(stmt.dst.varid)
                 elif isinstance(stmt, SideEffectStatement) and isinstance(stmt.ret_expr, VirtualVariable):
@@ -219,7 +225,7 @@ class SLivenessAnalysis(Analysis):
                 vvar_use_collector.walk_statement(stmt)
 
                 for def_vvar in def_vvars:
-                    for live_vvar in live:
+                    for live_vvar in self._interfering(def_vvar, live, vvar_ids):
                         graph.add_edge(def_vvar, live_vvar)
                     live.discard(def_vvar)
                 live |= vvar_use_collector.vvars
@@ -227,10 +233,16 @@ class SLivenessAnalysis(Analysis):
             if block.addr == self.func_addr:
                 # deal with function arguments
                 for arg_vvar in self.arg_vvars:
-                    for live_vvar in live:
+                    for live_vvar in self._interfering(arg_vvar.varid, live, vvar_ids):
                         graph.add_edge(arg_vvar.varid, live_vvar)
 
         return graph
+
+    @staticmethod
+    def _interfering(def_vvar: int, live: set[int], vvar_ids: set[int] | None) -> set[int]:
+        if vvar_ids is None:
+            return live
+        return live & vvar_ids if def_vvar in vvar_ids else set()
 
     def live_vars_by_stmt(self) -> defaultdict[Address, dict[int, set[int]]]:
         """
@@ -260,7 +272,7 @@ class SLivenessAnalysis(Analysis):
 
             for i, stmt in enumerate(reversed(stmts)):
                 stmt_idx = len(stmts) - i - 1
-                def_vvars = list(stmt.tags.get("extra_defs", []))
+                def_vvars = list(stmt.tags.get("extra_defs", [])) + clobber_def_ids(stmt)
                 if isinstance(stmt, Assignment) and isinstance(stmt.dst, VirtualVariable):
                     def_vvars.append(stmt.dst.varid)
                 elif isinstance(stmt, SideEffectStatement) and isinstance(stmt.ret_expr, VirtualVariable):

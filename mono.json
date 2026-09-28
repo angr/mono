@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "c27ea568fe2c8e757d5ffffc290aa294aa861c44",
-      "committed_at": "2026-09-24T21:53:29-07:00",
-      "subject": "Add RISC-V FCLASS.S and FCLASS.D CCall support (#7249)",
+      "commit": "245f544631cc0b68faa2cd7d0cb07e8ce666bb62",
+      "committed_at": "2026-09-28T13:04:41-07:00",
+      "subject": "Variable recovery: give a 16-bit architecture a stack base (#7287)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "25bc8aa222cfd514c3ccf06f1db7bd5e84da72da",
-      "committed_at": "2026-09-21T11:48:47-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#1739)",
+      "commit": "a98b65157173767c68fd6851fef1ae8bebe50f01",
+      "committed_at": "2026-09-28T11:23:56-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#1740)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -48,9 +48,9 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "3030afa4811f0496500e07c38a6952dca7574040",
-      "committed_at": "2026-09-21T11:48:04-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#387)",
+      "commit": "858a3f337b3c3b7fdb12c6583b98a04f7cd127fa",
+      "committed_at": "2026-09-28T11:54:32-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#388)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -64,9 +64,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "7c5e1a2c1e25524863ed5e778eef63b4d8bc56a1",
-      "committed_at": "2026-09-21T11:47:54-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#842)",
+      "commit": "53d3d2419cfbb8a8c8741e97440cc1a9d6462559",
+      "committed_at": "2026-09-28T11:54:26-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#848)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -91,17 +91,17 @@
     },
     "pysoot": {
       "upstream": "https://github.com/angr/pysoot",
-      "commit": "38976d00b1494fdaab8f9ba543d592e72e2a2ce7",
-      "committed_at": "2026-09-21T11:47:30-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#60)",
+      "commit": "87f398f71e7256542d826c4153c828377e25c822",
+      "committed_at": "2026-09-28T11:25:06-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#61)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "688cc9210601a5098d761ccd1fc125a00b5bb8fe",
-      "committed_at": "2026-09-21T11:47:14-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#588)",
+      "commit": "1412ade6ce5526736d51295b093266b9fc8ac9b9",
+      "committed_at": "2026-09-28T11:54:21-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#590)",
       "excluded": [
         ".gitmodules"
       ],
@@ -119,13 +119,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-09-26T20:47:22+00:00",
+  "imported_at": "2026-09-28T20:50:32+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "213d9d4c310eca1be489aefe42ab91d214cd4c6a",
-      "committed_at": "2026-09-17T06:55:23Z",
-      "subject": "Update version to 9.3.6.dev0 [ci skip]",
+      "commit": "1dd2bd00475350f031049edb7cb48bcad6a4d728",
+      "committed_at": "2026-09-28T10:24:11-07:00",
+      "subject": "Add fixed signed-call right-shift codegen fixtures (#240)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
