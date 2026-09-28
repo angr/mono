@@ -132,6 +132,15 @@ class AllocHelper:
         raise TypeError(type(val))
 
 
+def opaque_cpp_class(ty: SimType) -> bool:
+    """Whether ``ty`` is a C++ class whose definition angr never saw.
+
+    ``sim_type`` builds one of these from a demangled name it cannot resolve: no members, and a
+    size forced to one word. There is no layout to lay out.
+    """
+    return isinstance(ty, SimCppClass) and not ty.fields and bool(ty.size)
+
+
 def refine_locs_with_struct_type(
     arch: archinfo.Arch,
     locs: list,
@@ -357,12 +366,14 @@ class SimRegArg(SimFunctionArgument):
 
     def refine(self, size, arch=None, offset=None, is_fp=None):
         passed_offset_none = offset is None
+        if is_fp is None:
+            is_fp = self.is_fp
         if offset is None:
             if arch is None:
                 raise ValueError("Need to specify either offset or arch in order to refine a register argument")
-            offset = 0 if arch.register_endness == "Iend_LE" else self.size - size
-        if is_fp is None:
-            is_fp = self.is_fp
+            # VEX addresses a narrow float at its register's own offset, so only an integer
+            # register keeps a narrow value in the low-order bytes of a big-endian register.
+            offset = 0 if is_fp or arch.register_endness == "Iend_LE" else self.size - size
         return SimRegArg(self.reg_name, size, self.reg_offset + offset, is_fp, clear_entire_reg=passed_offset_none)
 
     def sse_extend(self):
@@ -817,7 +828,12 @@ class SimCC:
             return None
         ty_size = ty.size if ty.size is not None else self.RETURN_VAL.size * self.arch.byte_width
         if ty_size > self.RETURN_VAL.size * self.arch.byte_width:
-            assert self.OVERFLOW_RETURN_VAL is not None
+            if self.OVERFLOW_RETURN_VAL is None:
+                raise AngrTypeError(
+                    f"{self} returns {ty} in {self.RETURN_VAL}, which holds "
+                    f"{self.RETURN_VAL.size * self.arch.byte_width} of its {ty_size} bits, and declares no "
+                    "OVERFLOW_RETURN_VAL. Consider overriding return_val to implement its ABI logic"
+                )
             return SimComboArg([self.RETURN_VAL, self.OVERFLOW_RETURN_VAL])
         return self.RETURN_VAL.refine(size=ty_size // self.arch.byte_width, arch=self.arch, is_fp=False)
 
@@ -831,6 +847,9 @@ class SimCC:
     def next_arg(self, session: ArgSession, arg_type: SimType) -> SimFunctionArgument:
         if isinstance(arg_type, (SimTypeArray, SimTypeFixedSizeArray)):  # hack
             arg_type = SimTypePointer(arg_type.elem_type).with_arch(self.arch)
+        if opaque_cpp_class(arg_type):
+            assert arg_type.size is not None
+            arg_type = SimTypeNum(arg_type.size, signed=False)
         if isinstance(arg_type, (SimStruct, SimUnion, SimTypeFixedSizeArray)):
             raise TypeError(
                 f"{self} doesn't know how to store aggregate type {type(arg_type)}. Consider overriding next_arg to "
@@ -1279,7 +1298,7 @@ class SimCC:
             # this is a PCode SimCC where cls.ARCH is directly callable
             stack_arg_size = cls.ARCH().bytes  # type: ignore
         else:
-            stack_arg_size = cls.ARCH(archinfo.Endness.LE).bytes
+            stack_arg_size = cls.ARCH(cls.ARCH.default_endness).bytes
         stack_args = [a for a in args if isinstance(a, SimStackArg)]
         stack_arg_count = (max(a.stack_offset for a in stack_args) // stack_arg_size + 1) if stack_args else 0
         return min(limit, max(len(args), stack_arg_count))
@@ -1578,7 +1597,7 @@ class SimCCMicrosoftAMD64(SimCC):
     def return_in_implicit_outparam(self, ty):
         if isinstance(ty, TypeRef):
             ty = ty.type
-        if isinstance(ty, (SimTypeBottom, SimTypeRef, SimTypeFloat)):
+        if ty is None or isinstance(ty, (SimTypeBottom, SimTypeRef, SimTypeFloat)):
             return False
         size = ty.size
         return size is not None and size > self.STRUCT_RETURN_THRESHOLD
@@ -1600,12 +1619,23 @@ class SimCCMicrosoftAMD64(SimCC):
                 chosen = SimTypePointer(SimTypeBottom()).with_arch(self.arch)
             return self.return_val(chosen, perspective_returned=perspective_returned)
 
-        if not isinstance(ty, SimStruct):
+        # An array is an aggregate too, and it goes where a struct of its size goes: into RAX below
+        # the threshold, through the hidden out-parameter above it. return_in_implicit_outparam
+        # answers on ty.size alone, so it already agrees with this for an array.
+        #
+        # An array whose size is not a positive number of bits has no layout to give, and the base
+        # class's refusal is the right answer for it. Testing the size covers all three ways of
+        # getting there at once, because SimTypeArray.size is 0 for a length-less array and
+        # propagates through nesting: no length, no element size, or an unsized array inside one.
+        sized_array = isinstance(ty, SimTypeArray) and bool(ty.size)
+        if not isinstance(ty, SimStruct) and not sized_array:
             return super().return_val(ty, perspective_returned)
 
-        if ty.size > self.STRUCT_RETURN_THRESHOLD:
+        size = ty.size
+        assert size is not None
+        if size > self.STRUCT_RETURN_THRESHOLD:
             # TODO this code is duplicated a ton of places. how should it be a function?
-            byte_size = ty.size // self.arch.byte_width
+            byte_size = size // self.arch.byte_width
             referenced_locs = [SimStackArg(offset, self.arch.bytes) for offset in range(0, byte_size, self.arch.bytes)]
             referenced_loc = refine_locs_with_struct_type(self.arch, referenced_locs, ty)
             if perspective_returned:
@@ -1839,9 +1869,7 @@ class SimCCSystemVAMD64(SimCC):
             return ["SSE"] + ["SSEUP"] * (nchunks - 1)
         if isinstance(ty, (SimTypeReg, SimTypeNum, SimTypeBottom, SimTypeEnum, SimTypeBitfield)):
             return ["INTEGER"] * nchunks
-        if isinstance(ty, SimCppClass) and not ty.fields and ty.size:
-            # this is an opaque C++ class (likely unresolved); we cannot lay it out. so we must treat it as a native
-            # integer.
+        if opaque_cpp_class(ty):
             return ["INTEGER"]
         if isinstance(ty, SimTypeArray) or (isinstance(ty, SimType) and isinstance(ty, NamedTypeMixin)):
             # NamedTypeMixin covers SimUnion, SimStruct, SimCppClass, and other struct-like classes
@@ -2380,10 +2408,110 @@ class SimCCARMWindowsSyscall(SimCCSyscall):
 
 class SimCCAArch64(SimCC):
     ARG_REGS = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
-    FP_ARG_REGS = []  # TODO: ???
+    FP_ARG_REGS = ["v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"]
     RETURN_ADDR = SimRegArg("lr", 8)
     RETURN_VAL = SimRegArg("x0", 8)
+    FP_RETURN_VAL = SimRegArg("v0", 8)
     ARCH = archinfo.ArchAArch64
+    MAX_HFA_MEMBERS = 4
+
+    def stack_space(self, args):
+        stack_end = max(
+            (
+                loc.stack_offset + loc.size
+                for arg in args
+                for loc in arg.get_footprint()
+                if isinstance(loc, SimStackArg)
+            ),
+            default=self.STACKARG_SP_DIFF,
+        )
+        return (stack_end + self.arg_slot_size - 1) // self.arg_slot_size * self.arg_slot_size + self.STACKARG_SP_BUFF
+
+    # https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst#parameter-passing
+    def next_arg(self, session, arg_type):
+        members = self._hfa_members(arg_type)
+        if members is None:
+            return super().next_arg(session, arg_type)
+        if session.fp_iter.getstate() + len(members) > len(self.FP_ARG_REGS):
+            # the registers an aggregate was too large to fit into are not offered to any later argument
+            session.fp_iter.setstate(len(self.FP_ARG_REGS))
+            size = arg_type.size
+            assert size is not None
+            words = (size // self.arch.byte_width + self.arch.bytes - 1) // self.arch.bytes
+            return refine_locs_with_struct_type(self.arch, [next(session.both_iter) for _ in range(words)], arg_type)
+        return self._refine_hfa(arg_type, iter([next(session.fp_iter) for _ in members]))
+
+    def _hfa_members(self, arg_type: SimType) -> list[SimTypeFloat] | None:
+        """
+        The members of a homogeneous floating-point aggregate, or None if this type is not one.
+
+        A composite is one when it flattens to at most MAX_HFA_MEMBERS members that are all the same
+        floating-point type. An array argument is a pointer in C, so only a struct or a union can be one.
+        """
+        if not isinstance(arg_type, (SimStruct, SimUnion)) or arg_type.size is None:
+            return None
+        members = self._flatten_floats(arg_type)
+        if members is None or not 1 <= len(members) <= self.MAX_HFA_MEMBERS or members[0].size is None:
+            return None
+        return members if all(member.size == members[0].size for member in members) else None
+
+    def _flatten_floats(self, ty: SimType) -> list[SimTypeFloat] | None:
+        if isinstance(ty, SimTypeFloat):
+            return [ty]
+        if isinstance(ty, SimTypeFixedSizeArray):
+            if ty.length is None or ty.length > self.MAX_HFA_MEMBERS:
+                return None
+            members = self._flatten_floats(ty.elem_type)
+            return None if members is None else members * ty.length
+        if isinstance(ty, SimUnion):
+            widest = self._hfa_union_member(ty)
+            return None if widest is None else self._flatten_floats(widest)
+        if not isinstance(ty, SimStruct):
+            return None
+        flattened: list[SimTypeFloat] = []
+        for field in ty.fields.values():
+            members = self._flatten_floats(field)
+            if members is None:
+                return None
+            flattened += members
+            if len(flattened) > self.MAX_HFA_MEMBERS:
+                return None
+        return flattened
+
+    def _hfa_union_member(self, ty: SimUnion) -> SimType | None:
+        """
+        The member that decides a union's layout, which is the one with the most floating-point members.
+
+        Every member of a union counts towards its homogeneity, so one that is not floating-point, or one
+        whose floating-point type differs, disqualifies the whole union.
+        """
+        widest, widest_count, sizes = None, 0, set()
+        for member in ty.members.values():
+            members = self._flatten_floats(member)
+            if members is None:
+                return None
+            sizes.update(one.size for one in members)
+            if len(members) > widest_count:
+                widest, widest_count = member, len(members)
+        return widest if len(sizes) == 1 else None
+
+    def _refine_hfa(self, ty: SimType, locs: Iterator[SimRegArg]) -> SimFunctionArgument:
+        """
+        Give each member of a homogeneous floating-point aggregate a register of its own, rather than
+        packing them into words the way an aggregate in the general-purpose registers is packed.
+        """
+        if isinstance(ty, SimTypeFloat):
+            assert ty.size is not None
+            return next(locs).refine(ty.size // self.arch.byte_width, arch=self.arch, is_fp=True)
+        if isinstance(ty, SimTypeFixedSizeArray):
+            assert ty.length is not None
+            return SimArrayArg([self._refine_hfa(ty.elem_type, locs) for _ in range(ty.length)])
+        if isinstance(ty, SimUnion):
+            widest = self._hfa_union_member(ty)
+            assert widest is not None
+            return self._refine_hfa(widest, locs)
+        assert isinstance(ty, SimStruct)
+        return SimStructArg(ty, {name: self._refine_hfa(field, locs) for name, field in ty.fields.items()})
 
 
 class SimCCAArch64LinuxSyscall(SimCCSyscall):
@@ -2534,7 +2662,8 @@ class SimCCRISCV64(SimCC):
         session.both_iter.setstate(aligned_offset)
 
         size_bits = arg_type.size
-        n_slots = (size_bits + self.arch.bits - 1) // self.arch.bits
+        # one slot for a type with no computable size, as in _classify
+        n_slots = 1 if size_bits is None else (size_bits + self.arch.bits - 1) // self.arch.bits
         locs = [next(session.both_iter) for _ in range(n_slots)]
         return refine_locs_with_struct_type(self.arch, locs, arg_type)
 
@@ -2573,6 +2702,10 @@ class SimCCRISCV64(SimCC):
             return ["FLOAT"]
 
         size_bits = arg_type.size
+        if size_bits is None:
+            # treat a type with no computable size, BOT included, as one XLEN integer
+            return ["INTEGER"]
+
         # > 2 * _XLEN (Bytes)
         # REFERENCE from psABI:
         # Scalars wider than 2 * XLEN bits are passed by reference
@@ -2919,6 +3052,131 @@ class SimCCS390X(SimCC):
     RETURN_ADDR = SimRegArg("r14", 8)
     RETURN_VAL = SimRegArg("r2", 8)
     ARCH = archinfo.ArchS390X
+
+    # z/Architecture ELF ABI, "Parameter Passing". An aggregate of 1, 2, 4 or 8 bytes is passed in a
+    # register, right-justified in it; an aggregate of any other size, and any value too wide for a
+    # register, is copied by the caller and passed as a pointer to that copy. Checked against gcc
+    # 15.3.0 for s390x-unknown-linux-gnu: a 3-, 5-, 6-, 7-, 9- or 16-byte struct, a __int128 and a
+    # long double all arrive as a pointer, a 4-byte struct arrives through `l %r2` and a 1-byte one
+    # through `ic %r2`, and a 4-byte struct that has run out of registers is stored at 164(%r15),
+    # the last four bytes of the eight-byte slot at 160.
+    def next_arg(self, session, arg_type):
+        if isinstance(arg_type, (SimTypeArray, SimTypeFixedSizeArray)):  # hack
+            arg_type = SimTypePointer(arg_type.elem_type).with_arch(self.arch)
+        aggregate = isinstance(arg_type, (SimStruct, SimUnion))
+        if arg_type.size is None or not (aggregate or arg_type.size > self.arch.bits):
+            return super().next_arg(session, arg_type)
+        if aggregate and not self._layoutable(arg_type):
+            # refine_locs_with_struct_type cannot place an array with no length, and the analyses
+            # around arg_locs -- variable recovery, the calling-convention fact collector, FCP --
+            # catch TypeError and ValueError only, so the base class's refusal is the answer.
+            return super().next_arg(session, arg_type)
+        byte_size = arg_type.size // self.arch.byte_width
+        if not aggregate or byte_size not in (1, 2, 4, 8):
+            return self._reference_arg(session, arg_type)
+        # A record with a single member is passed just as that member would be, so a struct wrapping
+        # one float or double travels in a floating-point register. A union is not unwrapped: gcc
+        # passes `union { int a; float b; }` in a general register.
+        fp = isinstance(self._sole_member(arg_type), SimTypeFloat)
+        try:
+            loc = next(session.fp_iter if fp else session.int_iter)
+        except StopIteration:
+            loc = next(session.both_iter)
+            fp = False  # a spilled value sits in its slot the same way whatever its type
+        # A floating-point register holds a short float in its leading bytes -- VEX lifts `le %f0` to
+        # a four-byte F32 put at f0's own offset -- while a general register and a stack slot hold a
+        # narrow value right-justified, which is where gcc puts a four-byte struct: into the low word
+        # with `l %r2`, or at 164(%r15) in the eight-byte slot that starts at 160.
+        offset = 0 if fp else loc.size - byte_size
+        if not self._has_members(arg_type):
+            # An opaque aggregate has a size and no members to place, so it is placed by its size.
+            return loc.refine(byte_size, offset=offset, is_fp=fp, arch=self.arch)
+        return refine_locs_with_struct_type(self.arch, [loc], arg_type, offset=offset)
+
+    # z/Architecture ELF ABI, "Function Return Values". Every aggregate comes back in memory whatever
+    # its size: the caller passes the address of the return area as an implicit first argument in r2
+    # and the function hands that same address back in r2. gcc does this for a 1-, 3-, 4-, 8- and
+    # 16-byte struct and for a struct holding one float or one double alike, so there is no size below
+    # which an aggregate is returned in a register.
+    def return_val(self, ty, perspective_returned=False):
+        if ty._arch is None:
+            ty = ty.with_arch(self.arch)
+        if not isinstance(ty, (SimStruct, SimUnion, SimTypeFixedSizeArray)) or not self._layoutable(ty):
+            # A scalar too wide for r2 returns through the same hidden pointer, which the base class
+            # builds on top of return_in_implicit_outparam below; an aggregate holding an array with
+            # no length has no layout, and the base class refuses it.
+            return super().return_val(ty, perspective_returned)
+        if perspective_returned:
+            ptr_loc = self.RETURN_VAL
+        else:
+            ptr_loc = self.next_arg(self.ArgSession(self), SimTypePointer(SimTypeBottom()).with_arch(self.arch))
+        assert ptr_loc is not None
+        return SimReferenceArgument(ptr_loc, self._memory_image(ty))
+
+    def return_in_implicit_outparam(self, ty):
+        # Kept consistent with return_val: the hidden pointer is the call's first argument, so it takes
+        # r2 and pushes every declared argument along one register.
+        if ty is None or isinstance(ty, SimTypeBottom):
+            return False
+        if isinstance(ty, (SimStruct, SimUnion, SimTypeFixedSizeArray)):
+            return True
+        return ty.size is not None and ty.size > self.arch.bits
+
+    @classmethod
+    def _layoutable(cls, ty: SimType) -> bool:
+        """
+        Whether refine_locs_with_struct_type can place this type. An array needs a length and a
+        sized element, and a record is only as placeable as its members.
+        """
+        if isinstance(ty, SimTypeArray):
+            return ty.length is not None and ty.elem_type.size is not None and cls._layoutable(ty.elem_type)
+        if isinstance(ty, SimStruct):
+            return all(cls._layoutable(member) for member in ty.fields.values())
+        if isinstance(ty, SimUnion):
+            return all(cls._layoutable(member) for member in ty.members.values())
+        return True
+
+    @staticmethod
+    def _has_members(ty: SimType) -> bool:
+        """
+        Whether an aggregate has members to lay out. An opaque class or an empty one has only a size.
+        """
+        if isinstance(ty, SimStruct):
+            return bool(ty.fields)
+        if isinstance(ty, SimUnion):
+            return bool(ty.members)
+        return True
+
+    @staticmethod
+    def _sole_member(ty: SimType) -> SimType:
+        """
+        The member a one-member record is passed as, found recursively; any other type is its own.
+        """
+        while isinstance(ty, SimStruct) and len(ty.fields) == 1:
+            ty = next(iter(ty.fields.values()))
+        return ty
+
+    def _reference_arg(self, session: ArgSession, arg_type: SimType) -> SimReferenceArgument:
+        try:
+            ptr_loc = next(session.int_iter)
+        except StopIteration:
+            ptr_loc = next(session.both_iter)
+        return SimReferenceArgument(ptr_loc, self._memory_image(arg_type))
+
+    def _memory_image(self, ty: SimType) -> SimFunctionArgument:
+        """
+        How the value is laid out as if it were stored at offset zero on the stack, which is what both
+        a by-reference argument and a returned aggregate need.
+        """
+        size = ty.size
+        if not size:
+            # A zero-size aggregate has no layout; the pointer is the only part of it the ABI fixes.
+            return SimStackArg(0, self.arch.bytes)
+        if not self._has_members(ty):
+            return SimStackArg(0, size // self.arch.byte_width)
+        words = max(1, (size // self.arch.byte_width + self.arch.bytes - 1) // self.arch.bytes)
+        locs = [SimStackArg(offset * self.arch.bytes, self.arch.bytes) for offset in range(words)]
+        return refine_locs_with_struct_type(self.arch, locs, ty)
 
 
 class SimCCS390XLinuxSyscall(SimCCSyscall):

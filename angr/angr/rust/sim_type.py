@@ -821,11 +821,21 @@ class RustSimEnum(RustSimType, SimType):
             if self.name in memo:
                 return memo[self.name].to_json(fields=fields, memo=memo)
             memo[self.name] = SimTypeRef(self.name, self.__class__)
-        d = {
-            "_t": self._ident,
-            "name": self.name,
-            "variants": [v.to_json(memo=memo) for v in self.variants],
-        }
+        try:
+            d = {
+                "_t": self._ident,
+                "name": self.name,
+                "variants": [v.to_json(memo=memo) for v in self.variants],
+            }
+        finally:
+            # The entry only breaks a cycle through this enum, so it goes once the walk below it
+            # is done. Left in place it answered the enum's *next* use in the same document with a
+            # reference, and nothing resolves a rust_enum reference on the way back in:
+            # SimType.from_json registers only structs and unions as reference targets,
+            # RustSimEnum.from_json returns before it, and EnumVariant.from_json descends with no
+            # decoded map.
+            if self.name:
+                del memo[self.name]
         if self._size is not None:
             d["_size"] = self._size
         return d

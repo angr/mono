@@ -14,6 +14,7 @@ import archinfo
 
 import angr
 from angr.analyses.calling_convention import FactCollector
+from angr.analyses.calling_convention.utils import is_sane_register_variable
 from angr.analyses.complete_calling_conventions import (
     DEAD_WORKER_GRACE_PERIOD,
     CallingConventionAnalysisMode,
@@ -189,6 +190,26 @@ class TestCallingConventionAnalysis(unittest.TestCase):
             # TECHNICALLY WRONG but what are you gonna do about it
             # details: open(3) can take either 2 or 3 args. we use the 2 arg version but we have the 3 arg version
             # hardcoded in angr. the third arg is still "live" from the function start.
+        }
+
+        for func_name, args in expected_args.items():
+            self.check_args(func_name, self._a(funcs, func_name), args)
+
+    @cca_mode("fast,variables")
+    def test_s390x_fauxware(self, *, mode):
+        binary_path = os.path.join(test_location, "s390x", "fauxware")
+        proj = angr.Project(binary_path, auto_load_libs=False, load_debug_info=False)
+
+        cfg = proj.analyses.CFG()  # fill in the default kb
+
+        proj.analyses.CompleteCallingConventions(mode=mode, recover_variables=True)
+
+        funcs = cfg.kb.functions
+
+        # check args
+        expected_args = {
+            "accepted": [],
+            "authenticate": ["r_r2", "r_r3"],
         }
 
         for func_name, args in expected_args.items():
@@ -776,6 +797,51 @@ class TestCallingConventionAnalysis(unittest.TestCase):
         assert isinstance(func_init.prototype.returnty, SimTypeBottom), (
             f"G_InitPlayer should be void (tail-calls void function), got {func_init.prototype.returnty}"
         )
+
+    def test_mipsn32_answers_the_same_as_mips64(self):
+        # ArchMIPSN32 is ArchMIPS64's register file under another name: it subclasses it and
+        # inherits vex_arch, so every VEX offset is the same. The filter dispatches on
+        # arch.name, so n32 and O64 objects -- which cle loads as ArchMIPSN32 -- used to match
+        # no entry at all and fall through to the permissive default that accepts everything.
+        mips64 = archinfo.arch_from_id("mips64")
+        n32 = archinfo.ArchMIPSN32(archinfo.Endness.BE)
+        assert n32.registers == mips64.registers
+
+        rejected = 0
+        for reg in n32.register_list:
+            n32_says = is_sane_register_variable(n32, reg.vex_offset, reg.size)
+            assert n32_says == is_sane_register_variable(mips64, reg.vex_offset, reg.size), reg.name
+            if not n32_says:
+                rejected += 1
+        # The agreement above is vacuous if the filter accepts everything, which is exactly what
+        # the fall-through did.
+        assert rejected > 0
+
+        for reg_name in ["zero", "gp", "sp", "pc"]:
+            offset, size = n32.registers[reg_name]
+            assert not is_sane_register_variable(n32, offset, size), reg_name
+
+    def test_mipsn32_recovers_a_calling_convention(self):
+        # The production path the entry above serves. n32_be_static is an n32 object, so cle
+        # loads it as ArchMIPSN32; with no entry for that name every register was a candidate
+        # argument, no convention fitted, and the function got none at all. Its source is
+        # committed beside it: `long accumulate(long n)` in tests/mipsn32/mipsn32_fixture.c.
+        binary_path = os.path.join(test_location, "mipsn32", "n32_be_static")
+        proj = angr.Project(binary_path, auto_load_libs=False)
+        assert proj.arch.name == "MIPSN32"
+
+        cfg = proj.analyses.CFGFast(normalize=True)
+        proj.analyses.CompleteCallingConventions(recover_variables=True, cfg=cfg.model, analyze_callsites=True)
+
+        func = cfg.kb.functions.function(name="accumulate")
+        assert func is not None
+        assert func.calling_convention is not None, "accumulate recovered no calling convention"
+        assert func.prototype is not None
+        assert len(func.prototype.args) == 1, f"accumulate takes one argument, got {func.prototype.args}"
+        locs = func.calling_convention.arg_locs(func.prototype)
+        assert len(locs) == 1, locs
+        assert isinstance(locs[0], SimRegArg), locs
+        assert locs[0].reg_name == "a0", locs
 
 
 if __name__ == "__main__":

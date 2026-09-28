@@ -8,9 +8,11 @@ from unittest import TestCase, main
 
 import archinfo
 import pyvex
+from pyvex.expr import Const
 
 import angr
 from angr.block import Block
+from angr.engines.pcode.lifter import IRSB, IRSB_MAX_SIZE
 
 test_location = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "..", "..", "binaries", "tests")
 
@@ -102,6 +104,71 @@ class TestPcodeEngine(TestCase):
 
         assert simgr.active[0].regs.t6.concrete
         assert simgr.active[0].regs.t6.concrete_value == 1
+
+    def test_block_stops_at_the_last_fully_mapped_instruction(self):
+        """
+        Test that a block does not run past the end of the image.
+        """
+        # 0xe8 opens a five-byte "call rel32", so the last byte of this image starts an instruction whose
+        # remaining four bytes are not mapped at all. Sleigh reads ahead at every instruction boundary and
+        # pypcode zero-fills whatever part of that read the buffer cannot satisfy, so the call decodes from
+        # bytes that are not in memory.
+        code = b"\x90\x90\xe8"
+        base_address = 0x400000
+
+        arch = archinfo.ArchPcode("x86:LE:64:default")
+        p = angr.load_shellcode(code, arch=arch, load_address=base_address, engine=angr.engines.UberEnginePcode)
+        assert p.loader.main_object.max_addr == base_address + len(code) - 1
+
+        block = p.factory.block(base_address)
+        assert block.size == 2
+        assert block.bytes == b"\x90\x90"
+        assert list(block.instruction_addrs) == [base_address, base_address + 1]
+        assert [insn.mnemonic for insn in block.disassembly.insns] == ["NOP", "NOP"]
+
+        # There are not enough bytes for the instruction the block stopped in front of, so no block starts
+        # there either.
+        truncated = p.factory.block(base_address + 2)
+        assert truncated.size == 0
+        assert truncated.vex.jumpkind == "Ijk_NoDecode"
+
+    def test_block_stops_in_front_of_an_instruction_spanning_the_byte_cap(self):
+        """
+        Test that a block ends before an instruction that runs past the lifter's byte cap.
+        """
+        # The same zero-fill applies to a fully mapped image, because the lifter hands Sleigh at most
+        # IRSB_MAX_SIZE bytes at a time. This "call rel32" starts two bytes before that cap, so three of its
+        # five bytes are outside the buffer and decoding it there yields the wrong target.
+        call = b"\xe8\x11\x22\x33\x44"
+        base_address = 0x400000
+        arch = archinfo.ArchPcode("x86:LE:64:default")
+
+        p = angr.load_shellcode(
+            b"\x90" * (IRSB_MAX_SIZE - 2) + call + b"\xc3" * 16,
+            arch=arch,
+            load_address=base_address,
+            engine=angr.engines.UberEnginePcode,
+        )
+        block = p.factory.block(base_address)
+        assert block.size == IRSB_MAX_SIZE - 2
+        assert block.vex.jumpkind == "Ijk_Boring"
+
+        call_address = base_address + block.size
+        call_block = p.factory.block(call_address)
+        assert call_block.size == len(call)
+        assert call_block.vex.jumpkind == "Ijk_Call"
+        next_expr = call_block.vex.next
+        assert isinstance(next_expr, pyvex.expr.Const)
+        assert next_expr.con.value == call_address + len(call) + 0x44332211
+
+        # An instruction that ends exactly on the cap is still one the lifter was given.
+        aligned = angr.load_shellcode(
+            b"\x90" * IRSB_MAX_SIZE + b"\xc3" * 16,
+            arch=arch,
+            load_address=base_address,
+            engine=angr.engines.UberEnginePcode,
+        )
+        assert aligned.factory.block(base_address).size == IRSB_MAX_SIZE
 
     def test_callless_function_graph_consistency(self):
         binary_path = os.path.join(test_location, "x86_64", "fauxware")
@@ -254,6 +321,65 @@ class TestPcodeEngine(TestCase):
         other_engine, other_lifter = seen[0]
         assert other_engine is not proj.factory.default_engine  # the factory really did hand out a second engine
         assert other_lifter is main_lifter
+
+    def test_lift_architecture_whose_word_is_not_a_power_of_two(self):
+        """
+        A SLEIGH language may declare a word size VEX has no named constant for. Constructing a p-code block's
+        target used to raise KeyError on the width itself for the 24-bit PIC, dsPIC, and extended AVR8 families.
+        """
+        for language in ("dsPIC33F:LE:24:default", "PIC-24E:LE:24:default", "avr8:LE:16:extended"):
+            with self.subTest(language=language):
+                arch = archinfo.ArchPcode(language)
+                assert arch.bits == 24
+                irsb = IRSB.empty_block(arch, 0x1000, nxt=0x1002, size=2)
+                assert isinstance(irsb.next, Const)
+                assert irsb.next.con.__class__.__name__ == f"U{arch.bits}"
+                assert irsb.next.con.value == 0x1002
+                assert irsb.next.con.type == "Ity_I24"
+
+    def test_narrow_arch_jump_targets(self):
+        """
+        Lift a compiler-produced AVR object with extended AVR8's 24-bit address space, then follow the first
+        instruction through the engine. The lifter must preserve the 24-bit target in both the block and the state.
+        """
+        arch = archinfo.ArchPcode("avr8:LE:16:extended")
+        assert arch.bits == 24
+        p = angr.Project(
+            os.path.join(test_location, "avr", "isqrt_atmega128.o"),
+            arch=arch,
+            auto_load_libs=False,
+            engine=angr.engines.UberEnginePcode,
+        )
+        symbol = p.loader.find_symbol("basicmath_memcpy")
+        assert symbol is not None
+        assert symbol.rebased_addr == p.entry
+        assert symbol.size == 0x1C
+
+        block = p.factory.block(symbol.rebased_addr, num_inst=1).vex
+        assert block.jumpkind == "Ijk_Boring"
+        assert isinstance(block.next, Const)
+        assert block.next.con.value == symbol.rebased_addr + 2
+        assert block.next.con.type == "Ity_I24"
+
+        state = p.factory.blank_state(addr=symbol.rebased_addr)
+        successors = p.factory.successors(state, num_inst=1).successors
+        assert [(s.solver.eval(s.regs.ip), s.regs.ip.size()) for s in successors] == [(symbol.rebased_addr + 2, 24)]
+
+    def test_arch_without_program_counter(self):
+        """
+        Test state construction on an architecture whose sleigh language declares no program counter
+        register, so there is no register for the instruction pointer to live in.
+        """
+        arch = archinfo.ArchPcode("Dalvik:LE:32:DEX_Nougat")
+
+        # The project only gives the states their architecture; nothing is lifted or decoded from its bytes.
+        p = angr.load_shellcode(
+            b"\x00" * 4, arch=arch, start_offset=0x1000, load_address=0x1000, engine=angr.engines.UberEnginePcode
+        )
+
+        for state in (p.factory.blank_state(), p.factory.blank_state(addr=0x1002), p.factory.entry_state()):
+            assert repr(state) == "<SimState @ ?>"
+            assert state.history.successor_ip is None
 
 
 if __name__ == "__main__":

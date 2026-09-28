@@ -9,9 +9,22 @@ import os
 import unittest
 
 import angr
-from angr.ailment.expression import BinaryOp, Const, Extract, Insert, VirtualVariable, VirtualVariableCategory
-from angr.ailment.statement import Assignment
-from angr.analyses.decompiler.expression_narrower import EffectiveSizeExtractor
+from angr.ailment.block import Block
+from angr.ailment.expression import (
+    BinaryOp,
+    Call,
+    Const,
+    Convert,
+    DirtyExpression,
+    Extract,
+    FunctionLikeMacro,
+    Insert,
+    VirtualVariable,
+    VirtualVariableCategory,
+)
+from angr.ailment.manager import Manager
+from angr.ailment.statement import Assignment, SideEffectStatement
+from angr.analyses.decompiler.expression_narrower import EffectiveSizeExtractor, ExpressionNarrower
 from tests.common import WORKER, bin_location, print_decompilation_result
 
 test_location = os.path.join(bin_location, "tests")
@@ -20,6 +33,52 @@ l = logging.getLogger(__name__)
 
 
 class TestNarrowingExpressions(unittest.TestCase):
+    def test_dirty_expression_children_are_full_width_uses(self):
+        operand = VirtualVariable(0, 41, 64, VirtualVariableCategory.REGISTER, oident=8)
+        guard = VirtualVariable(1, 42, 1, VirtualVariableCategory.TMP, oident=0)
+        maddr = VirtualVariable(2, 43, 64, VirtualVariableCategory.REGISTER, oident=16)
+        dirty = DirtyExpression(
+            3,
+            "helper",
+            [operand],
+            guard=guard,
+            mfx="Ifx_Read",
+            maddr=maddr,
+            msize=8,
+            bits=64,
+        )
+        dst = VirtualVariable(4, 44, 64, VirtualVariableCategory.REGISTER, oident=24)
+
+        walker = EffectiveSizeExtractor()
+        walker.walk_statement(Assignment(5, dst, dirty))
+
+        self.assertEqual(walker.vvar_effective_bits[operand.varid][operand.idx], (0, 64))
+        self.assertEqual(walker.vvar_effective_bits[guard.varid][guard.idx], (0, 1))
+        self.assertEqual(walker.vvar_effective_bits[maddr.varid][maddr.idx], (0, 64))
+
+    def test_side_effect_statement_ignores_non_call_expression(self):
+        operand = VirtualVariable(0, 45, 64, VirtualVariableCategory.REGISTER, oident=8)
+        dirty = DirtyExpression(1, "helper", [operand], bits=64)
+
+        walker = EffectiveSizeExtractor()
+        walker.walk_statement(SideEffectStatement(2, dirty))
+
+        self.assertNotIn(operand.varid, walker.vvar_effective_bits)
+        self.assertNotIn(operand.varid, walker.vvar_call_arg_effective_bits)
+
+    def test_side_effect_statement_preserves_call_argument_handling(self):
+        for expr_type in (Call, FunctionLikeMacro):
+            with self.subTest(expr_type=expr_type.__name__):
+                argument = VirtualVariable(0, 46, 64, VirtualVariableCategory.REGISTER, oident=8)
+                converted_argument = Convert(1, 64, 32, False, argument)
+                call = expr_type(2, "callee", args=[converted_argument], bits=64)
+
+                walker = EffectiveSizeExtractor()
+                walker.walk_statement(SideEffectStatement(3, call))
+
+                self.assertEqual(walker.vvar_call_arg_effective_bits[argument.varid], (0, 32))
+                self.assertNotIn(argument.varid, walker.vvar_effective_bits)
+
     def test_insert_base_is_a_full_width_use(self):
         # the base of an Insert is consumed at full width: every byte outside the inserted range is
         # preserved into the result. EffectiveSizeExtractor used to skip the base entirely, so a vvar
@@ -43,6 +102,56 @@ class TestNarrowingExpressions(unittest.TestCase):
         # ...while the byte-1 Extract occurrence stays narrow
         assert occurrences[ah_vvar.idx] == (8, 16)
         assert 44 in walker.vvars_used_as_insert_base
+
+    def test_narrowing_a_register_variable_moves_the_offset_on_big_endian(self):
+        # A narrowed variable keeps the low-order bytes of the original: every use is rewritten to
+        # Convert(narrow -> wide) and every definition to Convert(wide -> narrow). On a little-endian
+        # architecture those bytes start where the register starts, so its offset is unchanged. On a
+        # big-endian one they sit at the end of the register, so the offset must move forward by the
+        # number of bytes dropped -- PPC64 r3 is (offset 40, 8 bytes) and its low 4 bytes are at 44.
+        # Leaving the offset alone made the narrowed variable name the high-order bytes instead.
+        for binary, register, big_endian in (("ppc64", "r3", True), ("x86_64", "rax", False)):
+            with self.subTest(binary=binary):
+                proj = angr.Project(os.path.join(test_location, binary, "fauxware"), auto_load_libs=False)
+                arch = proj.arch
+                reg_offset, reg_size = arch.registers[register]
+                new_size = reg_size // 2
+                bits = reg_size * arch.byte_width
+
+                varid = 0x100
+                dst = VirtualVariable(1, varid, bits, VirtualVariableCategory.REGISTER, oident=reg_offset)
+                use = VirtualVariable(2, varid, bits, VirtualVariableCategory.REGISTER, oident=reg_offset)
+                sink = VirtualVariable(3, 0x101, bits, VirtualVariableCategory.REGISTER, oident=reg_offset)
+                block = Block(
+                    0x400000,
+                    0,
+                    statements=[Assignment(10, dst, Const(11, 0, bits)), Assignment(12, sink, use)],
+                )
+
+                narrower = ExpressionNarrower(proj, None, Manager(), [], {}, {})
+                narrower.new_vvar_sizes[varid] = new_size
+                new_block = narrower.walk(block)
+
+                expected = reg_offset + reg_size - new_size if big_endian else reg_offset
+                assert (arch.register_endness == "Iend_BE") is big_endian
+
+                new_def_stmt, new_use_stmt = new_block.statements
+                assert isinstance(new_def_stmt, Assignment)
+                assert isinstance(new_use_stmt, Assignment)
+
+                narrowed_def = new_def_stmt.dst
+                assert isinstance(narrowed_def, VirtualVariable)
+                assert narrowed_def.size == new_size
+                assert narrowed_def.reg_offset == expected
+
+                # the use became Convert(narrow -> wide) around the same narrowed variable
+                widened = new_use_stmt.src
+                assert isinstance(widened, Convert)
+                narrowed_use = widened.operand
+                assert isinstance(narrowed_use, VirtualVariable)
+                assert narrowed_use.varid == varid
+                assert narrowed_use.size == new_size
+                assert narrowed_use.reg_offset == expected
 
     def test_narrowing_expressions_after_making_callsite_only(self):
         # narrowing expressions before making callsites may incorrectly remove some definitions that the calls use
