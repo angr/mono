@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "245f544631cc0b68faa2cd7d0cb07e8ce666bb62",
-      "committed_at": "2026-09-28T13:04:41-07:00",
-      "subject": "Variable recovery: give a 16-bit architecture a stack base (#7287)",
+      "commit": "08783a58708eab067ebde4f7a2489cddde387460",
+      "committed_at": "2026-09-29T11:22:05-07:00",
+      "subject": "CCA: Be more viligant for caller-cleanup clues. (#7308)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -119,13 +119,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-09-28T20:50:32+00:00",
+  "imported_at": "2026-09-29T20:51:28+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "1dd2bd00475350f031049edb7cb48bcad6a4d728",
-      "committed_at": "2026-09-28T10:24:11-07:00",
-      "subject": "Add fixed signed-call right-shift codegen fixtures (#240)",
+      "commit": "c9b359c1d2e2cc5dd58365fc3b76fdc526621439",
+      "committed_at": "2026-09-29T03:18:01-07:00",
+      "subject": "Update VERSION to 10.0.1.dev0.",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }

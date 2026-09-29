@@ -4386,9 +4386,81 @@ class TestDecompiler(unittest.TestCase):
         assert "IoDriverObjectType" in d.codegen.text
         assert "wcsncpy(" in d.codegen.text
         assert "ObMakeTemporaryObject" in d.codegen.text
+        # the destination of the inlined wcsncpy must be a stack variable instead of sp-N
+        assert re.search(r'wcsncpy\(v\d+, L"ObMakeTemporaryObject", 21\);', d.codegen.text) is not None
         # ensure the stack canary is removed
         assert "_security_check_cookie" not in d.codegen.text
         assert " ^ " not in d.codegen.text
+
+    def test_decoded_wide_string_copied_into_stack_variable(self, decompiler_options=None):
+        # issue 7285: the decoded path must be copied in full with its terminator, into a stack variable, and the
+        # decoded bytes after the terminator must be kept
+        bin_path = os.path.join(
+            test_location, "i386", "windows", "82ce4d6615793fec42a57571f6161794de24362be69a5103cf3c1192aa4b6ecb"
+        )
+        # 0x4402e0 and 0x440350 are the targets of the allocation thunks; without them the first one is non-returning
+        proj, cfg = load_project_with_scoped_cfg(
+            bin_path,
+            0x4290E0,
+            extra_func_addrs=[0x4402E0, 0x440350],
+            expand_call_tree=False,
+            cfg_kwargs={"data_references": True},
+        )
+        f = proj.kb.functions[0x4290E0]
+        d = proj.analyses[Decompiler].prep(fail_fast=True)(f, cfg=cfg.model, options=decompiler_options)
+        print_decompilation_result(d)
+
+        assert d.codegen is not None and d.codegen.text is not None
+        assert re.search(r'wcscpy\(v\d+, L"%AppData%\\\\Thunderbird\\\\Profiles"\);', d.codegen.text) is not None
+        assert "stack_base" not in d.codegen.text
+        for value in range(222, 228):
+            assert f" = {value};" in d.codegen.text
+
+    @staticmethod
+    def _decompile_thunderbird_profile_path_builder(run_ccc: bool, decompiler_options=None):
+        bin_path = os.path.join(
+            test_location, "i386", "windows", "82ce4d6615793fec42a57571f6161794de24362be69a5103cf3c1192aa4b6ecb"
+        )
+        # 0x40c710 and 0x40c720 are thunks to 0x4402e0 and 0x440350. 0x423a40 is a helper whose epilogue the CFG
+        # splits off into 0x423b0f, 0x423aea, and 0x423b00.
+        proj, cfg = load_project_with_scoped_cfg(
+            bin_path,
+            0x4290E0,
+            extra_func_addrs=[0x40C710, 0x40C720, 0x4402E0, 0x440350, 0x423A40, 0x423B0F, 0x423AEA, 0x423B00],
+            expand_call_tree=False,
+            run_ccc=run_ccc,
+        )
+        f = cfg.kb.functions[0x4290E0]
+        d = proj.analyses[Decompiler].prep(fail_fast=True)(f, options=decompiler_options)
+        print_decompilation_result(d)
+
+        assert d.codegen is not None and d.codegen.text is not None
+        # all three decoder loops are gone
+        assert "while" not in d.codegen.text
+        assert d.codegen.text.count('L"%AppData%\\\\Thunderbird\\\\Profiles"') == 2
+        assert 'L"Thunderbird"' in d.codegen.text
+        # the encoded bytes are not outlined into string copies
+        assert "{'e!" not in d.codegen.text
+        # the two six-argument indirect calls pop their arguments (angr issue #7288), so the stack pointer does not
+        # drift and all three strings are copied into the same buffer
+        dsts = re.findall(r"wcscpy\((v\d+), L", d.codegen.text)
+        assert len(dsts) == 3
+        assert len(set(dsts)) == 1
+        return d.codegen.text, dsts[0]
+
+    @structuring_algo("sailr")
+    def test_simplifying_string_transformation_loops_with_split_loads_and_pointers(self, decompiler_options=None):
+        # regression: angr issues #7286 and #7288
+        self._decompile_thunderbird_profile_path_builder(True, decompiler_options=decompiler_options)
+
+    @structuring_algo("sailr")
+    def test_simplifying_string_transformation_loops_with_split_loads_and_pointers_without_ccc(
+        self, decompiler_options=None
+    ):
+        # regression: angr issues #7286 and #7288. Without CompleteCallingConventions, callees have no calling
+        # conventions, and the call-site analysis recovers all five arguments of the helper, the third being the buffer.
+        text, buffer = self._decompile_thunderbird_profile_path_builder(False, decompiler_options=decompiler_options)
+        assert re.search(rf"sub_423a40\(v\d+, v\d+, {buffer}, 0, 0\)", text) is not None
 
     @structuring_algo("sailr")
     def test_win_security_cookie_removal_with_interleaved_ip_writes(self, decompiler_options=None):
@@ -5666,12 +5738,13 @@ class TestDecompiler(unittest.TestCase):
         str_name = m.group(1)
         assert f"{str_name}();" in dec.codegen.text
         assert f"{str_name}.c_str()" in dec.codegen.text
-        # assert there exists a stack-based buffer that is 12-byte long
-        # this is to test the type hint that strncpy provides
+        # assert there exists a stack-based buffer that is 16-byte long
+        # this is to test the type hint that strcpy provides
         m = re.search(r"char (\w+)\[16];", dec.codegen.text)
         assert m is not None
         bufvar = m.group(1)
-        assert f'strncpy({bufvar}, "FWe#JID%WkOCZy7", 15);' in dec.codegen.text
+        # the terminator is written as well
+        assert f'strcpy({bufvar}, "FWe#JID%WkOCZy7");' in dec.codegen.text
         # ensure the stack argument for sub_401a90 is correct
         assert "sub_401a90(-1888440072);" in dec.codegen.text
         # ensure the stack argument for the first indirect call is incorrect

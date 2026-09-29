@@ -829,6 +829,8 @@ class SimCC:
         return self.RETURN_ADDR
 
     def next_arg(self, session: ArgSession, arg_type: SimType) -> SimFunctionArgument:
+        if isinstance(arg_type, TypeRef):
+            arg_type = arg_type.type
         if isinstance(arg_type, (SimTypeArray, SimTypeFixedSizeArray)):  # hack
             arg_type = SimTypePointer(arg_type.elem_type).with_arch(self.arch)
         if isinstance(arg_type, (SimStruct, SimUnion, SimTypeFixedSizeArray)):
@@ -1221,6 +1223,8 @@ class SimCC:
         sp_delta,
         unused_hint: list[SimRegArg] | None = None,
         extra_pop: int | None = None,
+        *,
+        allow_unknown_cleanup: bool = False,
     ) -> bool:
         if cls.arches() is not None and ":" not in arch.name and not isinstance(arch, cls.arches()):  # pylint:disable=isinstance-second-argument-not-valid-type
             return False
@@ -1259,9 +1263,13 @@ class SimCC:
                 has_stackargs = True
             new_args.append(arg)
 
-        if has_stackargs and cls.CALLEE_CLEANUP and not extra_pop:
-            # the callee-cleanup convention should have a nonzero extra_pop if there are stack arguments
-            return False
+        if has_stackargs and cls.CALLEE_CLEANUP:
+            # a callee-cleanup convention with stack arguments should be demonstrated by stack pops in the callee
+            if extra_pop is None:
+                if not allow_unknown_cleanup:
+                    return False
+            elif extra_pop <= 0:
+                return False
 
         # update args (e.g., drop caller-saved register arguments)
         args.clear()
@@ -1303,7 +1311,9 @@ class SimCC:
                             remove non-argument arguments.
         :param sp_delta:    The change of stack pointer before and after the call is made.
         :param extra_pop:   The number of bytes that are popped by the callee. This is used to distinguish between
-                            callee-cleanup and caller-cleanup conventions.
+                            callee-cleanup and caller-cleanup conventions. None means unknown, in which case
+                            callee-cleanup conventions with stack arguments are only matched if no other convention
+                            fits the arguments.
         :param language:    The source language of the binary (e.g. "go"), if known. Languages with their own ABI are
                             matched against that ABI alone.
         :return:            A calling convention instance, or None if none of the SimCC subclasses seems to fit the
@@ -1322,6 +1332,14 @@ class SimCC:
         for cc_cls in possible_cc_classes:
             if cc_cls._match(arch, args, sp_delta, unused_hint, extra_pop):
                 return cc_cls(arch)
+        if extra_pop is None:
+            # the callee's cleanup is unknown, and only a callee-cleanup convention fits the arguments (e.g., ecx and
+            # edx and stack arguments on Windows x86)
+            for cc_cls in possible_cc_classes:
+                if cc_cls.CALLEE_CLEANUP and cc_cls._match(
+                    arch, args, sp_delta, unused_hint, extra_pop, allow_unknown_cleanup=True
+                ):
+                    return cc_cls(arch)
         return None
 
     @classmethod
@@ -1404,6 +1422,8 @@ class SimCCCdecl(SimCC):
     ARCH = archinfo.ArchX86
 
     def next_arg(self, session, arg_type):
+        if isinstance(arg_type, TypeRef):
+            arg_type = arg_type.type
         if isinstance(arg_type, (SimTypeArray, SimTypeFixedSizeArray)):  # hack
             arg_type = SimTypePointer(arg_type.elem_type).with_arch(self.arch)
         locs_size = 0
@@ -1464,6 +1484,7 @@ class SimCCStdcall(SimCCMicrosoftCdecl):
 
 
 class SimCCMicrosoftFastcall(SimCC):
+    CALLEE_CLEANUP = True
     ARG_REGS = ["ecx", "edx"]  # Remaining arguments are passed in stack
     CALLER_SAVED_REGS = ["eax", "ecx", "edx"]
     STACKARG_SP_DIFF = 4  # Return address is pushed on to stack by call
@@ -1473,6 +1494,8 @@ class SimCCMicrosoftFastcall(SimCC):
     ARCH = archinfo.ArchX86
 
     def next_arg(self, session, arg_type):
+        if isinstance(arg_type, TypeRef):
+            arg_type = arg_type.type
         if isinstance(arg_type, (SimTypeArray, SimTypeFixedSizeArray)):  # hack
             arg_type = SimTypePointer(arg_type.elem_type).with_arch(self.arch)
 
@@ -1555,6 +1578,8 @@ class SimCCMicrosoftAMD64(SimCC):
     STRUCT_RETURN_THRESHOLD = 64
 
     def next_arg(self, session, arg_type):
+        if isinstance(arg_type, TypeRef):
+            arg_type = arg_type.type
         if isinstance(arg_type, (SimTypeArray, SimTypeFixedSizeArray)):  # hack
             arg_type = SimTypePointer(arg_type.elem_type).with_arch(self.arch)
         try:
@@ -1763,6 +1788,8 @@ class SimCCSystemVAMD64(SimCC):
     # https://raw.githubusercontent.com/wiki/hjl-tools/x86-psABI/x86-64-psABI-1.0.pdf
     # section 3.2.3
     def next_arg(self, session, arg_type):
+        if isinstance(arg_type, TypeRef):
+            arg_type = arg_type.type
         if isinstance(arg_type, (SimTypeArray, SimTypeFixedSizeArray)):  # hack
             arg_type = SimTypePointer(arg_type.elem_type).with_arch(self.arch)
         if isinstance(arg_type, RustSimEnum):
@@ -2029,6 +2056,8 @@ class SimCCGoAMD64(SimCC):
         return [next(session.both_iter) for _ in range(max(1, -(-size // self.arch.bytes)))]
 
     def next_arg(self, session: ArgSession, arg_type: SimType) -> SimFunctionArgument:
+        if isinstance(arg_type, TypeRef):
+            arg_type = arg_type.type
         if isinstance(arg_type, SimTypeArray):
             arg_type = SimTypePointer(arg_type.elem_type).with_arch(self.arch)
         if arg_type._arch is None:
@@ -2141,6 +2170,8 @@ class SimCCARM(SimCC):
 
     # https://github.com/ARM-software/abi-aa/blob/60a8eb8c55e999d74dac5e368fc9d7e36e38dda4/aapcs32/aapcs32.rst#parameter-passing
     def next_arg(self, session, arg_type):
+        if isinstance(arg_type, TypeRef):
+            arg_type = arg_type.type
         if isinstance(arg_type, (SimTypeArray, SimTypeFixedSizeArray)):  # hack
             arg_type = SimTypePointer(arg_type.elem_type).with_arch(self.arch)
         state = session.getstate()
@@ -2278,6 +2309,8 @@ class SimCCARMHF(SimCCARM):
     EXTRA_ARCHES = (archinfo.ArchARMCortexM,)
 
     def next_arg(self, session: ArgSession, arg_type):
+        if isinstance(arg_type, TypeRef):
+            arg_type = arg_type.type
         if isinstance(arg_type, (SimTypeArray, SimTypeFixedSizeArray)):  # hack
             arg_type = SimTypePointer(arg_type.elem_type).with_arch(self.arch)
         state = session.getstate()
@@ -2446,6 +2479,8 @@ class SimCCRISCV64(SimCC):
 
     # https://github.com/riscv-non-isa/riscv-elf-psabi-doc/blob/master/riscv-cc.adoc
     def next_arg(self, session, arg_type):
+        if isinstance(arg_type, TypeRef):
+            arg_type = arg_type.type
         # TODO: Implement variable parameter passing
         # EXAMPLE:
         # struct F1 {float a, int b};
@@ -2634,6 +2669,8 @@ class SimCCO32(SimCC):
 
     # http://math-atlas.sourceforge.net/devel/assembly/mipsabi32.pdf Section 3-17
     def next_arg(self, session, arg_type):
+        if isinstance(arg_type, TypeRef):
+            arg_type = arg_type.type
         if isinstance(arg_type, (SimTypeArray, SimTypeFixedSizeArray)):  # hack
             arg_type = SimTypePointer(arg_type.elem_type).with_arch(self.arch)
         state = session.getstate()
