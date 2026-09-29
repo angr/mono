@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from collections import OrderedDict
 
@@ -9,6 +10,7 @@ import archinfo
 import angr
 import angr.rust.knowledge_plugins  # pylint:disable=unused-import
 from angr.analyses.typehoon import typeconsts
+from angr.knowledge_plugins.functions.function_parser import FunctionParser
 from angr.rust.analyses.type_db_loader import TypeDBLoader
 from angr.rust.sim_type import (
     EnumVariant,
@@ -30,6 +32,7 @@ from angr.rust.sim_type import (
 )
 from angr.rust.typehoon.translator import RustTypeTranslator
 from angr.sim_type import SimType, SimTypeArray, SimTypeFunction, SimTypeLongLong, SimTypePointer, SimTypeRef, TypeRef
+from tests.common import bin_location
 
 
 def _blank_type_db_loader() -> TypeDBLoader:
@@ -80,6 +83,24 @@ class TestRustSimType(unittest.TestCase):
         assert tuple(normalized.args) == (field_ty,)
         assert normalized.is_arg0_retbuf is False
         assert prototype.normalize() is not prototype
+
+    def test_narrow_type_constants_reach_rust_types(self):
+        # RustTypeConstHandlers dispatches on the exact type-constant class, so every class the type solver can
+        # produce needs an entry; a missing one silently degrades to a bottom type in the generated Rust
+        arch = archinfo.ArchPcode("z80:LE:16:default")
+        tx = RustTypeTranslator(arch)
+
+        for tc in (typeconsts.Pointer16(typeconsts.Int8()), typeconsts.Pointer24(typeconsts.Int8())):
+            restored, _ = tx.tc2simtype(tc)
+            assert isinstance(restored, RustSimTypeReference)
+            assert isinstance(restored.pts_to, RustSimTypeInt)
+
+        # int_type/signed_int_type/unsigned_int_type all answer 24-bit accesses now, on every architecture
+        for tc, signed in ((typeconsts.Int24(), False), (typeconsts.SInt24(), True), (typeconsts.UInt24(), False)):
+            restored, _ = tx.tc2simtype(tc)
+            assert isinstance(restored, RustSimTypeInt)
+            assert restored.size == 24
+            assert restored.signed is signed
 
     def test_rust_scalar_reference_and_array_repr_json_roundtrip(self):
         arch = archinfo.ArchAMD64()
@@ -214,6 +235,48 @@ class TestRustSimType(unittest.TestCase):
         ok = RustSimStruct(OrderedDict(), name="Tree")
         ok.fields["child"] = RustSimTypeResult(SimTypePointer(TypeRef("Tree", ok)), 0, 8, RustSimTypeInt(32), 1, 8)
         assert SimType.from_json(json.loads(json.dumps(ok.to_json()))).name == "Tree"
+
+    def test_a_rust_enum_used_twice_survives_one_json_document(self):
+        # to_json wrote memo[self.name] and never removed it, so the enum's second use in one
+        # document came back as {"_t": "_ref", "name": ..., "ot": "rust_enum"}, which nothing
+        # resolves: SimType.from_json registers only structs and unions as reference targets.
+        count = RustSimEnum(
+            "core::fmt::rt::Count",
+            [
+                EnumVariant.from_no_data("Implied", 0, 8),
+                EnumVariant.from_single_field_ty("Is", RustSimTypeSize(signed=False), 1, 8),
+            ],
+        )
+        prototype = SimTypeFunction([count, count], RustSimTypeInt(32))
+        restored = SimType.from_json(json.loads(json.dumps(prototype.to_json())))
+        for argument in restored.args:
+            assert isinstance(argument, RustSimEnum)
+            assert [variant.name for variant in argument.variants] == ["Implied", "Is"]
+
+    def test_a_rust_enum_used_twice_survives_a_function_prototype_round_trip(self):
+        # The same thing on the path FunctionParser uses, which is what an AngrDB save and load
+        # does to every prototype, and what the function manager's own spill does during analysis.
+        project = angr.Project(os.path.join(bin_location, "tests", "x86_64", "rust_hello_world"), auto_load_libs=False)
+        count = RustSimEnum(
+            "core::fmt::rt::Count",
+            [
+                EnumVariant.from_no_data("Implied", 0, 8),
+                EnumVariant.from_single_field_ty("Is", RustSimTypeSize(signed=False), 1, 8),
+            ],
+        )
+        prototype = SimTypeFunction([count, count], RustSimTypeInt(32)).with_arch(project.arch)
+        assert isinstance(prototype, SimTypeFunction)
+        function = project.kb.functions.function(addr=project.entry, create=True)
+        assert function is not None
+        function.prototype = prototype
+
+        back = FunctionParser.parse_from_cmsg(
+            FunctionParser.serialize(function), function_manager=project.kb.functions, project=project
+        )
+        assert back.prototype is not None
+        for argument in back.prototype.args:
+            assert isinstance(argument, RustSimEnum)
+            assert [variant.name for variant in argument.variants] == ["Implied", "Is"]
 
     def test_rust_slice_layout_uses_two_machine_words(self):
         arch = archinfo.ArchAMD64()

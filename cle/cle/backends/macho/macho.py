@@ -22,8 +22,8 @@ from cle.backends.symbol import Symbol
 from cle.errors import CLECompatibilityError, CLEInvalidBinaryError, CLEOperationError
 
 from .encrypted_sentinel_backer import CryptSentinel
+from .macho_enums import ARMThreadFlavor, CPUType, MachoFiletype, MH_flags, X86ThreadFlavor
 from .macho_enums import LoadCommands as LC
-from .macho_enums import MachoFiletype, MH_flags
 from .section import TYPE_MASK, ZEROFILL_SECTION_TYPES, MachOSection
 from .segment import MachOSegment
 from .structs import (
@@ -42,6 +42,16 @@ from .symbol import AbstractMachOSymbol, DyldBoundSymbol, SymbolTableSymbol
 log = logging.getLogger(name=__name__)
 
 __all__ = ("MachO", "MachOSection", "MachOSegment", "SymbolList")
+
+# Layout of the thread states LC_UNIXTHREAD can carry, keyed by (cputype, flavor) because a flavor number
+# only identifies a thread state together with the cputype it belongs to. Every format string stops at the
+# program counter, so the last field it unpacks is the entry point.
+UNIXTHREAD_PC_FORMATS = {
+    (CPUType.CPU_TYPE_X86, X86ThreadFlavor.x86_THREAD_STATE32): "11I",  # __eip
+    (CPUType.CPU_TYPE_X86_64, X86ThreadFlavor.x86_THREAD_STATE64): "17Q",  # __rip
+    (CPUType.CPU_TYPE_ARM, ARMThreadFlavor.ARM_THREAD_STATE): "16I",  # __pc
+    (CPUType.CPU_TYPE_ARM64, ARMThreadFlavor.ARM_THREAD_STATE64): "33Q",  # __pc
+}
 
 
 # pylint: disable=abstract-method
@@ -129,7 +139,7 @@ class MachO(Backend):
         self.weak_binding_blob: bytes | None = None  # weak binidng information
         self.rebase_blob: bytes | None = None  # rebasing information
         self.symtab_offset = None  # offset to the symtab
-        self.symtab_nsyms = None  # number of symbols in the symtab
+        self.symtab_nsyms: int = 0  # number of symbols in the symtab; LC_SYMTAB is optional
         self.binding_done = False  # if true binding was already done and do_bind will be a no-op
         self.strtab: bytes | None = None
         self._indexed_strtab: dict[int, bytes] | None = None
@@ -160,8 +170,14 @@ class MachO(Backend):
                 "7I", binary_file, 0, 28
             )
 
-            # Libraries are always implicitly PIC
-            self.pic = bool(self.flags & MH_flags.MH_PIE) or bool(self.filetype & MachoFiletype.MH_DYLIB)
+            # MH_PIE only ever appears on executables; everything linked relative to 0 is implicitly
+            # position independent. Bundles have an ordinal without the MH_DYLIB bit that older code
+            # relied on, so recognize them explicitly.
+            self.pic = (
+                bool(self.flags & MH_flags.MH_PIE)
+                or bool(self.filetype & MachoFiletype.MH_DYLIB)
+                or self.filetype == MachoFiletype.MH_BUNDLE
+            )
 
             if not bool(self.flags & MH_flags.MH_TWOLEVEL):  # ensure MH_TWOLEVEL
                 log.error(
@@ -179,41 +195,44 @@ class MachO(Backend):
             # Note that this should be customized for Apple ABI (TODO)
             self.set_arch(archinfo.arch_from_id(arch_ident, endness="lsb" if self.struct_byteorder == "<" else "msb"))
 
+            # Start reading load commands
+            lc_offset = (7 if self.arch.bits == 32 else 8) * 4
+
             # Determine the base address the binary was linked against
             # and set the values for the Backend and Loader accordingly
             if self.pic and self.filetype == MachoFiletype.MH_EXECUTE:
-                assert self.is_main_bin, "An file of type MH_EXECUTE should be the main bin, this should not happen"
+                # is_main_bin can be False here: a container backend (CaRT, universal binary) owns
+                # the child until the loader promotes it through force_main_object
                 # a Position Independent Main binary would later be loaded at 0x400000, which isn't legal for Mach-O
-                # Also, its segment vaddrs are relative to 0x100000000, so we set this as the linked base
-                # and the MachO Backend code uses the AdressTranslator to translate linked addresses to relative ones
+                # An executable is linked at the address of its __TEXT segment: that is where the mach header
+                # itself ends up, and what __mh_execute_header resolves to. ld64 puts it at 0x100000000 on 64 bit
+                # and 0x4000 on 32 bit, but that is a default and not a property of the format -- Go's linker
+                # links darwin/amd64 executables at 0x1000000 -- so read it instead of assuming it, and fall back
+                # to the ld64 default for a binary that declares no __TEXT.
+                # The MachO Backend code uses the AddressTranslator to translate linked addresses to relative ones.
                 # In theory this is the place where the slide for rebasing should be added, but this isn't supported yet
-                if self.arch.bits == 64:
+                text_vmaddr = self._text_segment_vmaddr(lc_offset)
+                if text_vmaddr:
+                    self.linked_base = self.mapped_base = text_vmaddr
+                elif self.arch.bits == 64:
                     self.linked_base = self.mapped_base = 2**32
                 elif self.arch.bits == 32:
                     self.linked_base = self.mapped_base = 0x4000
-            elif self.filetype == MachoFiletype.MH_DYLIB and self.is_main_bin:
-                # the segments of dylibs are just relative to the load address, i.e. the lowest segment addr is 0
-                # we need to set the load address to something because otherwise the loader will try to map the
-                # file to 0x400000, which is technically illegal for Mach-O because of PAGEZERO
-                #
-                # The problem is that libraries also tend to have relative pointers (e.g. inside ObjC Metadata),
-                # which are rebased by parsing the rebase_blob, which isn't supported yet (but coming soon)
-                # so we set the base addr to 0 to make them work out without having to deal with this
-                # IDA and Ghidra both seem to handle it this way too
-                # AFAIU this isn't a problem with iOS15+ binaries anymore that use the new binding fixups
-                # but for now we just load all libraries, that are loaded as the main object, at address 0
+            elif self.filetype in (MachoFiletype.MH_DYLIB, MachoFiletype.MH_BUNDLE) and self.is_main_bin:
+                # the segments of dylibs and bundles are just relative to the load address, i.e. the lowest segment
+                # addr is 0. We need to set the load address to something because otherwise the loader will try to
+                # map the file to 0x400000.
                 #
                 # We can't set the linked base to request this, because the MachO Backend implementation
-                # uses this to recalculate the addresses
+                # uses this to recalculate the addresses.
                 self._custom_base_addr = 0
             elif self.filetype == MachoFiletype.MH_OBJECT:
                 # A relocatable object is linked against 0, and carries one unnamed segment holding every
                 # section. Nothing is bound yet, so this is the same base-address situation as a dylib
                 # loaded as the main object.
                 self._custom_base_addr = 0
-            elif self.filetype == MachoFiletype.MH_DYLIB and not self.is_main_bin:
-                # A Library is loaded as a dependency, this is fine, the loader will map it to somewhere above the main
-                # binary, so we don't need to do anything
+            elif self.filetype in (MachoFiletype.MH_DYLIB, MachoFiletype.MH_BUNDLE) and not self.is_main_bin:
+                # A library or bundle loaded as a dependency will be mapped above the main binary.
                 pass
             else:
                 # This case is not explicitly supported yet.
@@ -222,9 +241,6 @@ class MachO(Backend):
                     f"Unsupported Mach-O file type: {MachoFiletype(self.filetype)}. "
                     "Please open an issue if you need support for this"
                 )
-
-            # Start reading load commands
-            lc_offset = (7 if self.arch.bits == 32 else 8) * 4
 
             self._parse_load_commands(lc_offset)
 
@@ -296,6 +312,30 @@ class MachO(Backend):
     def check_compatibility(cls, spec, obj):
         # TODO: Check properly, but for now libs are just used via force load libs anyway
         return True
+
+    def _text_segment_vmaddr(self, lc_offset: int) -> int | None:
+        """
+        The address __TEXT is linked at, read straight from the load commands before they are parsed
+        properly, because the base address the rest of the parse works against depends on it.
+
+        :return: the vmaddr of the __TEXT segment, or None if the binary declares no __TEXT segment.
+        """
+        binary_file = self._binary_stream
+        count = 0
+        offset = lc_offset
+        # Bounded the same way _parse_load_commands bounds itself, so a header that lies about either
+        # ncmds or sizeofcmds cannot walk this loop off the end of the commands
+        while count < self.ncmds and (offset - lc_offset) < self.sizeofcmds:
+            count += 1
+            cmd, size = self._unpack("2I", binary_file, offset, 8)
+            if cmd in (LC.LC_SEGMENT, LC.LC_SEGMENT_64):
+                segname = self._read(binary_file, offset + 8, 16).rstrip(b"\0")
+                if segname == b"__TEXT":
+                    if cmd == LC.LC_SEGMENT_64:
+                        return self._unpack("Q", binary_file, offset + 24, 8)[0]
+                    return self._unpack("I", binary_file, offset + 24, 4)[0]
+            offset += size
+        return None
 
     def _parse_load_commands(self, lc_offset):
         # Possible optimization: Remove all unnecessary calls to seek()
@@ -750,10 +790,10 @@ class MachO(Backend):
         try:
             arch_lookup = {
                 # contains all supported architectures. Note that apple deviates from standard ABI, see Apple docs
-                0x100000C: "aarch64",
-                0xC: "arm",
-                0x7: "x86",
-                0x1000007: "x64",
+                CPUType.CPU_TYPE_ARM64: "aarch64",
+                CPUType.CPU_TYPE_ARM: "arm",
+                CPUType.CPU_TYPE_X86: "x86",
+                CPUType.CPU_TYPE_X86_64: "x64",
             }
             return arch_lookup[self.cputype]  # subtype currently not needed
         except KeyError:
@@ -824,21 +864,32 @@ class MachO(Backend):
             )
 
         # parse basic structure
-        # _, cmdsize, flavor, long_count
-        _, _, flavor, _ = self._unpack("4I", f, offset, 16)
+        # _, cmdsize, flavor, count
+        _, _, flavor, count = self._unpack("4I", f, offset, 16)
 
-        # we only support 4 different types of thread state atm
-        # TODO: This is the place to add x86 and x86_64 thread states
-        if flavor == 1 and self.arch.bits != 64:  # ARM_THREAD_STATE or ARM_UNIFIED_THREAD_STATE or ARM_THREAD_STATE32
-            blob = self._unpack("16I", f, offset + 16, 64)  # parses only until __pc
-        elif flavor == 1 and self.arch.bits == 64 or flavor == 6:
-            # ARM_THREAD_STATE or ARM_UNIFIED_THREAD_STATE or ARM_THREAD_STATE64
-            blob = self._unpack("33Q", f, offset + 16, 264)  # parses only until __pc
-        else:
-            log.error("Unknown thread flavor: %d", flavor)
-            raise CLECompatibilityError()
+        # Nothing below can abort the load: the entry point is all LC_UNIXTHREAD contributes, and
+        # _resolve_entry already reports a binary that has no entry point at all.
+        fmt = UNIXTHREAD_PC_FORMATS.get((self.cputype, flavor))
+        if fmt is None:
+            # Without a known layout there is no telling where the program counter sits in the thread state.
+            log.warning("Unsupported thread state flavor %d for cputype %#x", flavor, self.cputype)
+            return
 
-        self.unixthread_pc = blob[-1]
+        # "=" asks for the standard sizes, which is what both byteorder prefixes select, so the size
+        # of the thread state does not depend on which one this binary needs.
+        size = struct.calcsize("=" + fmt)
+        if count * 4 < size:
+            # count is the length of the thread state in 32 bit words. Unpacking more than the command
+            # declares would read whatever follows it rather than the program counter.
+            log.warning("LC_UNIXTHREAD declares %d words of thread state, too few for flavor %d", count, flavor)
+            return
+
+        state = self._read(f, offset + 16, size)
+        if len(state) < size:
+            log.warning("File ends inside the LC_UNIXTHREAD thread state")
+            return
+
+        self.unixthread_pc = self._unpack_with_byteorder(fmt, state)[-1]
         log.debug("LC_UNIXTHREAD: __pc=%#x", self.unixthread_pc)
 
     def _load_dylib_info(self, f, offset):

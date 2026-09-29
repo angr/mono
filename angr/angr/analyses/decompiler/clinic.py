@@ -461,8 +461,9 @@ class Clinic(Analysis, Serializable):
         # True once _recover_and_link_variables has populated kb.dec_variables for this function this run
         self._variables_recovered = False
         # VariableMap is a side container that holds variable/variable_offset/custom_string/reference_values and the
-        # sibling reference_variable/reference_variable_offset for AIL atoms, keyed by their .idx. It supersedes
-        # storing this information directly on AIL Statement/Expression objects.
+        # sibling reference_variable/reference_variable_offset for AIL atoms. Variable associations use a separate
+        # VirtualVariable namespace; other metadata is keyed by .idx. It supersedes storing this information directly
+        # on AIL Statement/Expression objects.
         self.variable_map: VariableMap = variable_map if variable_map is not None else VariableMap()
         self.externs: set[SimMemoryVariable] = set()
         self.data_refs: dict[int, list[DataRefDesc]] = {}  # data address to data reference description
@@ -2046,6 +2047,7 @@ class Clinic(Analysis, Serializable):
         """
         Rewrite tail jumps to functions as call statements.
         """
+        function_block_addrs = {block.addr for block in ail_graph}
         for block in list(ail_graph.nodes()):
             if ail_graph.out_degree[block] > 1:
                 continue
@@ -2066,7 +2068,11 @@ class Clinic(Analysis, Serializable):
                 continue
 
             for slot_name, target in slots:
-                if not isinstance(target, ailment.Const) or not self.kb.functions.contains_addr(target.value):
+                if (
+                    not isinstance(target, ailment.Const)
+                    or target.value in function_block_addrs
+                    or not self.kb.functions.contains_addr(target.value)
+                ):
                     continue
 
                 target_func = self.kb.functions.get_by_addr(target.value)
@@ -3031,8 +3037,8 @@ class Clinic(Analysis, Serializable):
 
         # combo-register argument vvars only appear inside Reference expressions (created by
         # _rewrite_combo_reg_param_references), which variable recovery does not track, so no accesses were recorded
-        # for them; link them to their argument variables directly. the variable map is keyed by expression idx and
-        # every occurrence in the graph is the same expression object, so one call covers all of them.
+        # for them; link them to their argument variables directly. Every occurrence in the graph is the same
+        # expression object, so one occurrence association (and its stable varid default) covers all of them.
         if arg_vvars is not None:
             for vvar, var in arg_vvars.values():
                 if vvar.parameter_category == ailment.Expr.VirtualVariableCategory.COMBO_REGISTER:

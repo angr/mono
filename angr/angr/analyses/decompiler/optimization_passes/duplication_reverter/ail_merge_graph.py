@@ -7,6 +7,7 @@ import networkx as nx
 
 from angr.ailment.block import Block
 from angr.ailment.statement import ConditionalJump
+from angr.analyses.decompiler.utils import extract_jump_targets
 
 from .errors import SAILRSemanticError
 from .similarity import ail_similarity_to_orig_blocks
@@ -16,9 +17,16 @@ from .utils import (
     correct_jump_targets,
     deepcopy_ail_anyjump,
     replace_node_in_graph,
+    set_conditional_jump_target_addrs,
 )
 
 _l = logging.getLogger(name=__name__)
+
+
+def _replace_block_key[V](mapping: dict[Block, V], old_key: Block, new_key: Block) -> None:
+    replacement = {new_key if key is old_key else key: value for key, value in mapping.items()}
+    mapping.clear()
+    mapping.update(replacement)
 
 
 class AILBlockSplit:
@@ -255,11 +263,15 @@ class AILMergeGraph:
                 b0, b1 = merge_end_pair
 
             if true_target == self._find_og_start_by_merge_end(b0):
-                cond_jump_stmt.true_target.value = b0.addr
-                cond_jump_stmt.false_target.value = b1.addr
+                true_block, false_block = b0, b1
             else:
-                cond_jump_stmt.false_target.value = b0.addr
-                cond_jump_stmt.true_target.value = b1.addr
+                true_block, false_block = b1, b0
+
+            cond_copy.statements[-1] = set_conditional_jump_target_addrs(
+                cond_jump_stmt,
+                true_block.addr,
+                false_block.addr,
+            )
 
             self.graph.add_edge(match_node, cond_copy)
             self.graph.add_edge(cond_copy, b0)
@@ -440,8 +452,8 @@ class AILMergeGraph:
         def _rekey(mapping: dict, original: Block, updated: Block) -> None:
             for k in list(mapping.keys()):
                 if k == original:
-                    # note that updated might be the same as k
-                    mapping[updated] = mapping.pop(k)
+                    _replace_block_key(mapping, k, updated)
+                    break
 
         for original, updated in update_map.items():
             _rekey(self.original_split_blocks, original, updated)
@@ -492,11 +504,40 @@ class AILMergeGraph:
         graph = copy_graph_and_nodes(graph)
 
         # replace every block that has been split
-        updated_blocks = {}
+        updated_blocks: dict[Block, Block] = {}
+        split_addrs: dict[int, int] = {}
+
+        def resolve_updated_block(block: Block) -> Block:
+            path = []
+            while block in updated_blocks:
+                updated_block = updated_blocks[block]
+                if updated_block is block:
+                    break
+                path.append(block)
+                block = updated_block
+            for replaced_block in path:
+                updated_blocks[replaced_block] = block
+            return block
+
         for original_node, new_node in split_map.items():
+            block = resolve_updated_block(original_node)
+            predecessors = list(graph.predecessors(block))
+            successors = list(graph.successors(block))
+            split_addrs[original_node.addr] = new_node.addr
+            # a replacement is cut out of the unsplit original, so its terminator still names
+            # pre-split addresses; retarget only the ones that moved
+            terminator = new_node.statements[-1]
+            moved = {
+                addr: split_addrs[addr]
+                for addr in extract_jump_targets(terminator)
+                if split_addrs.get(addr, addr) != addr
+            }
+            new_node.statements[-1] = correct_jump_targets(terminator, moved, new_stmt=True)
             graph.add_node(new_node)
             # correct every in_edge to this node, with new targets for jumps
-            for pred in list(graph.predecessors(original_node)):
+            for pred in predecessors:
+                if pred == block:
+                    continue
                 new_pred = pred.copy()
                 new_pred.statements[-1] = correct_jump_targets(
                     new_pred.statements[-1], {original_node.addr: new_node.addr}, new_stmt=True
@@ -506,12 +547,16 @@ class AILMergeGraph:
                 graph.add_edge(new_pred, new_node)
 
             # re-add every out_edge
-            blk = updated_blocks.get(original_node, original_node)
-            for succ in graph.successors(blk):
-                graph.add_edge(new_node, succ)
+            for succ in successors:
+                graph.add_edge(new_node, new_node if succ == block else resolve_updated_block(succ))
 
             # finally, kill the original
-            if original_node in graph:
-                graph.remove_node(original_node)
+            graph.remove_node(block)
+            for replaced_block in list(updated_blocks):
+                if resolve_updated_block(replaced_block) is block:
+                    del updated_blocks[replaced_block]
+
+        for replaced_block in list(updated_blocks):
+            updated_blocks[replaced_block] = resolve_updated_block(replaced_block)
 
         return graph, updated_blocks
