@@ -39,8 +39,10 @@ class pthread_create(angr.SimProcedure):
         # Execute each block
         state = blank_state
         for b in blocks:
+            # the engine dispatches hooks on the state's instruction pointer, not on the block it is handed
+            state.regs.ip = b.addr
             try:
-                irsb = self.project.factory.default_engine.process(state, b, force_addr=b.addr)
+                irsb = self.project.factory.default_engine.process(state, irsb=b, force_addr=b.addr)
             except (AngrError, SimError) as ex:
                 _l.debug("pthread_create.static_exits: cannot execute block %#x: %s", b.addr, ex)
                 break
@@ -55,9 +57,9 @@ class pthread_create(angr.SimProcedure):
                 break
             state = succ
 
-        assert self.cc is not None and self.arch is not None
+        assert self.arch is not None
         try:
-            callfunc = self.cc.get_args(state, self.prototype)[2]
+            callfunc = self._resolve_cc().get_args(state, self.prototype)[2]
             retaddr = state.memory.load(state.regs.sp, size=self.arch.bytes)
         except (AngrError, SimError) as ex:
             _l.debug("pthread_create.static_exits: cannot recover the thread entry point: %s", ex)

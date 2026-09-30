@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-# pylint:disable=missing-class-docstring,no-self-use
+# pylint:disable=missing-class-docstring,no-self-use,protected-access
 from __future__ import annotations
 
 __package__ = __package__ or "tests.analyses.decompiler"  # pylint:disable=redefined-builtin
 
 import os
 import unittest
+from unittest import mock
 
 import angr
 from angr.analyses.decompiler.optimization_passes import LoweredSwitchSimplifier
 from angr.analyses.decompiler.presets import DECOMPILATION_PRESETS
+from angr.utils.ail import is_phi_assignment
 from tests.common import bin_location, load_project_with_scoped_cfg
 
 test_location = os.path.join(bin_location, "tests")
@@ -71,6 +73,80 @@ class TestLoweredSwitchSimplifier(unittest.TestCase):
         assert not dec.errors
         assert dec.codegen is not None and dec.codegen.text is not None
         assert "switch (" in dec.codegen.text
+
+    def test_rewrite_is_abandoned_when_an_earlier_cluster_took_this_one(self):
+        # NSSCKFWC_Decrypt maps a return code through two comparison clusters over the same variable.
+        # Converting the first removes the comparisons it subsumes and the chain they orphan, which here
+        # takes the second cluster's head, its comparisons and the nodes its cases target. The pass then
+        # read one of those targets back out of the graph and raised, sending the function to the basic
+        # preset.
+        proj, cfg = load_project_with_scoped_cfg(
+            os.path.join(test_location, "i386", "libnssckbi_gcc14.3.0_illumos"), 0x419830
+        )
+
+        dec = proj.analyses.Decompiler(cfg.functions[0x419830], cfg=cfg)
+
+        # pytest sets is_testing, so fail_fast re-raises and this test fails at the call above rather
+        # than on the assertion. Outside a test run the same exception is caught and logged, and the
+        # function is decompiled a second time on the basic preset.
+        assert not dec.errors
+        assert dec.codegen is not None and dec.codegen.text is not None
+
+    def test_rewrite_is_abandoned_when_it_would_remove_the_switch_head(self):
+        # scan_request() in bash's man2html at -O2 has a lowered switch whose first case-emitting
+        # comparison is reached through a range-splitting comparison. That splitter is redundant once the
+        # switch head exists, and removing it left the head with no in-edges, so the same walk took the
+        # head and every case body hanging off it. The pass then read one of those bodies back out of the
+        # graph and raised, which sent the whole function to the basic preset.
+        proj, cfg = load_project_with_scoped_cfg(
+            os.path.join(test_location, "x86_64", "man2html_gcc11.4.0_O2"), 0x4051D0, window=0x3000
+        )
+
+        dec = proj.analyses.Decompiler(cfg.functions[0x4051D0], cfg=cfg)
+
+        # pytest sets is_testing, so fail_fast re-raises and this test fails at the call above rather than
+        # on the assertion. Outside a test run the same exception is caught, and the only sign of it is
+        # that the function was decompiled a second time on the basic preset.
+        assert not dec.errors
+        assert dec.codegen is not None and dec.codegen.text is not None
+
+    def test_folding_a_comparison_chain_repoints_the_phis_that_named_it(self):
+        # dd(1) at -O2: the comparison node 0x406e97 folds into the switch head at 0x406e92, and the phi
+        # variable in 0x406ee4 named 0x406e97, a block the fold removes.
+        proj, cfg = load_project_with_scoped_cfg(os.path.join(test_location, "x86_64", "decompiler", "dd"), 0x406E10)
+
+        mismatches = []
+        original_analyze = LoweredSwitchSimplifier._analyze
+
+        def analyze_and_check(pass_, cache=None):
+            result = original_analyze(pass_, cache=cache)
+            if pass_.out_graph is not None:
+                mismatches.append(_phis_that_miss_a_predecessor(pass_.out_graph))
+            return result
+
+        with mock.patch.object(LoweredSwitchSimplifier, "_analyze", analyze_and_check):
+            dec = proj.analyses.Decompiler(cfg.functions[0x406E10], cfg=cfg)
+
+        assert not dec.errors
+        assert dec.codegen is not None and dec.codegen.text is not None
+        # a run in which the pass never produced a graph would collect no mismatch either
+        assert mismatches, "LoweredSwitchSimplifier produced no graph for this function"
+        assert all(not m for m in mismatches), mismatches
+
+
+def _phis_that_miss_a_predecessor(graph) -> list[str]:
+    """Report every phi variable whose sources are not exactly the block's predecessors."""
+    reported = []
+    for block in graph.nodes():
+        predecessors = {(pred.addr, pred.idx) for pred in graph.predecessors(block)}
+        for stmt in block.statements:
+            if is_phi_assignment(stmt):
+                sources = {src for src, _ in stmt.src.src_and_vvars}
+                if sources != predecessors:
+                    reported.append(
+                        f"{block.addr:#x}-{block.idx}: {stmt.dst} from {sources}, reached from {predecessors}"
+                    )
+    return reported
 
 
 if __name__ == "__main__":
