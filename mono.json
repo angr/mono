@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "08783a58708eab067ebde4f7a2489cddde387460",
-      "committed_at": "2026-09-29T11:22:05-07:00",
-      "subject": "CCA: Be more viligant for caller-cleanup clues. (#7308)",
+      "commit": "07f32f191f35a7f94e2376af3733ca1f427c031d",
+      "committed_at": "2026-09-30T11:13:35Z",
+      "subject": "Update version to 10.0.2.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "a98b65157173767c68fd6851fef1ae8bebe50f01",
-      "committed_at": "2026-09-28T11:23:56-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#1740)",
+      "commit": "45bf3482061f091a1f98a740f57ed8b5d1040fad",
+      "committed_at": "2026-09-30T11:13:37Z",
+      "subject": "Update version to 10.0.2.dev0 [ci skip]",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -48,25 +48,25 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "858a3f337b3c3b7fdb12c6583b98a04f7cd127fa",
-      "committed_at": "2026-09-28T11:54:32-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#388)",
+      "commit": "d74d9a04735af406f8fcdf183415ebcfdfbe705b",
+      "committed_at": "2026-09-30T11:13:38Z",
+      "subject": "Update version to 10.0.2.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "claripy": {
       "upstream": "https://github.com/angr/claripy",
-      "commit": "41e43fd980b413e95ce4a717c4201f6e7cbd4fb7",
-      "committed_at": "2026-09-21T11:48:18-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#745)",
+      "commit": "84a71b66997afe49cbd7636c542264952b0f1571",
+      "committed_at": "2026-09-30T11:13:41Z",
+      "subject": "Update version to 9.3.7.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "53d3d2419cfbb8a8c8741e97440cc1a9d6462559",
-      "committed_at": "2026-09-28T11:54:26-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#848)",
+      "commit": "997d4322678fe5876d9f83e0dd34e1052813b9db",
+      "committed_at": "2026-09-30T11:13:43Z",
+      "subject": "Update version to 10.0.2.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -99,9 +99,9 @@
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "1412ade6ce5526736d51295b093266b9fc8ac9b9",
-      "committed_at": "2026-09-28T11:54:21-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#590)",
+      "commit": "fc5b30d2ebe0d1478b75fb9d11c253c4d370b2c0",
+      "committed_at": "2026-09-30T11:13:44Z",
+      "subject": "Update version to 10.0.2.dev0 [ci skip]",
       "excluded": [
         ".gitmodules"
       ],
@@ -119,13 +119,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-09-29T20:51:28+00:00",
+  "imported_at": "2026-09-30T20:51:21+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "c9b359c1d2e2cc5dd58365fc3b76fdc526621439",
-      "committed_at": "2026-09-29T03:18:01-07:00",
-      "subject": "Update VERSION to 10.0.1.dev0.",
+      "commit": "9eb02bd1032e1d96e729df2739f9a10a337bd154",
+      "committed_at": "2026-09-30T11:13:40Z",
+      "subject": "Update version to 10.0.2.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
