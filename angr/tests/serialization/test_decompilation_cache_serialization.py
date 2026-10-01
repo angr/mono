@@ -41,13 +41,16 @@ from angr.analyses.decompiler.structured_codegen.c_serialize import (
     _DISPLAY_OPTION_ATTRS,
     _DISPLAY_OPTION_FIELD_FIRST,
     _SERIALIZE_KIND_BY_CLASS,
+    SerializeContext,
     _parse_tags,
     _sanitize_tags,
 )
+from angr.analyses.decompiler.structurer_nodes import IncompleteSwitchCaseHeadStatement
 from angr.knowledge_plugins.structured_code import SpillingDecompilationDict
 from angr.protos import codegen_pb2
 from angr.sim_variable import SimRegisterVariable, SimStackVariable
 from angr.utils.ail_serialization import (
+    BlockPool,
     pack_arg_vvars,
     pack_graph,
     pack_ite_exprs,
@@ -59,7 +62,7 @@ from angr.utils.ail_serialization import (
     parse_static_buffers,
     parse_static_vvars,
 )
-from tests.common import bin_location
+from tests.common import bin_location, load_project_with_scoped_cfg
 
 test_location = os.path.join(bin_location, "tests")
 
@@ -149,6 +152,104 @@ class TestAilSerializationHelpers(unittest.TestCase):
         assert back[b0][b2] == {"type": "transition", "stmt_idx": -2}
         assert back[b1][b2] == {}
 
+    def _switch_head_block(self, idx=7):
+        """A block terminated by the one AIL statement that is still written in Python, as LoweredSwitchSimplifier
+        leaves it: the marker replaces the head block's last statement."""
+        cmp_block = AilBlock(0x2000, 4, statements=[Return(9, [], ins_addr=0x2000)])
+        head = IncompleteSwitchCaseHeadStatement(
+            idx,
+            Const(11, 0x40, 32),
+            [
+                (cmp_block, 1, 0x1100, None, 0x1200),
+                (cmp_block, "default", 0x1300, 4, None),
+            ],
+            ins_addr=0x1000,
+        )
+        # the marker is not a Rust Statement; carrying one anyway is exactly what this change encodes
+        stmts = [Assignment(0, AilTmp(1, 2, 64), Const(2, 1, 64), ins_addr=0x1000), head]
+        return AilBlock(0x1000, 4, statements=stmts)  # pyright: ignore[reportArgumentType]
+
+    def test_graph_roundtrip_with_incomplete_switch_case_head(self):
+        # Block.to_bytes() carries only Rust statements, so the marker is encoded beside the block payload and put
+        # back at its original index on parse.
+        blk = self._switch_head_block()
+        _, b1, _ = self._blocks()
+        g = networkx.DiGraph()
+        g.add_edge(blk, b1, type="transition")
+
+        back = parse_graph(pack_graph(g))
+        restored = next(n for n in back.nodes if n.addr == 0x1000)
+        assert len(restored.statements) == 2
+        head = restored.statements[1]
+        assert isinstance(head, IncompleteSwitchCaseHeadStatement)
+        assert head.idx == 7
+        assert head.tags["ins_addr"] == 0x1000
+        assert head.switch_variable == Const(11, 0x40, 32)
+        assert [(v, ta, ti, na) for _, v, ta, ti, na in head.case_addrs] == [
+            (1, 0x1100, None, 0x1200),
+            ("default", 0x1300, 4, None),
+        ]
+        assert [c.addr for c, *_ in head.case_addrs] == [0x2000, 0x2000]
+
+    def test_graph_roundtrip_with_case_values_above_int64(self):
+        # A case label is recorded as the unsigned value of the comparison constant -- LoweredSwitchSimplifier
+        # special-cases 0xffff_ffff_ffff_ffff for exactly that reason -- so `case -5:` on a 64-bit switch
+        # reaches the encoder as 0xfffffffffffffffb. Anything above 2**63 has to round-trip, or the cache is
+        # lost for the very switches this encoding exists to keep.
+        cmp_block = AilBlock(0x2000, 4, statements=[Return(9, [], ins_addr=0x2000)])
+        head = IncompleteSwitchCaseHeadStatement(
+            7,
+            Const(11, 0x40, 64),
+            [
+                (cmp_block, 0xFFFFFFFFFFFFFFFB, 0x1100, None, 0x1200),  # case -5
+                (cmp_block, 0xFFFFFFFFFFFE1DC0, 0x1180, None, 0x1200),  # case -123456
+                (cmp_block, 42, 0x1200, None, None),
+                (cmp_block, "default", 0x1300, 4, None),
+            ],
+            ins_addr=0x1000,
+        )
+        stmts = [Assignment(0, AilTmp(1, 2, 64), Const(2, 1, 64), ins_addr=0x1000), head]
+        blk = AilBlock(0x1000, 4, statements=stmts)  # pyright: ignore[reportArgumentType]
+        g = networkx.DiGraph()
+        g.add_node(blk)
+
+        back = parse_graph(pack_graph(g))
+        restored = next(iter(back.nodes)).statements[1]
+        assert [v for _, v, *_ in restored.case_addrs] == [
+            0xFFFFFFFFFFFFFFFB,
+            0xFFFFFFFFFFFE1DC0,
+            42,
+            "default",
+        ]
+
+    def test_block_pool_separates_blocks_differing_only_in_python_statements(self):
+        # The pool deduplicates on the payload, and the marker is not in the payload; two blocks whose Rust
+        # statements are identical must not collapse into one entry.
+        pool = BlockPool()
+        g0 = networkx.DiGraph()
+        g0.add_node(self._switch_head_block(idx=7))
+        g1 = networkx.DiGraph()
+        g1.add_node(self._switch_head_block(idx=8))
+        m0 = pack_graph(g0, pool=pool)
+        m1 = pack_graph(g1, pool=pool)
+        assert m0.block_refs[0] != m1.block_refs[0]
+
+        back0 = parse_graph(m0, pool_payloads=pool.payloads)
+        back1 = parse_graph(m1, pool_payloads=pool.payloads)
+        assert next(iter(back0.nodes)).statements[1].idx == 7
+        assert next(iter(back1.nodes)).statements[1].idx == 8
+
+    def test_graph_rejects_unknown_python_statement(self):
+        # The encoder knows one Python-side statement. Anything else must still raise rather than be dropped.
+        class _Bogus:
+            pass
+
+        blk = AilBlock(0x1000, 4, statements=[_Bogus()])  # pyright: ignore[reportArgumentType]
+        g = networkx.DiGraph()
+        g.add_node(blk)
+        with self.assertRaises(TypeError):
+            pack_graph(g)
+
     def test_graph_rejects_unknown_edge_attr(self):
         b0, b1, _ = self._blocks()
         g = networkx.DiGraph()
@@ -234,6 +335,22 @@ class TestDecompilationCacheEndToEnd(unittest.TestCase):
         assert 0 not in node_ids
         # nodes created after deserialization must not collide with deserialized ones
         assert back._next_node_idx > max(node_ids)
+
+    def test_register_expression_carries_the_register_name(self):
+        # _handle_Expr_Register used to hand the AIL Register expression itself to CRegister, and
+        # CRegisterMsg.reg is a protobuf string: serializing a decompilation that held one raised
+        # "TypeError: bad argument type for built-in operation", so the cache was dropped whole.
+        codegen = self.decompiler.codegen
+        assert isinstance(codegen, c_codegen.CStructuredCodeGenerator)
+        offset, size = self.proj.arch.registers["rdi"]
+        node = codegen._handle_Expr_Register(Expr.Register(None, offset, size * 8))
+        assert isinstance(node, c_codegen.CRegister)
+        assert node.reg == "rdi"
+        assert "".join(chunk for chunk, _ in node.c_repr_chunks()) == "rdi"
+
+        ctx = SerializeContext()
+        ctx.serialize(node)
+        assert [n.creg.reg for n in ctx.nodes] == ["rdi"]
 
     def test_clinic_roundtrip(self):
         clinic = self.decompiler.clinic
@@ -373,6 +490,43 @@ class TestDecompilationCacheEndToEnd(unittest.TestCase):
             cache.stackvar_max_sizes = saved
         assert back.stackvar_max_sizes[big] == 5419868274
         assert len(back.stackvar_max_sizes) == len(saved) + 1
+
+    def test_cache_with_incomplete_switch_case_head_roundtrips(self):
+        # dirname's main has a lowered switch that LoweredSwitchSimplifier reverts, so cc_graph -- the snapshot taken
+        # before structuring -- keeps the Python-side marker statement it leaves behind.
+        proj = angr.Project(os.path.join(test_location, "x86_64", "decompiler", "dirname"), auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True, data_references=True)
+        proj.analyses.CompleteCallingConventions(cfg=cfg.model, recover_variables=True, analyze_callsites=True)
+        func = proj.kb.functions.function(name="main")
+        assert func is not None
+        dec = proj.analyses.Decompiler(func, cfg=cfg.model)
+
+        def heads(graph):
+            return [
+                stmt
+                for block in graph.nodes
+                for stmt in block.statements
+                if isinstance(stmt, IncompleteSwitchCaseHeadStatement)
+            ]
+
+        assert dec.clinic is not None and dec.cache is not None and dec.clinic.cc_graph is not None
+        original = heads(dec.clinic.cc_graph)
+        assert original, "cc_graph carries no switch-case head; this test would pass without exercising anything"
+
+        back = DecompilationCache.parse(dec.cache.serialize(), project=proj, kb=proj.kb, function=func, cfg=cfg.model)
+        assert back.clinic is not None and back.clinic.cc_graph is not None
+        restored = heads(back.clinic.cc_graph)
+        assert len(restored) == len(original)
+        for before, after in zip(original, restored):
+            assert after.idx == before.idx
+            assert after.tags == before.tags
+            assert after.switch_variable == before.switch_variable
+            assert after.peephole_optimized == before.peephole_optimized
+            # every field, including the cmp_block Block that _pack_switch_head encodes with
+            # to_bytes() and _parse_switch_head rebuilds with from_bytes()
+            assert after.case_addrs == before.case_addrs
+        assert back.clinic.cc_graph.number_of_nodes() == dec.clinic.cc_graph.number_of_nodes()
+        assert back.clinic.cc_graph.number_of_edges() == dec.clinic.cc_graph.number_of_edges()
 
     def test_cache_hit_on_deserialized_cache(self):
         cache = self.decompiler.cache
@@ -642,6 +796,100 @@ class TestClinicSerializationAboveFourGigabytes(unittest.TestCase):
         back = d[key]
         assert back.codegen is not None
         assert back.codegen.text == self.text
+
+
+class TestSwitchCaseLabelSerialization(unittest.TestCase):
+    """A case label carries the unsigned value of the constant the switch was lowered from, so a 64-bit switch
+    can label a case 0xfffffffffffffffe where the source wrote -2, and that does not fit in an int64."""
+
+    FIXTURE = os.path.join("riscv", "borgbackup2-chunker.cpython-312-riscv64-linux-gnu.so")
+    FUNC = 0x40AE4E
+    UNSIGNED_LABEL = 0xFFFFFFFFFFFFFFFE
+
+    codegen: c_codegen.CStructuredCodeGenerator
+    text: str
+
+    @classmethod
+    def setUpClass(cls):
+        # sub_40ae4e tests a 64-bit value against 2 and against -2; LoweredSwitchSimplifier turns that
+        # comparison chain into a switch and records the second label as the constant's unsigned value
+        cls.proj, cls.cfg = load_project_with_scoped_cfg(os.path.join(test_location, cls.FIXTURE), cls.FUNC)
+        codegen = cls.proj.analyses.Decompiler(cls.cfg.functions[cls.FUNC], cfg=cls.cfg).codegen
+        assert isinstance(codegen, c_codegen.CStructuredCodeGenerator)
+        assert codegen.text
+        cls.codegen = codegen
+        cls.text = codegen.text
+
+    @staticmethod
+    def _switches(codegen):
+        class Collector(c_codegen.CStructuredCodeWalker):
+            def __init__(self):
+                self.found = []
+
+            def handle_CSwitchCase(self, obj):
+                self.found.append(obj)
+                return super().handle_CSwitchCase(obj)
+
+        collector = Collector()
+        collector.handle(codegen.cfunc)
+        assert collector.found, "this function no longer decompiles to a switch"
+        return collector.found
+
+    @classmethod
+    def _labels(cls, codegen):
+        return [ids for switch in cls._switches(codegen) for ids, _ in switch.cases]
+
+    @classmethod
+    def _entry_storing(cls, blob, case_ids):
+        """The one serialized case entry whose stored labels are exactly ``case_ids``."""
+        msg = codegen_pb2.Codegen()
+        msg.ParseFromString(blob)
+        entries = [e for n in msg.nodes if n.kind == codegen_pb2.CCK_SWITCH_CASE for e in n.cswitch.cases]
+        matching = [e for e in entries if list(e.case_ids) == list(case_ids)]
+        assert len(matching) == 1, f"expected one entry storing {list(case_ids)}, found {len(matching)}"
+        return matching[0]
+
+    def _relabel(self, labels):
+        """Serialize with the switch's first case relabelled; give back the blob and the label parsed out."""
+        switch = self._switches(self.codegen)[0]
+        saved = switch.cases
+        switch.cases = [(labels, saved[0][1]), *saved[1:]]
+        try:
+            blob = self.codegen.serialize()
+        finally:
+            switch.cases = saved
+        back = type(self.codegen).parse(blob, project=self.proj, kb=self.proj.kb)
+        return blob, self._switches(back)[0].cases[0][0]
+
+    def test_the_decompiled_switch_labels_a_case_above_int64_max(self):
+        assert self.UNSIGNED_LABEL in self._labels(self.codegen)
+        assert f"case {self.UNSIGNED_LABEL}:" in self.text
+
+    def test_codegen_roundtrips_the_unsigned_label(self):
+        blob = self.codegen.serialize()  # an int64 case_ids field raised ValueError here
+        assert list(self._entry_storing(blob, [-2]).case_ids_unsigned) == [True]
+
+        back = type(self.codegen).parse(blob, project=self.proj, kb=self.proj.kb)
+        assert self._labels(back) == self._labels(self.codegen)
+        assert back.text == self.text
+
+    def test_negative_label_roundtrips(self):
+        # other producers record a small signed label; reading the field as unsigned would have broken those
+        blob, parsed = self._relabel(-9)
+        assert parsed == -9
+        assert not self._entry_storing(blob, [-9]).case_ids_unsigned
+
+    def test_grouped_labels_keep_their_order_and_signedness(self):
+        labels = (-9, 0, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF)
+        blob, parsed = self._relabel(labels)
+        assert parsed == labels
+        entry = self._entry_storing(blob, [-9, 0, 0xFFFFFFFF, -1])
+        assert list(entry.case_ids_unsigned) == [False, False, False, True]
+
+    def test_labels_that_fit_are_written_without_the_parallel_field(self):
+        blob, parsed = self._relabel((2, 4))
+        assert parsed == (2, 4)
+        assert not self._entry_storing(blob, [2, 4]).case_ids_unsigned
 
 
 class TestSerializerRegistration(unittest.TestCase):

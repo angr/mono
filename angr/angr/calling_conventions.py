@@ -366,12 +366,14 @@ class SimRegArg(SimFunctionArgument):
 
     def refine(self, size, arch=None, offset=None, is_fp=None):
         passed_offset_none = offset is None
+        if is_fp is None:
+            is_fp = self.is_fp
         if offset is None:
             if arch is None:
                 raise ValueError("Need to specify either offset or arch in order to refine a register argument")
-            offset = 0 if arch.register_endness == "Iend_LE" else self.size - size
-        if is_fp is None:
-            is_fp = self.is_fp
+            # VEX addresses a narrow float at its register's own offset, so only an integer
+            # register keeps a narrow value in the low-order bytes of a big-endian register.
+            offset = 0 if is_fp or arch.register_endness == "Iend_LE" else self.size - size
         return SimRegArg(self.reg_name, size, self.reg_offset + offset, is_fp, clear_entire_reg=passed_offset_none)
 
     def sse_extend(self):
@@ -1301,7 +1303,7 @@ class SimCC:
             # this is a PCode SimCC where cls.ARCH is directly callable
             stack_arg_size = cls.ARCH().bytes  # type: ignore
         else:
-            stack_arg_size = cls.ARCH(archinfo.Endness.LE).bytes
+            stack_arg_size = cls.ARCH(cls.ARCH.default_endness).bytes
         stack_args = [a for a in args if isinstance(a, SimStackArg)]
         stack_arg_count = (max(a.stack_offset for a in stack_args) // stack_arg_size + 1) if stack_args else 0
         return min(limit, max(len(args), stack_arg_count))
@@ -1617,7 +1619,7 @@ class SimCCMicrosoftAMD64(SimCC):
     def return_in_implicit_outparam(self, ty):
         if isinstance(ty, TypeRef):
             ty = ty.type
-        if isinstance(ty, (SimTypeBottom, SimTypeRef, SimTypeFloat)):
+        if ty is None or isinstance(ty, (SimTypeBottom, SimTypeRef, SimTypeFloat)):
             return False
         size = ty.size
         return size is not None and size > self.STRUCT_RETURN_THRESHOLD
@@ -2581,7 +2583,8 @@ class SimCCRISCV64(SimCC):
         session.both_iter.setstate(aligned_offset)
 
         size_bits = arg_type.size
-        n_slots = (size_bits + self.arch.bits - 1) // self.arch.bits
+        # one slot for a type with no computable size, as in _classify
+        n_slots = 1 if size_bits is None else (size_bits + self.arch.bits - 1) // self.arch.bits
         locs = [next(session.both_iter) for _ in range(n_slots)]
         return refine_locs_with_struct_type(self.arch, locs, arg_type)
 
@@ -2620,6 +2623,10 @@ class SimCCRISCV64(SimCC):
             return ["FLOAT"]
 
         size_bits = arg_type.size
+        if size_bits is None:
+            # treat a type with no computable size, BOT included, as one XLEN integer
+            return ["INTEGER"]
+
         # > 2 * _XLEN (Bytes)
         # REFERENCE from psABI:
         # Scalars wider than 2 * XLEN bits are passed by reference
