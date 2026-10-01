@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "07f32f191f35a7f94e2376af3733ca1f427c031d",
-      "committed_at": "2026-09-30T11:13:35Z",
-      "subject": "Update version to 10.0.2.dev0 [ci skip]",
+      "commit": "2b107140aab0334482bdff5f67d36badb9808d66",
+      "committed_at": "2026-10-01T12:53:34-07:00",
+      "subject": "ci: bump taiki-e/install-action from 2.87.20 to 2.87.21 (#7340)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "45bf3482061f091a1f98a740f57ed8b5d1040fad",
-      "committed_at": "2026-09-30T11:13:37Z",
-      "subject": "Update version to 10.0.2.dev0 [ci skip]",
+      "commit": "2f466c243cf1f0e677d2c17870a7bc71c9ca8773",
+      "committed_at": "2026-10-01T10:07:27-07:00",
+      "subject": "Optimize time taken by some recent test cases. (#1742)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -119,7 +119,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-09-30T20:51:21+00:00",
+  "imported_at": "2026-10-01T20:51:04+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
