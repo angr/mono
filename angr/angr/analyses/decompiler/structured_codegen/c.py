@@ -1115,15 +1115,37 @@ class CStatements(CStatement):
         self.addr = addr
 
     def c_repr_chunks(self, indent=0, asexpr=False):
+        yield from self._c_repr_chunks(indent=indent, asexpr=asexpr, terminate_trailing_label=True)
+
+    def _c_repr_chunks(self, indent=0, asexpr=False, *, terminate_trailing_label):
         indent_str = self.indent_str(indent)
         if self.codegen.display_block_addrs:
             yield indent_str, None
             yield f"/* Block {hex(self.addr) if self.addr is not None else 'unknown'} */", None
             yield "\n", None
         for stmt in self.statements:
-            yield from stmt.c_repr_chunks(indent=indent, asexpr=asexpr)
+            if isinstance(stmt, CStatements):
+                # CStatements may be a transparent sequence nested inside another sequence. A label at the end of
+                # the inner sequence still labels the next statement in the outer sequence.
+                yield from stmt._c_repr_chunks(indent=indent, asexpr=asexpr, terminate_trailing_label=False)
+            else:
+                yield from stmt.c_repr_chunks(indent=indent, asexpr=asexpr)
             if asexpr:
                 yield ", ", None
+        if not asexpr and terminate_trailing_label and isinstance(self._last_nonempty_statement(), CLabel):
+            # A C label prefixes a statement; it is not a complete statement itself. Finish it only at the boundary
+            # of the enclosing sequence, after looking through transparent nested sequences.
+            yield indent_str, None
+            yield ";\n", None
+
+    def _last_nonempty_statement(self) -> CStatement | None:
+        for stmt in reversed(self.statements):
+            if isinstance(stmt, CStatements):
+                stmt = stmt._last_nonempty_statement()
+                if stmt is None:
+                    continue
+            return stmt
+        return None
 
 
 class CAILBlock(CStatement):
@@ -1966,7 +1988,8 @@ class CDirtyStatement(CExpression):
 
         yield indent_str, None
         yield from self.dirty.c_repr_chunks()
-        yield "\n", None
+        if not asexpr:
+            yield ";\n", None
 
 
 class CLabel(CStatement):
@@ -2219,11 +2242,18 @@ class CUnaryOp(CExpression):
         if handler is not None:
             yield from handler()
         else:
-            yield f"UnaryOp {self.op}", self
+            yield from self._c_repr_chunks_opfirst(self.op)
 
     #
     # Handlers
     #
+
+    def _c_repr_chunks_opfirst(self, op):
+        yield op, self
+        paren = CClosingObject("(")
+        yield "(", paren
+        yield from CExpression._try_c_repr_chunks(self.operand)
+        yield ")", paren
 
     def _c_repr_chunks_not(self):
         yield "!", self
@@ -2759,11 +2789,8 @@ class CConstant(CExpression):
 
         if self.reference_values is not None:
             if self._type is not None and self._type in self.reference_values:
-                if isinstance(self._type, SimTypeInt):
-                    if isinstance(self.reference_values[self._type], int):
-                        yield self.fmt_int(self.reference_values[self._type]), self
-                        return
-                    yield hex(self.reference_values[self._type]), self
+                if isinstance(self._type, SimTypeInt) and isinstance(self.reference_values[self._type], int):
+                    yield self.fmt_int(self.reference_values[self._type]), self
                     return
 
                 if isinstance(self._type, SimTypePointer) and isinstance(self._type.pts_to, SimTypeChar):
@@ -2997,37 +3024,51 @@ class CDirtyExpression(CExpression):
     AIL. Eventually this class should not be used at all.
     """
 
-    __slots__ = ("dirty",)
+    __slots__ = ("dirty", "operands")
 
     _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
-    def __init__(self, dirty, **kwargs):
+    def __init__(self, dirty, operands: list[CExpression] | None, **kwargs):
         super().__init__(**kwargs)
         self.dirty = dirty
+        self.operands = operands
 
     @property
     def type(self):
         return SimTypeInt().with_arch(self.codegen.project.arch)
 
-    def intrinsic_name(self) -> str | None:
+    @classmethod
+    def intrinsic_name_for(cls, dirty) -> str | None:
         """Return the dirty callee if it is a clean C identifier, else None."""
-        callee = getattr(self.dirty, "callee", None)
-        if isinstance(callee, str) and self._IDENT_RE.fullmatch(callee):
+        callee = getattr(dirty, "callee", None)
+        if isinstance(callee, str) and cls._IDENT_RE.fullmatch(callee):
             return callee
         return None
+
+    def intrinsic_name(self) -> str | None:
+        return self.intrinsic_name_for(self.dirty)
 
     def c_repr_chunks(self, indent=0, asexpr=False):
         if self.collapsed:
             yield "...", self
             return
-        # Never leak the internal "[D] ..." diagnostic repr into emitted C. Render a clean
-        # pseudo-intrinsic call when the callee is a valid C identifier, otherwise a safe
-        # placeholder comment.
         name = self.intrinsic_name()
         if name is not None:
-            operands = getattr(self.dirty, "operands", None) or []
-            args = ", ".join(repr(op).replace("[D] ", "") for op in operands)
-            yield f"{name}({args})", None
+            if self.operands is None:
+                # ``operands_ids`` was added after CDirtyExpression serialization. Preserve the raw operands when an
+                # older cache is explicitly re-rendered instead of silently turning ``helper(arg)`` into ``helper()``.
+                operands = getattr(self.dirty, "operands", None) or []
+                args = ", ".join(repr(op).replace("[D] ", "") for op in operands)
+                yield f"{name}({args})", self
+                return
+            yield name, self
+            paren = CClosingObject("(")
+            yield "(", paren
+            for idx, operand in enumerate(self.operands):
+                if idx:
+                    yield ", ", None
+                yield from CExpression._try_c_repr_chunks(operand)
+            yield ")", paren
         else:
             yield "/* unsupported instruction */", None
 
@@ -3492,15 +3533,18 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
         lvalue: bool,
         renegotiate_type: Callable[[SimType, SimType], SimType] = lambda old, proposed: old,
     ) -> CExpression:
-        def _force_type_cast(src_type_: SimType, dst_type_: SimType, expr_: CExpression) -> CUnaryOp:
+        def _force_type_cast(
+            src_type_: SimType, dst_type_: SimType, expr_: CExpression, take_reference: bool
+        ) -> CUnaryOp:
             src_type_ptr = SimTypePointer(src_type_).with_arch(self.project.arch)
             dst_type_ptr = SimTypePointer(dst_type_).with_arch(self.project.arch)
+            cast_expr = CUnaryOp("Reference", expr_, codegen=self) if take_reference else expr_
             return CUnaryOp(
                 "Dereference",
                 CTypeCast(
                     src_type_ptr,
                     dst_type_ptr,
-                    CUnaryOp("Reference", expr_, codegen=self),
+                    cast_expr,
                     codegen=self,
                 ),
                 codegen=self,
@@ -3533,11 +3577,11 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
                 # case 2: we're done because we can never find it and we might as well stop early
                 if base_expr:
                     if not type_equals(base_type, data_type):
-                        return _force_type_cast(base_type, data_type, base_expr)
+                        return _force_type_cast(base_type, data_type, base_expr, True)
                     return base_expr
 
                 if not type_equals(base_type, data_type):
-                    return _force_type_cast(base_type, data_type, expr)
+                    return _force_type_cast(base_type, data_type, expr, False)
                 return CUnaryOp("Dereference", expr, codegen=self)
 
         stride = 1 if base_type.size is None else base_type.size // self.project.arch.byte_width or 1
@@ -4257,10 +4301,15 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
         else_node = (
             None
             if stmt.false_target is None
-            else CGoto(self._handle(stmt.false_target), None, tags=stmt.tags, codegen=self)
+            else CGoto(self._handle(stmt.false_target), stmt.false_target_idx, tags=stmt.tags, codegen=self)
         )
         return CIfElse(
-            [(self._handle(stmt.condition), CGoto(self._handle(stmt.true_target), None, tags=stmt.tags, codegen=self))],
+            [
+                (
+                    self._handle(stmt.condition),
+                    CGoto(self._handle(stmt.true_target), stmt.true_target_idx, tags=stmt.tags, codegen=self),
+                )
+            ],
             else_node=else_node,
             cstyle_ifs=self.cstyle_ifs,
             tags=stmt.tags,
@@ -4388,7 +4437,12 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
             # FIXME: The type should be associated to the register expression itself
             type_ = self.default_simtype_from_bits(expr.bits, signed=False)
             return self._access_constant_offset(self._get_variable_reference(cvar), offset, type_, lvalue, negotiate)
-        return CRegister(expr, tags=expr.tags, codegen=self)
+        # CRegister carries the register's *name*: CRegisterMsg.reg is a protobuf string and
+        # _parse_cregister reads one back, so a CRegister holding the AIL expression cannot be
+        # serialized at all, and the decompilation cache holding it is dropped with it. The
+        # virtual-variable path in _handle_VirtualVariable names its register the same way.
+        reg_name = self.project.arch.translate_register_name(expr.reg_offset, expr.size)
+        return CRegister(reg_name or f"reg{expr.reg_offset}", tags=expr.tags, codegen=self)
 
     #: The libc functions that return ``&errno``. ``errno`` is a macro that
     #: dereferences one of them, so it never survives into a binary as a symbol;
@@ -4549,8 +4603,9 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
                 ):
                     reference_values[type_] = self._cfg.memory_data[expr.value]
                     inline_string = True
-            elif isinstance(type_, SimTypeInt):
-                # int
+            elif isinstance(type_, SimTypeInt) and isinstance(expr.value, int):
+                # int. a Const lifted from a VEX float constant carries a Python float, and a float is not an
+                # integer reference value: u2s would pass it through and every reader of this entry expects an int.
                 reference_values[type_] = u2s(expr.value, expr.bits) if type_.signed else expr.value
 
             # we don't know the type of this argument, or the type is not what we are expecting
@@ -4746,7 +4801,10 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
         return CVEXCCallExpression(expr.callee, operands, tags=expr.tags, codegen=self)
 
     def _handle_Expr_Dirty(self, expr: Expr.DirtyExpression, **kwargs):
-        return CDirtyExpression(expr, codegen=self)
+        if CDirtyExpression.intrinsic_name_for(expr) is None:
+            return CDirtyExpression(expr, [], codegen=self)
+        operands = [self._handle(operand) for operand in expr.operands]
+        return CDirtyExpression(expr, operands, codegen=self)
 
     def _handle_Expr_ITE(self, expr: Expr.ITE, **kwargs):
         return CITE(
@@ -4819,7 +4877,7 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
             reg_name = self.project.arch.translate_register_name(expr.oident, expr.size)
             return CRegister(reg_name or f"reg{expr.oident}", tags=expr.tags, codegen=self)
 
-        return CDirtyExpression(expr, codegen=self)
+        return CDirtyExpression(expr, [], codegen=self)
 
     def _handle_Expr_StackBaseOffset(self, expr: StackBaseOffset, **kwargs):
         expr_var = self._variable_map.variable(expr)
@@ -4915,6 +4973,10 @@ class CStructuredCodeWalker:
         obj.expr = self.handle(obj.expr)
         return obj
 
+    def handle_CDirtyStatement(self, obj):
+        obj.dirty = self.handle(obj.dirty)
+        return obj
+
     def handle_CFunctionCall(self, obj):
         obj.callee_target = self.handle(obj.callee_target)
         obj.args = [self.handle(arg) for arg in obj.args]
@@ -4962,6 +5024,11 @@ class CStructuredCodeWalker:
 
     def handle_CVEXCCallExpression(self, obj):
         obj.operands = [self.handle(operand) for operand in obj.operands]
+        return obj
+
+    def handle_CDirtyExpression(self, obj):
+        if obj.operands is not None:
+            obj.operands = [self.handle(operand) for operand in obj.operands]
         return obj
 
 
