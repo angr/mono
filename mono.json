@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "2b107140aab0334482bdff5f67d36badb9808d66",
-      "committed_at": "2026-10-01T12:53:34-07:00",
-      "subject": "ci: bump taiki-e/install-action from 2.87.20 to 2.87.21 (#7340)",
+      "commit": "8e2a379f2ef5c7bb5d66d1a5dfd27e72b86b5309",
+      "committed_at": "2026-10-02T11:23:19-07:00",
+      "subject": "SLiveness: Fix a performance regression caused by redundant VVarSet creations. (#7343)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -119,7 +119,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-01T20:51:04+00:00",
+  "imported_at": "2026-10-02T20:50:41+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
