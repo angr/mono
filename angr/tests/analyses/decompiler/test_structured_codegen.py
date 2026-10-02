@@ -10,11 +10,16 @@ import re
 import time
 import unittest
 from types import SimpleNamespace
+from typing import Any, cast
+from typing import cast as typing_cast
 
 import archinfo
 
 import angr
-from angr.ailment import Expr, Stmt
+from angr.ailment import Block, Expr, Manager, Stmt
+from angr.ailment.expression import VirtualVariableCategory
+from angr.analyses.decompiler.jump_target_collector import JumpTargetCollector
+from angr.analyses.decompiler.redundant_label_remover import RedundantLabelRemover
 from angr.analyses.decompiler.structured_codegen.c import (
     CAssignment,
     CBinaryOp,
@@ -28,6 +33,9 @@ from angr.analyses.decompiler.structured_codegen.c import (
     type_layout_key,
     type_to_c_repr_chunks,
 )
+from angr.analyses.decompiler.structured_codegen.rust import RustGoto, RustStructuredCodeGenerator
+from angr.analyses.decompiler.structurer_nodes import SequenceNode
+from angr.analyses.decompiler.variable_map import VariableMap
 from angr.calling_conventions import SimComboArg
 from angr.sim_type import (
     SimCppClass,
@@ -46,6 +54,7 @@ from angr.sim_type import (
     TypeRef,
     parse_cpp_file,
 )
+from angr.sim_variable import SimRegisterVariable, SimStackVariable
 from tests.common import WORKER, bin_location, print_decompilation_result
 
 test_location = os.path.join(bin_location, "tests")
@@ -65,14 +74,36 @@ class _RenderedExpression(CExpression):
         yield self.text, self
 
 
+def _make_codegen() -> CStructuredCodeGenerator:
+    proj = angr.Project(os.path.join(test_location, "x86_64", "fauxware"), auto_load_libs=False)
+    cfg = proj.analyses.CFGFast(normalize=True)
+    codegen = proj.analyses.Decompiler(cfg.functions["main"], cfg=cfg).codegen
+    assert isinstance(codegen, CStructuredCodeGenerator)
+    return codegen
+
+
+class _ConditionalJumpCodegenHarness:
+    cstyle_ifs = True
+
+    @staticmethod
+    def next_ident(name):
+        return name
+
+    @staticmethod
+    def next_node_idx():
+        return 0
+
+    @staticmethod
+    def _handle(node, **_kwargs):
+        return node
+
+
 class TestConvertRendering(unittest.TestCase):
     """How CStructuredCodeGenerator renders Convert expressions of assorted widths."""
 
     @classmethod
     def setUpClass(cls):
-        proj = angr.Project(os.path.join(test_location, "x86_64", "fauxware"), auto_load_libs=False)
-        cfg = proj.analyses.CFGFast(normalize=True)
-        cls.codegen = proj.analyses.Decompiler(cfg.functions["main"], cfg=cfg).codegen
+        cls.codegen = _make_codegen()
 
     def _render(self, from_bits: int, to_bits: int, value: int = 0x1234) -> str:
         conv = Expr.Convert(0, from_bits, to_bits, False, Expr.Const(0, value, from_bits))
@@ -95,6 +126,71 @@ class TestConvertRendering(unittest.TestCase):
         assert self._render(1, 5, value=1) == "(char)1"
         assert self._render(8, 12, value=3) == "(unsigned short)3"
         assert self._render(32, 64, value=3) == "(unsigned long long)3"
+
+
+class TestDirtyExpressionRendering(unittest.TestCase):
+    _idx = itertools.count(0x10000)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.proj = angr.Project(os.path.join(test_location, "x86_64", "fauxware"), auto_load_libs=False)
+        cls.cfg = cls.proj.analyses.CFGFast(normalize=True)
+        cls.func = cls.cfg.functions["main"]
+        cls.codegen = typing_cast(
+            CStructuredCodeGenerator, cls.proj.analyses.Decompiler(cls.func, cfg=cls.cfg.model).codegen
+        )
+        assert isinstance(cls.codegen, CStructuredCodeGenerator)
+
+    def _dirty_statement(self):
+        lhs = Expr.Const(next(self._idx), 1, 64)
+        rhs = Expr.Const(next(self._idx), 2, 64)
+        operand = Expr.BinaryOp(next(self._idx), "Add", [lhs, rhs], False, bits=64)
+        dirty = Expr.DirtyExpression(next(self._idx), "amd64g_dirtyhelper_test", [operand], bits=0)
+        return self.codegen._handle(Stmt.DirtyStatement(next(self._idx), dirty), is_expr=False)
+
+    def test_operands_are_rendered_as_c_expressions(self):
+        assert self._dirty_statement().c_repr() == "amd64g_dirtyhelper_test(1 + 2);\n"
+
+    def test_operands_survive_codegen_serialization(self):
+        statement = self._dirty_statement()
+        cfunc = self.codegen.cfunc
+        assert cfunc is not None
+        statements = cfunc.statements.statements
+        statements.append(statement)
+        try:
+            blob = self.codegen.serialize()
+        finally:
+            assert statements.pop() is statement
+
+        parsed = CStructuredCodeGenerator.parse(blob, project=self.proj, kb=self.proj.kb, func=self.func)
+        assert parsed.cfunc.statements.statements[-1].c_repr() == "amd64g_dirtyhelper_test(1 + 2);\n"
+
+    def test_legacy_serialization_preserves_raw_operands(self):
+        statement = self._dirty_statement()
+        cfunc = self.codegen.cfunc
+        assert cfunc is not None
+        statements = cfunc.statements.statements
+        statements.append(statement)
+        try:
+            msg = self.codegen.serialize_to_cmessage()
+        finally:
+            assert statements.pop() is statement
+
+        dirty_nodes = [node for node in msg.nodes if node.HasField("cdirty_expr") and node.cdirty_expr.operands_ids]
+        assert len(dirty_nodes) == 1
+        dirty_nodes[0].cdirty_expr.ClearField("operands_ids")
+        parsed = CStructuredCodeGenerator.parse_from_cmessage(msg, project=self.proj, kb=self.proj.kb, func=self.func)
+        assert parsed.cfunc is not None
+        assert parsed.cfunc.statements.statements[-1].c_repr() == "amd64g_dirtyhelper_test((1<64> Add 2<64>));\n"
+        parsed.regenerate_text()
+        assert parsed.text is not None
+        assert "amd64g_dirtyhelper_test((1<64> Add 2<64>));" in parsed.text
+
+    def test_invalid_intrinsic_does_not_lower_operands(self):
+        operand = Expr.Phi(next(self._idx), 64, [])
+        dirty = Expr.DirtyExpression(next(self._idx), "not-a-c-identifier", [operand], bits=0)
+        statement = self.codegen._handle(Stmt.DirtyStatement(next(self._idx), dirty), is_expr=False)
+        assert statement.c_repr() == "/* unsupported instruction */;\n"
 
 
 class TestGotoRendering(unittest.TestCase):
@@ -443,6 +539,133 @@ class TestMultiRegisterReturnEndToEnd(unittest.TestCase):
         # decoderune's error path is Go's `return RuneError, 1`, so rax holds 0xfffd and rbx the size.
         # rbx is the second location, which is the high half, so it is the first operand.
         assert "return CONCAT(a2 + 1, 0xfffd);" in text, text
+
+
+class TestStoreRendering(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.codegen = _make_codegen()
+
+    def test_mismatched_store_cast_distinguishes_pointer_from_storage(self):
+        manager = Manager()
+        addr = Expr.VirtualVariable(
+            manager.next_atom(), 1, self.codegen.project.arch.bits, VirtualVariableCategory.REGISTER
+        )
+        data = Expr.Const(manager.next_atom(), 0x11223344, 32)
+        pointer_store = Stmt.Store(
+            manager.next_atom(), addr, data, 4, self.codegen.project.arch.memory_endness, ins_addr=0x401000
+        )
+        direct_store = Stmt.Store(
+            manager.next_atom(), addr, data, 4, self.codegen.project.arch.memory_endness, ins_addr=0x401004
+        )
+        addr_variable = SimRegisterVariable(0x28, self.codegen.project.arch.bytes, ident="ir_test", name="iter")
+        storage_variable = SimStackVariable(-0x10, 4, ident="is_test", name="storage")
+        variable_map = VariableMap()
+        variable_map.set_variable(addr, addr_variable)
+        variable_map.set_variable(direct_store, storage_variable)
+
+        variable_manager = self.codegen.kb.dec_variables[self.codegen._func.addr]
+        variable_manager.set_unified_variable(addr_variable, addr_variable)
+        variable_manager.set_unified_variable(storage_variable, storage_variable)
+        variable_manager.set_variable_type(
+            addr_variable, SimTypePointer(SimTypeChar()).with_arch(self.codegen.project.arch)
+        )
+        variable_manager.set_variable_type(storage_variable, SimTypeChar().with_arch(self.codegen.project.arch))
+        old_variable_map = self.codegen._variable_map
+        self.codegen._variable_map = variable_map
+        try:
+            pointer_rendered = self.codegen._handle(pointer_store, is_expr=False).c_repr()
+            direct_rendered = self.codegen._handle(direct_store, is_expr=False).c_repr()
+        finally:
+            self.codegen._variable_map = old_variable_map
+
+        assert direct_rendered == "*((unsigned int *)&storage) = 287454020;\n"
+        assert pointer_rendered == "*((unsigned int *)iter) = 287454020;\n"
+
+
+class TestConditionalJumpTargetIdentity(unittest.TestCase):
+    def setUp(self):
+        self.stmt = Stmt.ConditionalJump(
+            0,
+            Expr.Const(1, 1, 1),
+            Expr.Const(2, 0x2000, 64),
+            Expr.Const(3, 0x2000, 64),
+            true_target_idx=4,
+            false_target_idx=5,
+        )
+
+    def test_jump_target_collector_preserves_branch_indices(self):
+        block = Block(0x1000, 4, statements=[self.stmt], idx=3)
+
+        self.assertEqual(JumpTargetCollector(block).jump_targets, {(0x2000, 4), (0x2000, 5)})
+
+    def test_redundant_labels_retarget_conditional_address_and_idx(self):
+        head = Block(
+            0x2000,
+            4,
+            statements=[Stmt.Label(10, "LABEL_2000__1", ins_addr=0x2000, block_idx=1)],
+            idx=1,
+        )
+        indexed = Block(
+            0x3000,
+            4,
+            statements=[Stmt.Label(11, "LABEL_3000__2", ins_addr=0x3000, block_idx=2)],
+            idx=2,
+        )
+        unindexed = Block(
+            0x3000,
+            4,
+            statements=[Stmt.Label(12, "LABEL_3000", ins_addr=0x3000, block_idx=None)],
+            idx=None,
+        )
+        source = Block(
+            0x1000,
+            4,
+            statements=[
+                Stmt.ConditionalJump(
+                    13,
+                    Expr.Const(4, 1, 1),
+                    Expr.Const(5, 0x3000, 64),
+                    Expr.Const(6, 0x3000, 64),
+                    true_target_idx=2,
+                    false_target_idx=None,
+                )
+            ],
+            idx=0,
+        )
+        sequence = SequenceNode(0x2000, [head, indexed, unindexed, source])
+
+        RedundantLabelRemover(sequence, {(0x3000, 2), (0x3000, None)})
+
+        updated = cast(Any, source.statements[0])
+        self.assertEqual((updated.true_target.value, updated.true_target_idx), (0x2000, 1))
+        self.assertEqual((updated.false_target.value, updated.false_target_idx), (0x2000, 1))
+        self.assertEqual(JumpTargetCollector(source).jump_targets, {(0x2000, 1)})
+
+        c_handler = cast(Any, CStructuredCodeGenerator._handle_Stmt_ConditionalJump)
+        rendered = c_handler(_ConditionalJumpCodegenHarness(), updated)
+        self.assertEqual(rendered.condition_and_nodes[0][1].target_idx, 1)
+        self.assertEqual(rendered.else_node.target_idx, 1)
+
+    def test_c_codegen_preserves_branch_indices(self):
+        handler = cast(Any, CStructuredCodeGenerator._handle_Stmt_ConditionalJump)
+        result = handler(_ConditionalJumpCodegenHarness(), self.stmt)
+
+        true_goto = result.condition_and_nodes[0][1]
+        self.assertIsInstance(true_goto, CGoto)
+        self.assertIsInstance(result.else_node, CGoto)
+        self.assertEqual(true_goto.target_idx, 4)
+        self.assertEqual(result.else_node.target_idx, 5)
+
+    def test_rust_codegen_preserves_branch_indices(self):
+        handler = cast(Any, RustStructuredCodeGenerator._handle_Stmt_ConditionalJump)
+        result = handler(_ConditionalJumpCodegenHarness(), self.stmt)
+
+        true_goto = result.condition_and_nodes[0][1]
+        self.assertIsInstance(true_goto, RustGoto)
+        self.assertIsInstance(result.else_node, RustGoto)
+        self.assertEqual(true_goto.target_idx, 4)
+        self.assertEqual(result.else_node.target_idx, 5)
 
 
 if __name__ == "__main__":
