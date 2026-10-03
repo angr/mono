@@ -605,6 +605,8 @@ def to_ail_supergraph(transition_graph: networkx.DiGraph, allow_fake=False) -> n
             # already merged away or removed
             continue
         for dst in list(transition_graph.successors(src)):
+            if src is dst:
+                continue
             type_ = transition_graph.edges[src, dst].get("type", None)
 
             if transition_graph.out_degree(src) == 1 and transition_graph.in_degree(dst) == 1:
@@ -1032,11 +1034,13 @@ def peephole_optimize_expr(expr: ailment.Expression, expr_opts: list[PeepholeOpt
 
 def copy_graph(graph: networkx.DiGraph[Block]) -> networkx.DiGraph[Block]:
     """
-    Copy AIL Graph.
+    Copy an AIL graph, including its graph, node, and edge attributes. Blocks and their statement lists are copied;
+    attribute values retain NetworkX's shallow-copy semantics.
 
-    :return: A copy of the AIl graph.
+    :return: A copy of the AIL graph.
     """
     graph_copy = networkx.DiGraph()
+    graph_copy.graph.update(graph.graph)
     block_mapping = {}
     # copy all blocks
     for block in graph.nodes():
@@ -1044,7 +1048,7 @@ def copy_graph(graph: networkx.DiGraph[Block]) -> networkx.DiGraph[Block]:
         new_stmts = copy.copy(block.statements)
         new_block.statements = new_stmts
         block_mapping[block] = new_block
-        graph_copy.add_node(new_block)
+        graph_copy.add_node(new_block, **graph.nodes[block])
 
     # copy all edges
     for src, dst, data in graph.edges(data=True):

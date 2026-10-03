@@ -831,7 +831,12 @@ class SimCC:
             return None
         ty_size = ty.size if ty.size is not None else self.RETURN_VAL.size * self.arch.byte_width
         if ty_size > self.RETURN_VAL.size * self.arch.byte_width:
-            assert self.OVERFLOW_RETURN_VAL is not None
+            if self.OVERFLOW_RETURN_VAL is None:
+                raise AngrTypeError(
+                    f"{self} returns {ty} in {self.RETURN_VAL}, which holds "
+                    f"{self.RETURN_VAL.size * self.arch.byte_width} of its {ty_size} bits, and declares no "
+                    "OVERFLOW_RETURN_VAL. Consider overriding return_val to implement its ABI logic"
+                )
             return SimComboArg([self.RETURN_VAL, self.OVERFLOW_RETURN_VAL])
         return self.RETURN_VAL.refine(size=ty_size // self.arch.byte_width, arch=self.arch, is_fp=False)
 
@@ -1301,7 +1306,7 @@ class SimCC:
             # this is a PCode SimCC where cls.ARCH is directly callable
             stack_arg_size = cls.ARCH().bytes  # type: ignore
         else:
-            stack_arg_size = cls.ARCH(archinfo.Endness.LE).bytes
+            stack_arg_size = cls.ARCH(cls.ARCH.default_endness).bytes
         stack_args = [a for a in args if isinstance(a, SimStackArg)]
         stack_arg_count = (max(a.stack_offset for a in stack_args) // stack_arg_size + 1) if stack_args else 0
         return min(limit, max(len(args), stack_arg_count))
@@ -1625,7 +1630,7 @@ class SimCCMicrosoftAMD64(SimCC):
     def return_in_implicit_outparam(self, ty):
         if isinstance(ty, TypeRef):
             ty = ty.type
-        if isinstance(ty, (SimTypeBottom, SimTypeRef, SimTypeFloat)):
+        if ty is None or isinstance(ty, (SimTypeBottom, SimTypeRef, SimTypeFloat)):
             return False
         size = ty.size
         return size is not None and size > self.STRUCT_RETURN_THRESHOLD

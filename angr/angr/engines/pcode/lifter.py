@@ -15,11 +15,12 @@ import cle
 import pypcode
 from archinfo import ArchARM, ArchPcode
 from cachetools import LRUCache
+from pyvex.const import vex_int_class
 
 # FIXME: Reusing these errors from pyvex for compatibility. Eventually these
 # should be refactored to use common error classes.
 from pyvex.errors import LiftingException, PyVEXError, SkipStatementsError
-from pyvex.expr import U8, U16, U32, U64, Const, IRExpr
+from pyvex.expr import Const, IRExpr
 
 from angr import sim_options as o
 from angr.block import DisassemblerBlock, DisassemblerInsn
@@ -474,7 +475,7 @@ class IRSB:
         # pylint: disable=unused-argument
         self._statements = statements if statements is not None else []
         if isinstance(nxt, int):
-            const_cls = {8: U8, 16: U16, 32: U32, 64: U64}[self.arch.bits]
+            const_cls = vex_int_class(self.arch.bits)
             self.next = Const(const_cls(nxt))
         else:
             self.next = nxt
@@ -816,7 +817,7 @@ def lift(
             # We have no more bytes left. Mark the jumpkind of the IRSB as Ijk_Boring
             if final_irsb.size > 0 and final_irsb.jumpkind == "Ijk_NoDecode":
                 final_irsb.jumpkind = "Ijk_Boring"
-                const_cls = {8: U8, 16: U16, 32: U32, 64: U64}[arch.bits]
+                const_cls = vex_int_class(arch.bits)
                 final_irsb.next = Const(const_cls(final_irsb.addr + final_irsb.size))
 
     return final_irsb
@@ -852,6 +853,24 @@ class PcodeBasicBlockLifter:
 
         self.context = pypcode.Context(langid)
         self.behaviors = BehaviorFactory()
+
+    @staticmethod
+    def _drop_incomplete_instruction(ops: list[PcodeOp], end_addr: int) -> list[PcodeOp]:
+        """
+        Drop the trailing instruction, if there is one, that Sleigh decoded past the end of the data.
+
+        Sleigh reads ahead at every instruction boundary and pypcode's load image zero-fills the part of such
+        a read it cannot satisfy, so a translation may end in an instruction decoded from bytes that were
+        never given to the lifter. A block covers only the bytes it was handed.
+
+        :param ops:         The p-code ops of one translation, in order.
+        :param end_addr:    The address one past the last byte given to Sleigh.
+        :return:            The ops up to and including the last instruction that fits.
+        """
+        for op_idx, op in enumerate(ops):
+            if op.opcode == pypcode.OpCode.IMARK and op.inputs[-1].offset + op.inputs[-1].size > end_addr:
+                return ops[:op_idx]
+        return ops
 
     def lift(
         self,
@@ -909,7 +928,7 @@ class PcodeBasicBlockLifter:
                 max_bytes=max_bytes,
                 flags=pypcode.TranslateFlags.BB_TERMINATING,
             )
-            irsb._ops = translation.ops
+            irsb._ops = self._drop_incomplete_instruction(translation.ops, irsb.addr + len(sliced_data))
 
             last_decode_addr = irsb.addr
             last_imark_idx = 0
@@ -945,19 +964,22 @@ class PcodeBasicBlockLifter:
                 elif op.opcode == pypcode.OpCode.RETURN and next_block is None:
                     next_block = (None, "Ijk_Ret")
 
-            # FIXME: Do this lazily
-            disasm = self.context.disassemble(
-                sliced_data,
-                irsb.addr,
-                max_instructions=max_inst,
-                max_bytes=fallthru_addr - irsb.addr,
-            )
-            irsb._disassembly = PcodeDisassemblerBlock(
-                addr=irsb.addr,
-                insns=[PcodeDisassemblerInsn(ins) for ins in disasm.instructions],
-                thumb=False,
-                arch=irsb.arch,
-            )
+            # pypcode reads max_bytes=0 as "no limit" rather than as an empty request, so only ask for a
+            # disassembly once something has decoded.
+            if fallthru_addr > irsb.addr:
+                # FIXME: Do this lazily
+                disasm = self.context.disassemble(
+                    sliced_data,
+                    irsb.addr,
+                    max_instructions=max_inst,
+                    max_bytes=fallthru_addr - irsb.addr,
+                )
+                irsb._disassembly = PcodeDisassemblerBlock(
+                    addr=irsb.addr,
+                    insns=[PcodeDisassemblerInsn(ins) for ins in disasm.instructions],
+                    thumb=False,
+                    arch=irsb.arch,
+                )
 
         except (pypcode.BadDataError, pypcode.UnimplError):
             next_block = (fallthru_addr, "Ijk_NoDecode")
@@ -971,7 +993,7 @@ class PcodeBasicBlockLifter:
             next_block = (fallthru_addr, "Ijk_Boring")
 
         irsb._size = fallthru_addr - irsb.addr
-        const_cls = {8: U8, 16: U16, 32: U32, 64: U64}[irsb.arch.bits]
+        const_cls = vex_int_class(irsb.arch.bits)
         irsb.next = Const(const_cls(next_block[0])) if next_block[0] is not None else None
         irsb.jumpkind = next_block[1]
 

@@ -14,6 +14,7 @@ from angr import Project, calling_conventions, load_shellcode, types
 from angr.calling_conventions import (
     SimArrayArg,
     SimCC,
+    SimCCAArch64,
     SimCCCdecl,
     SimCCMicrosoftAMD64,
     SimCCMicrosoftCdecl,
@@ -519,6 +520,46 @@ class TestCallingConvention(TestCase):
             [SimRegArg("edx", 4)],
             [SimStackArg(0x4, 4)],
         ]
+
+    def test_simcc_arg_locs_returnty_none(self):
+        # SimTypeFunction documents returnty=None as void, and SimCC.arg_session accepts it. Rust
+        # decompilation produces such prototypes: when arg0 is a return buffer the return type moves
+        # into arg0 as a reference and returnty is left None. return_in_implicit_outparam must answer
+        # False for it rather than reaching for its size.
+        func_proto = SimTypeFunction([SimTypeInt(), SimTypeInt()], None)
+
+        arch = archinfo.ArchAMD64()
+        cc = SimCCMicrosoftAMD64(arch)
+        assert cc.return_in_implicit_outparam(None) is False
+
+        reg_names = []
+        for loc in cc.arg_locs(func_proto.with_arch(arch)):
+            assert isinstance(loc, SimRegArg)
+            reg_names.append(loc.reg_name)
+        assert reg_names == ["rcx", "rdx"]
+
+        for arch_cls in [archinfo.ArchAMD64, archinfo.ArchX86, archinfo.ArchARM]:
+            proto = func_proto.with_arch(arch_cls())
+            cc_cls = default_cc(arch_cls.name)
+            assert cc_cls is not None
+            arch_cc = cc_cls(arch_cls())
+
+            # It should not raise any exception!
+            arg_locs = list(arch_cc.arg_locs(proto))
+            assert len(arg_locs) == 2
+
+    def test_return_too_wide_for_one_register_names_the_convention(self):
+        # A return type wider than RETURN_VAL used to hit `assert self.OVERFLOW_RETURN_VAL is not None`,
+        # so a convention that declares no second return register failed with an AssertionError carrying
+        # no message at all -- and under python -O, with the assert gone, with an AttributeError from
+        # SimComboArg.__init__ summing the size of a None.
+        arch = archinfo.arch_from_id("aarch64")
+        cc = SimCCAArch64(arch)
+        with self.assertRaises(AngrTypeError) as caught:
+            cc.return_val(SimTypeNum(128).with_arch(arch))
+        message = str(caught.exception)
+        assert "SimCCAArch64" in message
+        assert "OVERFLOW_RETURN_VAL" in message
 
 
 if __name__ == "__main__":
