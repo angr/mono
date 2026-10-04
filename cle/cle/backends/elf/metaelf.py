@@ -38,7 +38,13 @@ def _get_relro(elf):
     # checksec.sh v1.5 (https://www.trapkit.de/tools/checksec/):
     #   - Partial RELRO has a 'GNU_RELRO' segment
     #   - Full RELRO also has a 'BIND_NOW' flag in the dynamic section
-    if not any(seg.header.p_type == "PT_GNU_RELRO" for seg in elf.iter_segments()):
+
+    # Ask the program headers directly: iter_segments() builds a DynamicSegment for PT_DYNAMIC, and building
+    # one walks the whole section table, so a section CLE has no use for here can fail the load.
+    if not any(
+        elf._get_segment_header(i)["p_type"] == "PT_GNU_RELRO"  # pylint: disable=protected-access
+        for i in range(elf.num_segments())
+    ):
         return Relro.NONE
     dyn_sec = elf.get_section_by_name(".dynamic")
     if dyn_sec is None or not isinstance(dyn_sec, DynamicSection):
@@ -440,7 +446,9 @@ class MetaELF(Backend):
         Get initial rtoc value for PowerPC64 architecture.
         """
         if self.is_ppc64_abiv1:
-            return self._ppc64_abiv1_initial_rtoc
+            if self._ppc64_abiv1_initial_rtoc is None:
+                return None
+            return AT.from_lva(self._ppc64_abiv1_initial_rtoc, self).to_mva()
         elif self.is_ppc64_abiv2:
             return self._ppc64_abiv2_get_initial_rtoc()
         else:
