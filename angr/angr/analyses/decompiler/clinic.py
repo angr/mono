@@ -135,7 +135,7 @@ if TYPE_CHECKING:
 l = logging.getLogger(name=__name__)
 
 
-BlockCache = namedtuple("BlockCache", ("rd", "prop"))
+BlockCache = namedtuple("BlockCache", ("prop",))
 
 
 def _pick_var(candidates: set[SimVariable]) -> SimVariable:
@@ -2071,6 +2071,9 @@ class Clinic(Analysis, Serializable):
             for slot_name, target in slots:
                 if not isinstance(target, ailment.Const) or not self.kb.functions.contains_addr(target.value):
                     continue
+                if target.value == self.function.addr:
+                    # a jump back to the current function is a loop back edge, not a call to other functions
+                    continue
 
                 target_func = self.kb.functions.get_by_addr(target.value)
 
@@ -2360,14 +2363,13 @@ class Clinic(Analysis, Serializable):
         :return:                        A simplified AIL block.
         """
 
-        cached_rd, cached_prop = None, None
+        cached_prop = None
         cache_item = None
         cache_key = ail_block.addr, ail_block.idx
         if cache:
             cache_item = cache.get(cache_key, None)
             if cache_item:
                 # cache hit
-                cached_rd = cache_item.rd
                 cached_prop = cache_item.prop
 
         simp = BlockSimplifier(
@@ -2376,7 +2378,6 @@ class Clinic(Analysis, Serializable):
             self._ail_manager,
             self.function.addr,
             stack_pointer_tracker=stack_pointer_tracker,
-            cached_reaching_definitions=cached_rd,
             cached_propagator=cached_prop,
             preserve_vvar_ids=preserve_vvar_ids,
             type_hints=type_hints,
@@ -2386,7 +2387,7 @@ class Clinic(Analysis, Serializable):
         if cache is not None:
             if cache_item:
                 del cache[cache_key]
-            cache[cache_key] = BlockCache(simp._reaching_definitions, simp._propagator)
+            cache[cache_key] = BlockCache(simp._propagator)
         return simp.result_block
 
     @timethis

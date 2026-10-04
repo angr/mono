@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "0c9553751f7dad862daa966862d4960ff86a8c86",
-      "committed_at": "2026-10-02T16:46:17-07:00",
-      "subject": "Update coverage to use llvm-23 (#7344)",
+      "commit": "827438beeb9f32004a297b1c28d64213c245ceb0",
+      "committed_at": "2026-10-04T02:26:18-07:00",
+      "subject": "AILSimplifier: Some quick performance improvements. (#7360)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -119,7 +119,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-03T20:51:34+00:00",
+  "imported_at": "2026-10-04T20:56:35+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
