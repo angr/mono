@@ -77,6 +77,12 @@ class Ssailification(Analysis):  # pylint:disable=abstract-method
 
         bp_as_gpr = self._function.info.get("bp_as_gpr", False)
 
+        df = DominanceFrontier(self._function, func_graph=ail_graph, entry=self._entry)
+        frontiers = df.frontiers
+        frontier_blocks: set[tuple[int, int | None]] = {
+            (b.addr, b.idx) for blocks in frontiers.values() for b in blocks
+        }
+
         # collect defs
         traversal = TraversalAnalysis(
             self.project,
@@ -90,6 +96,7 @@ class Ssailification(Analysis):  # pylint:disable=abstract-method
             self.kb.functions.get,
             variable_map=variable_map_of(self._ail_manager) if self._ail_manager is not None else None,
             ail_manager=self._ail_manager,
+            start_state_blocks=frontier_blocks,
         )
 
         # calculate virtual variables and phi nodes
@@ -114,10 +121,6 @@ class Ssailification(Analysis):  # pylint:disable=abstract-method
                 blockkey = (definfo.loc.addr, definfo.loc.block_idx)
                 def_to_udef[def_] = udef
                 udef_to_blockkeys[udef].add(blockkey)
-
-        # Computer the dominance frontier for each node in the graph
-        df = DominanceFrontier(self._function, func_graph=ail_graph, entry=self._entry)
-        frontiers = df.frontiers
 
         phi_id_ctr = count(vvar_id_start)
 
@@ -146,8 +149,16 @@ class Ssailification(Analysis):  # pylint:disable=abstract-method
                         # print('passed up phi for', udef, 'at', block, '(1)')
                         continue
                     ranges = set()
-                    for suboffset in range(udef[1], udef[1] + udef[2]):
-                        for def2 in defmap.get(suboffset, ()):
+                    if udef[0] == "stack":
+                        overlapping_defs = (
+                            d for _, _, d in state.stackvar_defs.overlapping(udef[1], udef[1] + udef[2])
+                        )
+                    else:
+                        overlapping_defs = (
+                            state.register_defs.get(suboffset, ()) for suboffset in range(udef[1], udef[1] + udef[2])
+                        )
+                    for defs2 in overlapping_defs:
+                        for def2 in defs2:
                             definfo2 = traversal.def_info[def2]
                             ranges.add((definfo2.variable_offset, definfo2.variable_size))
                     for def2 in defs:

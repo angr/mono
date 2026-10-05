@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "827438beeb9f32004a297b1c28d64213c245ceb0",
-      "committed_at": "2026-10-04T02:26:18-07:00",
-      "subject": "AILSimplifier: Some quick performance improvements. (#7360)",
+      "commit": "be995f52ee38a055d0f96d04f3e4d02192a3d743",
+      "committed_at": "2026-10-05T13:08:15-07:00",
+      "subject": "Clinic: Serialize addresses as unsigned (#7379)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "2f466c243cf1f0e677d2c17870a7bc71c9ca8773",
-      "committed_at": "2026-10-01T10:07:27-07:00",
-      "subject": "Optimize time taken by some recent test cases. (#1742)",
+      "commit": "53a888d51366f7e00a54ba88285060fe9b6f60fe",
+      "committed_at": "2026-10-05T12:08:06-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#1743)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -48,9 +48,9 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "d74d9a04735af406f8fcdf183415ebcfdfbe705b",
-      "committed_at": "2026-09-30T11:13:38Z",
-      "subject": "Update version to 10.0.2.dev0 [ci skip]",
+      "commit": "420b45ede562e8db46ad8898acb924e6f24c8d32",
+      "committed_at": "2026-10-05T12:08:19-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#390)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -64,9 +64,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "997d4322678fe5876d9f83e0dd34e1052813b9db",
-      "committed_at": "2026-09-30T11:13:43Z",
-      "subject": "Update version to 10.0.2.dev0 [ci skip]",
+      "commit": "80dadfe13f878582046ed26e0e2507668d50f616",
+      "committed_at": "2026-10-05T12:41:48-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#861)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -91,17 +91,17 @@
     },
     "pysoot": {
       "upstream": "https://github.com/angr/pysoot",
-      "commit": "87f398f71e7256542d826c4153c828377e25c822",
-      "committed_at": "2026-09-28T11:25:06-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#61)",
+      "commit": "6ab9df57c3001eb5324571ffeac9554dfd9b11c1",
+      "committed_at": "2026-10-05T12:07:46-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#62)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "fc5b30d2ebe0d1478b75fb9d11c253c4d370b2c0",
-      "committed_at": "2026-09-30T11:13:44Z",
-      "subject": "Update version to 10.0.2.dev0 [ci skip]",
+      "commit": "08ef1010ef83fe3058350fed57b45020d4e57567",
+      "committed_at": "2026-10-05T12:07:40-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#591)",
       "excluded": [
         ".gitmodules"
       ],
@@ -119,13 +119,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-04T20:56:35+00:00",
+  "imported_at": "2026-10-05T20:55:22+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "9eb02bd1032e1d96e729df2739f9a10a337bd154",
-      "committed_at": "2026-09-30T11:13:40Z",
-      "subject": "Update version to 10.0.2.dev0 [ci skip]",
+      "commit": "6ac63bf4e32db7067538d44754dbb91771437e09",
+      "committed_at": "2026-10-05T20:15:44Z",
+      "subject": "Go pclntab layout binaries: langdetect_go and basics built with go1.4.3, go1.9.7, go1.10.8, go1.15.15 and go1.16.15.",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }

@@ -6,8 +6,11 @@
 #   tests/x86_64/go/<goversion>/<prog>_N          -gcflags='all=-N -l'       (no inlining, no optimization)
 #   tests/x86_64/go/<goversion>/<prog>_stripped   -gcflags=all=-l -ldflags='-s -w' (symbols only via pclntab)
 #   tests/aarch64/go/<goversion>/<prog>[_stripped] arm64 builds of ARM64_PROGS (default: basics)
+#   tests/<arch>/go/go1.27.1/<prog>...               GO127_PROGS (need go1.23+ APIs): amd64 (three builds), arm64, 386
 #   tests/x86_64/go/go1.27.1/<prog>_inlined        default inlining (INLINED_PROGS; shapes that need it)
 #   tests/i386/go/go1.27.1/<prog>                  386 builds of I386_PROGS, -gcflags=all=-l
+#   tests/x86_64/go/<goversion>/basics[_stripped]  LEGACY_VERSIONS (pre-1.17 pclntab layouts: go1.4.3,
+#                                                  go1.9.7, go1.10.8, go1.15.15, go1.16.15), amd64 only
 #
 # Requirements: one Go toolchain per version in $GO_SDK_DIR/<goversion>/bin/go
 # (https://go.dev/dl/<goversion>.linux-amd64.tar.gz).
@@ -26,10 +29,15 @@ PROGS=${PROGS:-"basics builtins conc iface maps swap"}
 
 # arm64 builds (optimized + stripped only) of the programs in ARM64_PROGS land under tests/aarch64/go/<goversion>/
 ARM64_PROGS=${ARM64_PROGS:-"basics"}
+# programs that need go1.23+ APIs (sync/atomic And/Or), built with go1.27.1 only
+GO127_PROGS=${GO127_PROGS:-"atomics typeswitch"}
 # programs whose shape only appears with the inliner on (one optimized amd64 build, go1.27.1 only)
 INLINED_PROGS=${INLINED_PROGS:-"uninit"}
 # 386 builds (one optimized build, go1.27.1 only)
 I386_PROGS=${I386_PROGS:-"recv"}
+# toolchains with older pclntab layouts: basics only, optimized and stripped; the empty default keeps
+# a plain ./build.sh from needing them
+LEGACY_VERSIONS=${LEGACY_VERSIONS:-""}
 
 export CGO_ENABLED=0 GOOS=linux GOFLAGS=-trimpath
 
@@ -58,9 +66,35 @@ for prog in $INLINED_PROGS; do
     GOARCH=amd64 "$GO" build -o "$out/${prog}_inlined" "$prog.go"
     echo "built $prog (inlined) with go1.27.1"
 done
+for prog in $GO127_PROGS; do
+    out="$ROOT/tests/x86_64/go/go1.27.1"
+    GOARCH=amd64 "$GO" build -gcflags=all=-l -o "$out/$prog" "$prog.go"
+    GOARCH=amd64 "$GO" build -gcflags='all=-N -l' -o "$out/${prog}_N" "$prog.go"
+    GOARCH=amd64 "$GO" build -gcflags=all=-l -ldflags='-s -w' -o "$out/${prog}_stripped" "$prog.go"
+    out="$ROOT/tests/aarch64/go/go1.27.1"
+    GOARCH=arm64 "$GO" build -gcflags=all=-l -o "$out/$prog" "$prog.go"
+    GOARCH=arm64 "$GO" build -gcflags=all=-l -ldflags='-s -w' -o "$out/${prog}_stripped" "$prog.go"
+    out="$ROOT/tests/i386/go/go1.27.1"
+    mkdir -p "$out"
+    GOARCH=386 "$GO" build -gcflags=all=-l -o "$out/$prog" "$prog.go"
+    echo "built $prog (amd64, arm64, 386) with go1.27.1"
+done
 out="$ROOT/tests/i386/go/go1.27.1"
 mkdir -p "$out"
 for prog in $I386_PROGS; do
     GOARCH=386 "$GO" build -gcflags=all=-l -o "$out/$prog" "$prog.go"
     echo "built $prog (386) with go1.27.1"
+done
+
+# -trimpath only exists from go1.13, so the older builds carry the build directory in their file
+# names; the all= pattern in -gcflags from go1.10; go1.4 needs GOROOT to find itself.
+for ver in $LEGACY_VERSIONS; do
+    GO="$GO_SDK_DIR/$ver/bin/go"
+    out="$ROOT/tests/x86_64/go/$ver"
+    mkdir -p "$out"
+    minor=${ver#go1.}; minor=${minor%%.*}
+    if [ "$minor" -ge 10 ]; then gcflags="all=-l"; else gcflags="-l"; fi
+    GOROOT="$GO_SDK_DIR/$ver" GOARCH=amd64 GOFLAGS= "$GO" build -gcflags=$gcflags -o "$out/basics" basics.go
+    GOROOT="$GO_SDK_DIR/$ver" GOARCH=amd64 GOFLAGS= "$GO" build -gcflags=$gcflags -ldflags='-s -w' -o "$out/basics_stripped" basics.go
+    echo "built basics (legacy) with $ver"
 done

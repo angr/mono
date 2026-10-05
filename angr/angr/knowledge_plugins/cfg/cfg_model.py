@@ -229,27 +229,30 @@ class CFGModel(Serializable):
             cmsg.nodes.extend(nodes)
 
         # edges
-        # When the graph supports spilling, iterate the underlying adjacency at the key level so that no
-        # endpoint node is created.
-        edge_iter = (
-            ((key_to_addr[s], key_to_addr[d], data) for s, d, data in self.graph._graph.edges(data=True))
-            if spilling
-            else ((src.addr, dst.addr, data) for src, dst, data in self.graph.edges(data=True))
-        )
+        # When the graph supports spilling, iterate the packed store at the key level so that no endpoint node is
+        # created.
+        if spilling:
+            store = self.graph._graph
+            key_of = self.graph._keys.key_of
+            edge_iter = (
+                (key_to_addr[key_of(s)], key_to_addr[key_of(d)], data) for s, d, data in store.edges_with_data()
+            )
+        else:
+            edge_iter = ((src.addr, dst.addr, data) for src, dst, data in self.graph.edges(data=True))
         edges = []
         for src_ea, dst_ea, data in edge_iter:
             edge = primitives_pb2.Edge()  # type:ignore
             edge.src_ea = src_ea
             edge.dst_ea = dst_ea
-            for k, v in data.items():
-                if k == "jumpkind":
-                    jk = cfg_jumpkind_to_pb(v)
-                    edge.jumpkind = primitives_pb2.Edge.UnknownJumpkind if jk is None else jk  # type:ignore
-                elif k == "ins_addr":
-                    edge.ins_addr = v if v is not None else 0xFFFF_FFFF_FFFF_FFFF
-                elif k == "stmt_idx":
-                    edge.stmt_idx = v if v is not None else -1
-                else:
+            # missing attributes are written as None (their sentinels), not as the protobuf default 0
+            jk = cfg_jumpkind_to_pb(data.get("jumpkind"))
+            edge.jumpkind = primitives_pb2.Edge.UnknownJumpkind if jk is None else jk  # type:ignore
+            ins_addr = data.get("ins_addr")
+            edge.ins_addr = ins_addr if ins_addr is not None else 0xFFFF_FFFF_FFFF_FFFF
+            stmt_idx = data.get("stmt_idx")
+            edge.stmt_idx = stmt_idx if stmt_idx is not None else -1
+            for k in data:
+                if k not in ("jumpkind", "ins_addr", "stmt_idx"):
                     l.warning('Unexpected edge data type "%s" found during CFG serialization.', k)
             edges.append(edge)
         cmsg.edges.extend(edges)
@@ -349,27 +352,23 @@ class CFGModel(Serializable):
                 function_addrs_complete = False
         model._node_function_addrs_complete = function_addrs_complete
 
-        # disable adjacency eviction while nodes and edges are inserted; spill down once at the end
-        graph._graph.set_edge_eviction_enabled(False)
-        try:
-            graph.bulk_import_serialized_nodes(items)
-            model._node_addrs = None
+        graph.bulk_import_serialized_nodes(items)
+        model._node_addrs = None
 
-            # edges
-            keys_by_addr = graph._keys_by_addr
-            for edge_pb2 in cmsg.edges:
-                # more than one node at a given address is unsupported, grab the first one
-                src_key = next(iter(keys_by_addr.get(edge_pb2.src_ea, ())))
-                dst_key = next(iter(keys_by_addr.get(edge_pb2.dst_ea, ())))
-                data = {
-                    "jumpkind": cfg_jumpkind_from_pb(edge_pb2.jumpkind),
-                    "ins_addr": edge_pb2.ins_addr if edge_pb2.ins_addr != 0xFFFF_FFFF_FFFF_FFFF else None,
-                    "stmt_idx": edge_pb2.stmt_idx if edge_pb2.stmt_idx != -1 else None,
-                }
-                graph.add_edge_by_key(src_key, dst_key, **data)
-        finally:
-            graph._graph.set_edge_eviction_enabled(True)
-        graph._graph.spill_down_edges()
+        # edges
+        first_key_at_addr = graph.first_key_at_addr
+        for edge_pb2 in cmsg.edges:
+            # more than one node at a given address is unsupported, grab the first one
+            src_key = first_key_at_addr(edge_pb2.src_ea)
+            dst_key = first_key_at_addr(edge_pb2.dst_ea)
+            if src_key is None or dst_key is None:
+                raise KeyError(f"CFG edge {edge_pb2.src_ea:#x} -> {edge_pb2.dst_ea:#x} refers to a missing node")
+            data = {
+                "jumpkind": cfg_jumpkind_from_pb(edge_pb2.jumpkind),
+                "ins_addr": edge_pb2.ins_addr if edge_pb2.ins_addr != 0xFFFF_FFFF_FFFF_FFFF else None,
+                "stmt_idx": edge_pb2.stmt_idx if edge_pb2.stmt_idx != -1 else None,
+            }
+            graph.add_edge_by_key(src_key, dst_key, **data)
 
     #
     # Other methods
@@ -397,7 +396,7 @@ class CFGModel(Serializable):
         return model
 
     def _build_node_addr_index(self):
-        self._node_addrs = SortedList(iter(k for k, lst in self.graph._keys_by_addr.items() if lst))
+        self._node_addrs = SortedList(self.graph.node_addrs())
 
     #
     # Node insertion and removal
@@ -1064,19 +1063,12 @@ class CFGModel(Serializable):
 
         pointer_size = self.project.arch.bytes
 
-        # who's using it?
-        irsb_addr, stmt_idx = None, None
-        if xrefs is not None and seg_list is not None:
-            try:
-                ref: XRef = next(iter(xrefs.get_xrefs_by_dst(data_addr)))
-                irsb_addr = ref.block_addr
-            except StopIteration:
-                pass
-        if irsb_addr is not None and isinstance(self.project.loader.main_object, cle.MetaELF):
-            plt_entry = self.project.loader.main_object.reverse_plt.get(irsb_addr, None)
-            if plt_entry is not None:
-                # IRSB is owned by plt!
-                return MemoryDataSort.GOTPLTEntry, pointer_size
+        # who's using it? a GOT slot read by any PLT stub is a GOT PLT entry
+        if xrefs is not None and seg_list is not None and isinstance(self.project.loader.main_object, cle.MetaELF):
+            reverse_plt = self.project.loader.main_object.reverse_plt
+            for ref in xrefs.get_xrefs_by_dst(data_addr):
+                if ref.block_addr is not None and ref.block_addr in reverse_plt:
+                    return MemoryDataSort.GOTPLTEntry, pointer_size
 
         # is it in a section with zero bytes, like .bss?
         obj = self.project.loader.find_object_containing(data_addr)
@@ -1153,12 +1145,10 @@ class CFGModel(Serializable):
         # is it a code reference?
         irsb_addr, stmt_idx = None, None
         if xrefs is not None and seg_list is not None:
-            try:
-                ref: XRef = next(iter(xrefs.get_xrefs_by_dst(data_addr)))
+            ref = self._first_xref(xrefs.get_xrefs_by_dst(data_addr))
+            if ref is not None:
                 irsb_addr = ref.block_addr
                 stmt_idx = ref.stmt_idx
-            except StopIteration:
-                pass
 
             if seg_list.is_occupied(data_addr) and seg_list.occupied_by_sort(data_addr) == "code":
                 # it's a code reference
@@ -1173,6 +1163,20 @@ class CFGModel(Serializable):
                     return sort, size
 
         return None, None
+
+    @staticmethod
+    def _first_xref(refs: set[XRef]) -> XRef | None:
+        # lowest-addressed xref; set iteration order is not a stable choice
+        return min(
+            refs,
+            key=lambda r: (
+                r.ins_addr if r.ins_addr is not None else -1,
+                r.block_addr if r.block_addr is not None else -1,
+                r.stmt_idx if r.stmt_idx is not None else -1,
+                r.type if r.type is not None else -1,
+            ),
+            default=None,
+        )
 
     def _guess_data_type_pointer_array(
         self,
