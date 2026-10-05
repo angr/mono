@@ -831,7 +831,12 @@ class SimCC:
             return None
         ty_size = ty.size if ty.size is not None else self.RETURN_VAL.size * self.arch.byte_width
         if ty_size > self.RETURN_VAL.size * self.arch.byte_width:
-            assert self.OVERFLOW_RETURN_VAL is not None
+            if self.OVERFLOW_RETURN_VAL is None:
+                raise AngrTypeError(
+                    f"{self} returns {ty} in {self.RETURN_VAL}, which holds "
+                    f"{self.RETURN_VAL.size * self.arch.byte_width} of its {ty_size} bits, and declares no "
+                    "OVERFLOW_RETURN_VAL. Consider overriding return_val to implement its ABI logic"
+                )
             return SimComboArg([self.RETURN_VAL, self.OVERFLOW_RETURN_VAL])
         return self.RETURN_VAL.refine(size=ty_size // self.arch.byte_width, arch=self.arch, is_fp=False)
 
@@ -847,6 +852,9 @@ class SimCC:
             arg_type = arg_type.type
         if isinstance(arg_type, (SimTypeArray, SimTypeFixedSizeArray)):  # hack
             arg_type = SimTypePointer(arg_type.elem_type).with_arch(self.arch)
+        if opaque_cpp_class(arg_type):
+            assert arg_type.size is not None
+            arg_type = SimTypeNum(arg_type.size, signed=False)
         if isinstance(arg_type, (SimStruct, SimUnion, SimTypeFixedSizeArray)):
             raise TypeError(
                 f"{self} doesn't know how to store aggregate type {type(arg_type)}. Consider overriding next_arg to "
@@ -1301,7 +1309,7 @@ class SimCC:
             # this is a PCode SimCC where cls.ARCH is directly callable
             stack_arg_size = cls.ARCH().bytes  # type: ignore
         else:
-            stack_arg_size = cls.ARCH(archinfo.Endness.LE).bytes
+            stack_arg_size = cls.ARCH(cls.ARCH.default_endness).bytes
         stack_args = [a for a in args if isinstance(a, SimStackArg)]
         stack_arg_count = (max(a.stack_offset for a in stack_args) // stack_arg_size + 1) if stack_args else 0
         return min(limit, max(len(args), stack_arg_count))
@@ -1625,7 +1633,7 @@ class SimCCMicrosoftAMD64(SimCC):
     def return_in_implicit_outparam(self, ty):
         if isinstance(ty, TypeRef):
             ty = ty.type
-        if isinstance(ty, (SimTypeBottom, SimTypeRef, SimTypeFloat)):
+        if ty is None or isinstance(ty, (SimTypeBottom, SimTypeRef, SimTypeFloat)):
             return False
         size = ty.size
         return size is not None and size > self.STRUCT_RETURN_THRESHOLD
@@ -2376,9 +2384,10 @@ class SimCCARMHF(SimCCARM):
 
 
 class SimCCARMLinuxSyscall(SimCCSyscall):
-    # TODO: Make sure all the information is correct
-    ARG_REGS = ["r0", "r1", "r2", "r3"]
-    FP_ARG_REGS = []  # TODO: ???
+    # The ARM Linux syscall ABI uses r0-r6. Unlike the procedure-call ABI, it
+    # has no stack fallback for additional arguments.
+    ARG_REGS = ["r0", "r1", "r2", "r3", "r4", "r5", "r6"]
+    FP_ARG_REGS = []
     RETURN_ADDR = SimRegArg("ip_at_syscall", 4)
     RETURN_VAL = SimRegArg("r0", 4)
     ARCH = archinfo.ArchARM
@@ -2387,6 +2396,42 @@ class SimCCARMLinuxSyscall(SimCCSyscall):
     def _match(cls, arch, args, sp_delta, unused_hint=None, extra_pop=None):  # pylint: disable=unused-argument
         # never appears anywhere except syscalls
         return False
+
+    def next_arg(self, session: ArgSession, arg_type: SimType) -> SimFunctionArgument:
+        if isinstance(arg_type, TypeRef):
+            arg_type = arg_type.type
+        if isinstance(arg_type, (SimTypeArray, SimTypeFixedSizeArray)):
+            arg_type = SimTypePointer(arg_type.elem_type).with_arch(self.arch)
+        if isinstance(arg_type, (SimStruct, SimUnion, SimTypeFixedSizeArray)):
+            raise TypeError(f"{self} does not support aggregate syscall arguments")
+        if isinstance(arg_type, SimTypeBottom):
+            arg_type = SimTypeInt().with_arch(self.arch)
+
+        assert arg_type.size is not None
+        size = arg_type.size // self.arch.byte_width
+        is_fp = isinstance(arg_type, SimTypeFloat)
+        state = session.getstate()
+
+        try:
+            if size <= self.arch.bytes:
+                return next(session.int_iter).refine(size, is_fp=is_fp, arch=self.arch)
+            if size > 2 * self.arch.bytes:
+                raise ValueError(f"{self} does not support syscall arguments larger than 64 bits")
+
+            # A 64-bit value must start in an even-numbered register. The
+            # skipped odd register is an ABI padding slot, not an argument.
+            if session.int_iter.getstate() % 2 == 1:
+                next(session.int_iter)
+            locations = [next(session.int_iter), next(session.int_iter)]
+        except StopIteration as err:
+            session.setstate(state)
+            raise TypeError("Accessed too many syscall arguments - exhausted r0-r6") from err
+
+        # SimComboArg locations are least-significant first. Big-endian ARM
+        # stores the high word in the lower-numbered register.
+        if self.arch.register_endness == archinfo.Endness.BE:
+            locations.reverse()
+        return SimComboArg(locations, is_fp=is_fp)
 
     @staticmethod
     def syscall_num(state):  # type: ignore
@@ -2842,6 +2887,116 @@ class SimCCN64(SimCC):
     RETURN_ADDR = SimRegArg("ra", 8)
     RETURN_VAL = SimRegArg("v0", 8)
     ARCH = archinfo.ArchMIPS64
+
+    # An argument occupies ceil(size / 8) consecutive 64-bit slots, the first eight of which are
+    # a0-a7 and the rest the stack from the caller's own sp; a type that wants 16-byte alignment
+    # starts on an even slot, and anything else may straddle a7 into the stack. Measured with gcc
+    # 14.3.0 -mabi=64 for mips64el: f(u64 x 3, unsigned __int128) passes the wide value in a4:a5 and
+    # leaves a3 unused, f(u64 x 6, struct {u64 x 3}) straddles a6:a7 into the first stack slot, and
+    # the ninth 64-bit argument of f(u64 x 9) is read at the caller's sp. clang 21.1.8 agrees except
+    # that it does not pad to an even slot. A slot holding one double travels in the floating-point
+    # argument registers instead -- clang reads struct {double a; u64 b;} as f12 and a1 -- which this
+    # convention cannot express while FP_ARG_REGS is empty, so a floating-point member is left to the
+    # base class.
+    def next_arg(self, session, arg_type):
+        if isinstance(arg_type, TypeRef):
+            arg_type = arg_type.type
+        if isinstance(arg_type, (SimTypeArray, SimTypeFixedSizeArray)):  # hack
+            arg_type = SimTypePointer(arg_type.elem_type).with_arch(self.arch)
+        size = self._byte_size(arg_type)
+        if size is None or not self._placeable(arg_type):
+            return super().next_arg(session, arg_type)
+        slot = self.arg_slot_size
+        if not isinstance(arg_type, (SimStruct, SimUnion)) and size <= slot:
+            return super().next_arg(session, arg_type)
+        taken = self._slots_taken(session)
+        if taken is None:
+            return super().next_arg(session, arg_type)
+        if self._wants_even_slot(arg_type) and taken % 2:
+            self._next_slot(session)
+        locations = [self._next_slot(session) for _ in range((size + slot - 1) // slot)]
+        return refine_locs_with_struct_type(self.arch, self._wordsize_locs(locations), arg_type)
+
+    @staticmethod
+    def _next_slot(session: ArgSession) -> SimRegArg | SimStackArg:
+        """
+        The next argument slot: a0-a7 while they last, then the stack.
+        """
+        try:
+            return next(session.int_iter)
+        except StopIteration:
+            return next(session.both_iter)
+
+    def _slots_taken(self, session: ArgSession) -> int | None:
+        """
+        How many slots the session has handed out, counting the registers and the stack as the one
+        sequence the ABI describes -- or None when it is not that sequence. With FP_ARG_REGS empty
+        the base class spends a stack slot on a floating-point argument while a0-a7 are still free,
+        and after that nothing here knows which slot comes next, so the base class's answer is the
+        one to keep.
+        """
+        taken = session.int_iter.getstate()
+        start = self.STACKARG_SP_BUFF + self.STACKARG_SP_DIFF
+        spilled = (session.both_iter.getstate() - start) // self.arg_slot_size
+        if taken < len(self.ARG_REGS):
+            return None if spilled else taken
+        return len(self.ARG_REGS) + spilled
+
+    def _wants_even_slot(self, ty: SimType) -> bool:
+        """
+        Whether the type's alignment is wider than one slot, which is what makes it start on an
+        even-numbered one.
+        """
+        try:
+            alignment = ty.alignment
+        except (AngrTypeError, ValueError):
+            return False
+        return alignment is not NotImplemented and alignment > self.arg_slot_size
+
+    def _placeable(self, ty: SimType) -> bool:
+        """
+        Whether every part of the type has a layout this convention can describe. A floating-point
+        member belongs in the floating-point argument registers, which SimCCN64 does not declare; an
+        array needs a length and a sized element; an aggregate with no members has only a size; and a
+        member with no size gets no entry in SimStruct.offsets, which refine_locs_with_struct_type
+        reads for every field.
+        """
+        if isinstance(ty, SimTypeFloat):
+            return False
+        if isinstance(ty, (SimTypeArray, SimTypeFixedSizeArray)):
+            return ty.length is not None and self._byte_size(ty.elem_type) is not None and self._placeable(ty.elem_type)
+        if isinstance(ty, SimStruct):
+            return bool(ty.fields) and all(
+                self._byte_size(field) is not None and self._placeable(field) for field in ty.fields.values()
+            )
+        if isinstance(ty, SimUnion):
+            return bool(ty.members) and all(
+                self._byte_size(member) is not None and self._placeable(member) for member in ty.members.values()
+            )
+        return True
+
+    def _byte_size(self, ty: SimType) -> int | None:
+        """
+        The type's size in bytes, or None when it has none to lay out. Reading it can raise instead
+        of answering: SimStruct and SimUnion need an arch to size themselves, and a member that
+        cannot size itself propagates.
+        """
+        try:
+            size = ty.size
+        except (AngrTypeError, ValueError):
+            return None
+        return size // self.arch.byte_width if size else None
+
+    def _wordsize_locs(self, locations: list[SimRegArg | SimStackArg]) -> list[SimRegArg | SimStackArg]:
+        """
+        The slots as word-sized locations, which is the contract refine_locs_with_struct_type keeps.
+        An n32 slot is eight bytes wide in a register file archinfo calls thirty-two-bit, so it has
+        to arrive as two words.
+        """
+        width = self.arch.bytes
+        if width == self.arg_slot_size:
+            return locations
+        return [loc.refine(width, offset=offset) for loc in locations for offset in range(0, self.arg_slot_size, width)]
 
 
 SimCCO64 = SimCCN64  # compatibility

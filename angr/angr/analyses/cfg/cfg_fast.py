@@ -21,7 +21,7 @@ from archinfo import Endness
 from archinfo.arch_arm import get_real_address_if_arm, is_arm_arch
 from archinfo.arch_soot import SootAddressDescriptor
 from cle.address_translator import AT
-from sortedcontainers import SortedDict
+from sortedcontainers import SortedDict, SortedSet
 
 import angr
 from angr import claripy
@@ -31,8 +31,10 @@ from angr.analyses.forward_analysis import ForwardAnalysis
 from angr.codenode import FuncNode, HookNode
 from angr.errors import (
     AngrCFGError,
+    AngrError,
     AngrSkipJobNotice,
     SimEngineError,
+    SimError,
     SimIRSBNoDecodeError,
     SimMemoryError,
     SimTranslationError,
@@ -671,6 +673,12 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
     # TODO: Move arch_options to CFGBase, and add those logic to CFGEmulated as well.
 
     PRINTABLES = string.printable.replace("\x0b", "").replace("\x0c", "").encode()
+
+    # How much of a candidate run _repeating_tile_run_length reads before deciding it repeats at all. Long enough
+    # that a periodic window is not a coincidence, short enough that the check costs one small load per block on
+    # everything that is not filler.
+    TILE_PROBE_LENGTH = 64
+
     SPECIAL_THUNKS = {
         "AMD64": {
             bytes.fromhex("E807000000F3900FAEE8EBF9488D642408C3"): ("ret",),
@@ -717,9 +725,10 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         exceptions=True,
         skip_unmapped_addrs=True,
         nodecode_window_size=2048,
-        nodecode_threshold=0.6,
+        nodecode_threshold=0.3,
         nodecode_step=16483,
         repeating_byte_run_threshold=64,
+        repeating_tile_run_threshold=1024,
         check_funcret_max_job=500,
         indirect_calls_always_return: bool | None = None,
         jumptable_resolver_resolves_calls: bool | None = None,
@@ -794,6 +803,14 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                                         0x91 is `xchg ecx, eax` on x86), so linear disassembly would otherwise walk
                                         through them forever. Runs of the architecture's nop byte are exempt because
                                         execution really does flow through them. Set it to 0 to disable the check.
+        :param repeating_tile_run_threshold: The same, for a run of one repeated multi-byte tile (up to four bytes),
+                                        which decodes just as cleanly and is just as certainly filler. It needs a far
+                                        longer run to be sure of than a single repeated byte does, because real code
+                                        repeats a short instruction sequence and padding repeats a multi-byte nop:
+                                        over angr's own corpus of 942 ELF and PE fixtures, 209 MB of executable
+                                        sections, the longest such run is 858 bytes of `66 90` (`xchg ax, ax`)
+                                        alignment padding, so the default is the next power of two above it. Set it
+                                        to 0 to disable the check.
         :param check_funcret_max_job:   When popping return-site jobs out of the job queue, angr will prioritize jobs
                                         for which the callee is known to return. This check may be slow when there are
                                         a large amount of jobs in different caller functions, and this situation often
@@ -889,6 +906,8 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
             if is_dotnet and once("dotnet_native"):
                 l.warning("You're trying to analyze a .NET binary as native code. Are you sure?")
 
+        self._model_was_provided = model is not None
+
         CFGBase.__init__(
             self,
             "fast",
@@ -963,6 +982,7 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         self._nodecode_threshold = nodecode_threshold
         self._nodecode_step = nodecode_step
         self._repeating_byte_run_threshold = repeating_byte_run_threshold
+        self._repeating_tile_run_threshold = repeating_tile_run_threshold
         # a run of the nop byte is transparent -- execution really does flow through it into whatever follows -- so
         # repeating-byte-run detection must leave it alone. other padding bytes are not code, but they are still
         # padding rather than data we failed to recognize.
@@ -1041,6 +1061,9 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         self._eh_frame_boundary_addrs_sorted: list[int] = []
         self._remaining_function_prologue_addrs: list[int] | None = None
         self._used_function_prologue_addrs: set[int] = set()
+        # blocks whose Ijk_NoDecode is an undefined instruction that _generate_cfgnode recognized, and not bytes it
+        # failed to decode
+        self._undefined_instruction_blocks: set[int] = set()
         self._ptr_hints: SortedDict | None = None
         self._processed_eh_prolog3_callsites: set[int] = set()
         self._processed_cxx_frame_handler3_callsites: set[int] = set()
@@ -1291,11 +1314,13 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
             else:
                 inside_region = addr < region_end
             if not inside_region:
+                is_sz = False
                 break
 
             # l.debug("Searching address %x", addr)
             val = self._load_a_byte_as_int(addr)
             if val is None:
+                is_sz = False
                 break
             if val == 0:
                 break
@@ -1337,14 +1362,17 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
             else:
                 inside_region = addr < region_end
             if not inside_region:
+                is_sz = False
                 break
 
             # l.debug("Searching address %x", addr)
             val0 = self._load_a_byte_as_int(addr)
             if val0 is None:
+                is_sz = False
                 break
             val1 = self._load_a_byte_as_int(addr + 1)
             if val1 is None:
+                is_sz = False
                 break
             if val0 == 0 and val1 == 0:
                 break
@@ -1431,6 +1459,52 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
             if matched < len(chunk):
                 break
         return length
+
+    def _repeating_tile_run_length(self, start_addr: int, min_length: int, max_period: int = 4) -> int:
+        """
+        Measure the run of one repeated multi-byte tile that begins at ``start_addr``.
+
+        :meth:`_repeating_byte_run_length` is the same rule for a tile one byte long, and keeps that case: a run
+        whose least period is 1 belongs to it, not here. The two are separate because they cannot share a
+        threshold. 64 bytes of one repeated byte is already conclusive; 64 bytes of a repeated *sequence* is not,
+        because real code repeats a short instruction sequence and alignment padding repeats a multi-byte nop.
+
+        Like :meth:`_repeating_byte_run_length`, this loads memory in bulk and is bounded by the enclosing region.
+
+        :param start_addr:  The address the run has to begin at.
+        :param min_length:  The shortest run that counts, and never shorter than ``TILE_PROBE_LENGTH``:
+                            a window of a few tiles cannot tell a repeat from a coincidence.
+        :param max_period:  The longest tile considered. Past four bytes no length threshold is safe: eight bytes
+                            is two instructions on a four-byte ISA, and the corpus holds 1,024- and 3,200-byte
+                            runs of genuinely repeated instruction pairs on `armel` and `aarch64`.
+        :return:            The length of the run, or 0 if it is shorter than ``min_length``.
+        """
+
+        inside, region_end = self._inside_regions_and_region_end(start_addr)
+        if not inside or region_end is None or region_end - start_addr < min_length:
+            return 0
+
+        head = self._fast_memory_load_bytes(start_addr, self.TILE_PROBE_LENGTH)
+        if head is None or len(head) < self.TILE_PROBE_LENGTH:
+            return 0
+        period = next((p for p in range(1, max_period + 1) if head[p:] == head[:-p]), None)
+        if period is None or period == 1:
+            return 0
+        tile = head[:period]
+
+        length = self.TILE_PROBE_LENGTH
+        while start_addr + length < region_end:
+            chunk = self._fast_memory_load_bytes(start_addr + length, min(0x1000, region_end - start_addr - length))
+            if not chunk:
+                break
+            # the tile continues at the phase the run has reached, not from its first byte
+            expected = (tile * (len(chunk) // period + 2))[length % period :][: len(chunk)]
+            if chunk == expected:
+                length += len(chunk)
+                continue
+            length += next(i for i, (a, b) in enumerate(zip(chunk, expected)) if a != b)
+            break
+        return length if length >= min_length else 0
 
     def _scan_for_fp_constants(self, start_addr: int, threshold: int = 4) -> int:
         """
@@ -1976,6 +2050,16 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         # Call _initialize_cfg() before self.functions is used.
         self._initialize_cfg()
 
+        # A fresh CFG model must not be recovered into function graphs left over from a different model. In
+        # particular, a normalized graph may contain artificial splits of overlapping instruction streams that a
+        # lifter cannot reproduce. Retain function metadata and known starts, but rebuild all structural data from
+        # this model.
+        if not self._model_was_provided:
+            self.functions.callgraph.clear_edges()
+            for function in self.functions.values():
+                function.clear_transition_graph()
+                self.functions.set_func_block_count(function.addr, 0)
+
         # Scan for __x86_return_thunk and friends
         self._known_thunks = self._find_thunks()
 
@@ -2273,16 +2357,23 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
         elif self.project.arch.name == "X86":
             func_block_count = self.kb.functions.get_func_block_count(func_addr)
 
-            # determine if the function is __alloca_probe
-            if func_block_count == 4:
+            # determine if the function is a known Windows stack probe. Match the complete basic-block byte set,
+            # rather than a symbol name, since these helpers are just as important in stripped binaries.
+            if func_block_count in {3, 4}:
                 func = self.kb.functions.get_by_addr(func_addr)  # must exist
                 block_bytes = {func.get_block(block_addr).bytes for block_addr in func.block_addrs_set}
-                if block_bytes == {
+                is_msvc_alloca_probe = block_bytes == {
                     b"-\x00\x10\x00\x00\x85\x00\xeb\xe9",
                     b";\xc8r\n",
                     b"Q\x8dL$\x04+\xc8\x1b\xc0\xf7\xd0#\xc8\x8b\xc4%\x00\xf0\xff\xff;\xc8r\n",
                     b"\x8b\xc1Y\x94\x8b\x00\x89\x04$\xc3",
-                }:
+                }
+                is_mingw_chkstk_ms = block_bytes == {
+                    b"QP=\x00\x10\x00\x00\x8dL$\x0cr\x15",
+                    b"\x81\xe9\x00\x10\x00\x00\x83\t\x00-\x00\x10\x00\x00=\x00\x10\x00\x00w\xeb",
+                    b")\xc1\x83\t\x00XY\xc3",
+                }
+                if is_msvc_alloca_probe or is_mingw_chkstk_ms:
                     func.info["is_alloca_probe"] = True
                     self.kb.functions.add_key_func_addr("alloca_probe", func_addr)
 
@@ -5269,10 +5360,11 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                         nodes_to_remove.append(func_addr)
                         continue
 
-            if func_addr in self._function_addresses_from_symbols:
-                # the file's own symbol table names a function here, so this is not something the linear scan
-                # invented out of data. an instruction set the lifter does not implement looks exactly like data
-                # from here, and the tests below cannot tell the two apart.
+            if func_addr in self._function_addresses_from_symbols or (
+                self._start_at_entry and func_addr == self.project.entry
+            ):
+                # These starts come from the binary, not from scanning data. An instruction set the lifter does not
+                # implement looks exactly like data from here, and the tests below cannot tell the two apart.
                 continue
 
             if not (
@@ -5287,7 +5379,11 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
             func = self.kb.functions.get_by_addr(func_addr)
             for block_addr in sorted(func.block_addrs, reverse=True):
                 cfg_node = self.model.get_any_node(block_addr)
-                if cfg_node is not None and cfg_node.size > 0:
+                if (
+                    cfg_node is not None
+                    and cfg_node.size > 0
+                    and cfg_node.addr not in self._undefined_instruction_blocks
+                ):
                     out_degree = self.model.graph.out_degree[cfg_node]
                     # is it jumping to data?
                     if out_degree == 0:
@@ -6053,17 +6149,22 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
             # A long run of one repeated byte is filler, never code. Many such runs decode cleanly (0x91 is
             # `xchg ecx, eax` on x86), so without this check linear disassembly walks the whole run and emits a
             # fall-through block every VEX_IRSB_MAX_INST instructions until the run ends. See issue #6968.
+            # A run of one repeated multi-byte tile does exactly the same thing and needs its own, longer,
+            # threshold -- see _repeating_tile_run_length.
+            run_length = 0
             if self._repeating_byte_run_threshold:
                 run_length = self._repeating_byte_run_length(
                     real_addr, self._repeating_byte_run_threshold, ignore=self._nop_byte
                 )
-                if run_length:
-                    # same distinction _next_code_addr_core makes: padding is alignment, anything else is data we
-                    # cannot decode. only the latter may feed the smart scan's skip-a-window heuristic -- real code
-                    # regularly starts right after a padding run.
-                    is_padding = self._load_a_byte_as_int(real_addr) in self._padding_bytes
-                    self._seg_list.occupy(real_addr, run_length, "alignment" if is_padding else "nodecode")
-                    return None, None, None, None
+            if not run_length and self._repeating_tile_run_threshold:
+                run_length = self._repeating_tile_run_length(real_addr, self._repeating_tile_run_threshold)
+            if run_length:
+                # same distinction _next_code_addr_core makes: padding is alignment, anything else is data we
+                # cannot decode. only the latter may feed the smart scan's skip-a-window heuristic -- real code
+                # regularly starts right after a padding run.
+                is_padding = self._load_a_byte_as_int(real_addr) in self._padding_bytes
+                self._seg_list.occupy(real_addr, run_length, "alignment" if is_padding else "nodecode")
+                return None, None, None, None
 
             distance = VEX_IRSB_MAX_SIZE
             # if there is exception handling code, check the distance between `addr` and the closest ending address
@@ -6258,9 +6359,10 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                     except SimTranslationError:
                         nodecode = True
 
-                    irsb_string = lifted_block.bytes[: irsb.size] if irsb is not None else lifted_block.bytes
+                    lifted_block_bytes = lifted_block.bytes if lifted_block.bytes is not None else b""
+                    irsb_string = lifted_block_bytes[: irsb.size] if irsb is not None else lifted_block_bytes
 
-                    if not (nodecode or irsb.size == 0 or irsb.jumpkind == "Ijk_NoDecode"):
+                    if not (nodecode or irsb is None or irsb.size == 0 or irsb.jumpkind == "Ijk_NoDecode"):
                         # it is decodeable
                         if current_function_addr == addr:
                             current_function_addr = addr_0
@@ -6333,18 +6435,11 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                     # VEX decodes ud2 on both x86 and AMD64 and counts it towards the block size.
                     valid_ins = True
                     nodecode_size = 0
-                elif (
-                    lifted_block is not None
-                    and is_x86_x64_arch
-                    and lifted_block.bytes is not None
-                    and len(lifted_block.bytes) - irsb_size > 2
-                    and lifted_block.bytes[irsb_size : irsb_size + 2]
-                    in {
-                        b"\x0f\xff",  # ud0
-                        b"\x0f\xb9",  # ud1
-                        b"\x0f\x0b",  # ud2
-                    }
-                ):
+                elif is_x86_x64_arch and self._fast_memory_load_bytes(real_addr + irsb_size, 2) in {
+                    b"\x0f\xff",  # ud0
+                    b"\x0f\xb9",  # ud1
+                    b"\x0f\x0b",  # ud2
+                }:
                     # ud0, ud1, and ud2 are actually valid instructions.
                     valid_ins = True
                     # VEX decodes none of ud0/ud1 here, so they are not part of the block size. ud2 only
@@ -6407,10 +6502,17 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
 
                     if irsb_size == 0:
                         return None, None, None, None
+                else:
+                    self._undefined_instruction_blocks.add(addr)
 
                 self._seg_list.occupy(real_addr, irsb_size, "code")
                 if nodecode_size > 0:
                     self._seg_list.occupy(real_addr + irsb_size, nodecode_size, "nodecode")
+
+                if irsb_size == 0:
+                    # the undefined instruction is the whole block, so there is nothing to turn into a node.
+                    # its extent is recorded above, which is what keeps the scan from restarting inside it.
+                    return None, None, None, None
 
             if (
                 irsb is not None
@@ -6788,9 +6890,9 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                     del self.functions[existing_node.addr]
 
                 # update indirect_jumps_to_resolve
-                self._indirect_jumps_to_resolve = {
+                self._indirect_jumps_to_resolve = SortedSet(
                     ij for ij in self._indirect_jumps_to_resolve if ij.addr != existing_node.addr
-                }
+                )
 
                 self._remove_jobs_by_source_node_addr(existing_node.addr)
 
@@ -6998,7 +7100,11 @@ class CFGFast(ForwardAnalysis[CFGNode, CFGNode, CFGJob, int, object], CFGBase): 
                 blocks_ahead.append(self._lift(callsite_cfgnode.addr).vex)
                 hooker.project = self.project
                 hooker.arch = self.project.arch
-                return hooker.dynamic_returns(blocks_ahead)
+                try:
+                    return hooker.dynamic_returns(blocks_ahead)
+                except (AngrError, SimError, claripy.ClaripyError):
+                    # fall through to the callee's own flag, as for a hook that does not decide dynamically
+                    l.warning("%s failed to determine whether it returns.", hooker.display_name, exc_info=True)
 
         if callee_func is not None:
             return callee_func.returning
