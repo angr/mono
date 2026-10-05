@@ -41,6 +41,7 @@ from angr.analyses.decompiler.structured_codegen.c_serialize import (
     _DISPLAY_OPTION_ATTRS,
     _DISPLAY_OPTION_FIELD_FIRST,
     _SERIALIZE_KIND_BY_CLASS,
+    SerializeContext,
     _parse_tags,
     _sanitize_tags,
 )
@@ -59,7 +60,7 @@ from angr.utils.ail_serialization import (
     parse_static_buffers,
     parse_static_vvars,
 )
-from tests.common import bin_location
+from tests.common import bin_location, load_project_with_scoped_cfg
 
 test_location = os.path.join(bin_location, "tests")
 
@@ -234,6 +235,22 @@ class TestDecompilationCacheEndToEnd(unittest.TestCase):
         assert 0 not in node_ids
         # nodes created after deserialization must not collide with deserialized ones
         assert back._next_node_idx > max(node_ids)
+
+    def test_register_expression_carries_the_register_name(self):
+        # _handle_Expr_Register used to hand the AIL Register expression itself to CRegister, and
+        # CRegisterMsg.reg is a protobuf string: serializing a decompilation that held one raised
+        # "TypeError: bad argument type for built-in operation", so the cache was dropped whole.
+        codegen = self.decompiler.codegen
+        assert isinstance(codegen, c_codegen.CStructuredCodeGenerator)
+        offset, size = self.proj.arch.registers["rdi"]
+        node = codegen._handle_Expr_Register(Expr.Register(None, offset, size * 8))
+        assert isinstance(node, c_codegen.CRegister)
+        assert node.reg == "rdi"
+        assert "".join(chunk for chunk, _ in node.c_repr_chunks()) == "rdi"
+
+        ctx = SerializeContext()
+        ctx.serialize(node)
+        assert [n.creg.reg for n in ctx.nodes] == ["rdi"]
 
     def test_clinic_roundtrip(self):
         clinic = self.decompiler.clinic
@@ -642,6 +659,100 @@ class TestClinicSerializationAboveFourGigabytes(unittest.TestCase):
         back = d[key]
         assert back.codegen is not None
         assert back.codegen.text == self.text
+
+
+class TestSwitchCaseLabelSerialization(unittest.TestCase):
+    """A case label carries the unsigned value of the constant the switch was lowered from, so a 64-bit switch
+    can label a case 0xfffffffffffffffe where the source wrote -2, and that does not fit in an int64."""
+
+    FIXTURE = os.path.join("riscv", "borgbackup2-chunker.cpython-312-riscv64-linux-gnu.so")
+    FUNC = 0x40AE4E
+    UNSIGNED_LABEL = 0xFFFFFFFFFFFFFFFE
+
+    codegen: c_codegen.CStructuredCodeGenerator
+    text: str
+
+    @classmethod
+    def setUpClass(cls):
+        # sub_40ae4e tests a 64-bit value against 2 and against -2; LoweredSwitchSimplifier turns that
+        # comparison chain into a switch and records the second label as the constant's unsigned value
+        cls.proj, cls.cfg = load_project_with_scoped_cfg(os.path.join(test_location, cls.FIXTURE), cls.FUNC)
+        codegen = cls.proj.analyses.Decompiler(cls.cfg.functions[cls.FUNC], cfg=cls.cfg).codegen
+        assert isinstance(codegen, c_codegen.CStructuredCodeGenerator)
+        assert codegen.text
+        cls.codegen = codegen
+        cls.text = codegen.text
+
+    @staticmethod
+    def _switches(codegen):
+        class Collector(c_codegen.CStructuredCodeWalker):
+            def __init__(self):
+                self.found = []
+
+            def handle_CSwitchCase(self, obj):
+                self.found.append(obj)
+                return super().handle_CSwitchCase(obj)
+
+        collector = Collector()
+        collector.handle(codegen.cfunc)
+        assert collector.found, "this function no longer decompiles to a switch"
+        return collector.found
+
+    @classmethod
+    def _labels(cls, codegen):
+        return [ids for switch in cls._switches(codegen) for ids, _ in switch.cases]
+
+    @classmethod
+    def _entry_storing(cls, blob, case_ids):
+        """The one serialized case entry whose stored labels are exactly ``case_ids``."""
+        msg = codegen_pb2.Codegen()
+        msg.ParseFromString(blob)
+        entries = [e for n in msg.nodes if n.kind == codegen_pb2.CCK_SWITCH_CASE for e in n.cswitch.cases]
+        matching = [e for e in entries if list(e.case_ids) == list(case_ids)]
+        assert len(matching) == 1, f"expected one entry storing {list(case_ids)}, found {len(matching)}"
+        return matching[0]
+
+    def _relabel(self, labels):
+        """Serialize with the switch's first case relabelled; give back the blob and the label parsed out."""
+        switch = self._switches(self.codegen)[0]
+        saved = switch.cases
+        switch.cases = [(labels, saved[0][1]), *saved[1:]]
+        try:
+            blob = self.codegen.serialize()
+        finally:
+            switch.cases = saved
+        back = type(self.codegen).parse(blob, project=self.proj, kb=self.proj.kb)
+        return blob, self._switches(back)[0].cases[0][0]
+
+    def test_the_decompiled_switch_labels_a_case_above_int64_max(self):
+        assert self.UNSIGNED_LABEL in self._labels(self.codegen)
+        assert f"case {self.UNSIGNED_LABEL}:" in self.text
+
+    def test_codegen_roundtrips_the_unsigned_label(self):
+        blob = self.codegen.serialize()  # an int64 case_ids field raised ValueError here
+        assert not self._entry_storing(blob, [self.UNSIGNED_LABEL]).case_ids_signed
+
+        back = type(self.codegen).parse(blob, project=self.proj, kb=self.proj.kb)
+        assert self._labels(back) == self._labels(self.codegen)
+        assert back.text == self.text
+
+    def test_negative_label_roundtrips(self):
+        # other producers record a small signed label, which a uint64 field cannot hold as it stands
+        blob, parsed = self._relabel(-9)
+        assert parsed == -9
+        assert list(self._entry_storing(blob, [0xFFFFFFFFFFFFFFF7]).case_ids_signed) == [True]  # -9 raw
+
+    def test_grouped_labels_keep_their_order_and_signedness(self):
+        labels = (-9, 0, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF)
+        blob, parsed = self._relabel(labels)
+        assert parsed == labels
+        entry = self._entry_storing(blob, [0xFFFFFFFFFFFFFFF7, 0, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF])
+        assert list(entry.case_ids_signed) == [True, False, False, False]
+
+    def test_labels_that_are_not_negative_are_written_without_the_parallel_field(self):
+        blob, parsed = self._relabel((2, 4))
+        assert parsed == (2, 4)
+        assert not self._entry_storing(blob, [2, 4]).case_ids_signed
 
 
 class TestSerializerRegistration(unittest.TestCase):
