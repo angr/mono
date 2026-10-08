@@ -14,7 +14,21 @@ from angr.ailment.expression import VirtualVariable
 from angr.analyses.analysis import AnalysesHub
 from angr.analyses.forward_analysis import ForwardAnalysis, visitors
 from angr.analyses.typehoon.translator import TypeTranslator
-from angr.analyses.typehoon.typeconsts import BottomType, Int, TopType, TypeConstant
+from angr.analyses.typehoon.typeconsts import (
+    BottomType,
+    Float,
+    Int,
+    SInt8,
+    SInt16,
+    SInt32,
+    SInt64,
+    TopType,
+    TypeConstant,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+)
 from angr.analyses.typehoon.typevars import (
     DerivedTypeVariable,
     Equivalence,
@@ -54,6 +68,9 @@ if TYPE_CHECKING:
     from angr.analyses.typehoon.typevars import TypeConstraint
 
 l = logging.getLogger(name=__name__)
+
+# integer bounds that carry a signedness; the default bounds added at assignments are the unqualified IntN
+_QUALIFIED_INT_TYPES = (SInt8, UInt8, SInt16, UInt16, SInt32, UInt32, SInt64, UInt64)
 
 
 def _generic_name_of(op):
@@ -263,6 +280,9 @@ class VariableRecoveryFast(ForwardAnalysis, VariableRecoveryBase):  # pylint:dis
     accurately. However, it is not a requirement. In this case, the function graph you pass must contain information
     indicating the call-out sites inside the analyzed function. These graph edges must be annotated with either
     ``"type": "call"`` or ``"outside": True``.
+
+    :param flavor:  The decompilation flavor on whose behalf variables are recovered. Only ``"rust"`` lifts types
+                    through the Rust type translator; ``None`` (the default) recovers C types.
     """
 
     def __init__(
@@ -281,8 +301,11 @@ class VariableRecoveryFast(ForwardAnalysis, VariableRecoveryBase):  # pylint:dis
         vvar_to_vvar: dict[int, int] | None = None,
         type_hints: list[tuple[atoms.VirtualVariable | atoms.MemoryLocation, str]] | None = None,
         variable_map=None,
+        flavor: str | None = None,
     ):
         self._variable_map = variable_map
+        # Rust types are a decompilation-flavor decision, not a property of the binary
+        self._rust_types = flavor == "rust"
         if not isinstance(func, Function):
             func = self.kb.functions[func]
         func_graph_with_calls = func_graph or func.transition_graph
@@ -306,6 +329,7 @@ class VariableRecoveryFast(ForwardAnalysis, VariableRecoveryBase):  # pylint:dis
             vvar_to_vvar=vvar_to_vvar,
             func_graph=func_graph_with_calls,
             entry_node_addr=entry_node_addr,
+            flavor=flavor,
         )
         ForwardAnalysis.__init__(
             self, order_jobs=True, allow_merging=True, allow_widening=False, graph_visitor=function_graph_visitor
@@ -323,7 +347,7 @@ class VariableRecoveryFast(ForwardAnalysis, VariableRecoveryBase):  # pylint:dis
         # handle type hints
         self.type_lifter = (
             RustTypeTranslator(self.project.arch, func_addr=self.function.addr)
-            if self.project.is_rust_binary
+            if self._rust_types
             else TypeTranslator(self.project.arch, func_addr=self.function.addr)
         )
         self.vvar_type_hints = {}
@@ -331,7 +355,7 @@ class VariableRecoveryFast(ForwardAnalysis, VariableRecoveryBase):  # pylint:dis
             self._parse_type_hints(type_hints)
         if (
             func_graph is not None
-            and self.project.is_rust_binary
+            and self._rust_types
             and len(func_graph.nodes) > 0
             and all(isinstance(node, ailment.Block) for node in func_graph.nodes)
         ):
@@ -347,6 +371,7 @@ class VariableRecoveryFast(ForwardAnalysis, VariableRecoveryBase):  # pylint:dis
             func_ret_var=self._func_ret_var,
             tv_manager=self.tv_manager,
             variable_map=self._variable_map,
+            flavor=flavor,
         )
         self._vex_engine: SimEngineVRVEX = SimEngineVRVEX(self.project, self.kb, call_info=call_info)
 
@@ -425,6 +450,18 @@ class VariableRecoveryFast(ForwardAnalysis, VariableRecoveryBase):  # pylint:dis
             state.register_region.store(self.project.arch.bp_offset, initial_sp + 0x100000)
 
         internal_manager = self.variable_manager[self.function.addr]
+
+        # BUG BUG BUG: If there is no bp initialization, e.g.
+        #
+        # 00000000 <mul>:
+        # 0:   dd 44 24 04             fld    QWORD PTR [esp+0x4]
+        # 4:   dc 4c 24 0c             fmul   QWORD PTR [esp+0xc]
+        # 8:   dd 1d ef be ad de       fstp   QWORD PTR ds:0xdeadbeef
+        # e:   c3                      ret
+        #
+        # A return variable gets created at esp+0x4 mistakenly!
+        #
+        #
 
         # put a return address on the stack if necessary
         if self.project.arch.call_pushes_ret:
@@ -562,7 +599,7 @@ class VariableRecoveryFast(ForwardAnalysis, VariableRecoveryBase):  # pylint:dis
     def _post_analysis(self):
         VariableRecoveryBase._post_analysis(self)
 
-        self.variable_manager["global"].assign_variable_names(labels=self.kb.labels)
+        self.global_variable_manager.assign_variable_names(labels=self.kb.labels)
         self.variable_manager[self.function.addr].assign_variable_names()
 
         if self._store_live_variables:
@@ -608,6 +645,80 @@ class VariableRecoveryFast(ForwardAnalysis, VariableRecoveryBase):  # pylint:dis
                         has_nondefault_subtyping_constraints = True
                 if has_nondefault_subtyping_constraints:
                     self.type_constraints[func_var].difference_update(default_subtyping_constraints)
+
+            # Remove default Int upper bounds that conflict with Float lower bounds or Float equivalences.
+            # Collect variables that have Float lower bounds (Float <: tv) or are equivalent to Float (Float == tv).
+            float_vars: set[TypeVariable] = set()
+            for constraint in self.type_constraints[func_var]:
+                if isinstance(constraint, Subtype) and isinstance(constraint.sub_type, Float):
+                    if isinstance(constraint.super_type, TypeVariable):
+                        float_vars.add(constraint.super_type)
+                elif isinstance(constraint, Equivalence):
+                    if isinstance(constraint.type_a, Float) and isinstance(constraint.type_b, TypeVariable):
+                        float_vars.add(constraint.type_b)
+                    elif isinstance(constraint.type_b, Float) and isinstance(constraint.type_a, TypeVariable):
+                        float_vars.add(constraint.type_a)
+
+            if float_vars:
+                # A signed/unsigned integer upper bound only comes from an integer operation (a signed compare, a
+                # shift, a sign extension); the default bounds are unqualified. Such a variable reads the bits of any
+                # FP value copied into it, so it neither joins the float class through copies nor extends it.
+                int_evidence_vars: set[TypeVariable] = {
+                    tv
+                    for tv, cs in var_to_subtyping.items()
+                    if any(isinstance(c.super_type, _QUALIFIED_INT_TYPES) for c in cs)
+                }
+                # Expand float_vars through equivalence chains
+                changed = True
+                while changed:
+                    changed = False
+                    for constraint in self.type_constraints[func_var]:
+                        if isinstance(constraint, Equivalence):
+                            t1 = constraint.type_a if isinstance(constraint.type_a, TypeVariable) else None
+                            t2 = constraint.type_b if isinstance(constraint.type_b, TypeVariable) else None
+                            if t1 in float_vars and t2 is not None and t2 not in float_vars:
+                                float_vars.add(t2)
+                                changed = True
+                            elif t2 in float_vars and t1 is not None and t1 not in float_vars:
+                                float_vars.add(t1)
+                                changed = True
+                        elif isinstance(constraint, Subtype):
+                            # Propagate through subtype chains bidirectionally:
+                            # if a value in a subtype chain is float, all connected values are too.
+                            sub = constraint.sub_type if isinstance(constraint.sub_type, TypeVariable) else None
+                            sup = constraint.super_type if isinstance(constraint.super_type, TypeVariable) else None
+                            if sub in int_evidence_vars or sup in int_evidence_vars:
+                                continue
+                            if sub in float_vars and sup is not None and sup not in float_vars:
+                                float_vars.add(sup)
+                                changed = True
+                            elif sup in float_vars and sub is not None and sub not in float_vars:
+                                float_vars.add(sub)
+                                changed = True
+
+                # Remove tv <: Int_X for any tv in the float equivalence class
+                to_remove = set()
+                for tv in float_vars:
+                    for constraint in var_to_subtyping.get(tv, []):
+                        if isinstance(constraint.super_type, Int):
+                            to_remove.add(constraint)
+                # A copy between a float variable and an integer-evidenced one is a bit reinterpretation, not a
+                # subtyping relation (a value conversion would be a Convert); its edge must not flow float into the
+                # integer side.
+                if int_evidence_vars:
+                    for constraint in self.type_constraints[func_var]:
+                        if (
+                            isinstance(constraint, Subtype)
+                            and isinstance(constraint.sub_type, TypeVariable)
+                            and isinstance(constraint.super_type, TypeVariable)
+                            and (
+                                (constraint.sub_type in float_vars and constraint.super_type in int_evidence_vars)
+                                or (constraint.super_type in float_vars and constraint.sub_type in int_evidence_vars)
+                            )
+                        ):
+                            to_remove.add(constraint)
+                if to_remove:
+                    self.type_constraints[func_var].difference_update(to_remove)
 
         self.variable_manager[self.function.addr].ret_val_size = self.ret_val_size
 

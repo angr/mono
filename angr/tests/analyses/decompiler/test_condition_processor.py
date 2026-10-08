@@ -7,8 +7,17 @@ from unittest import TestCase
 
 import archinfo
 
-from angr import ailment
-from angr.ailment.expression import BinaryOp, Const, Convert, Extract, Load, VirtualVariable, VirtualVariableCategory
+from angr import ailment, claripy
+from angr.ailment.expression import (
+    BinaryOp,
+    Const,
+    Convert,
+    Extract,
+    Load,
+    StackBaseOffset,
+    VirtualVariable,
+    VirtualVariableCategory,
+)
 from angr.analyses.decompiler.condition_processor import ConditionProcessor
 
 
@@ -51,6 +60,29 @@ class TestConditionProcessor(TestCase):
         cmp = BinaryOp(5, "CmpEQ", [_vvar(6, 32, 16), _vvar(7, 64, 24)], False, bits=1)
         assert cp.claripy_ast_from_ail_condition(cmp) is not None
 
+    def test_float_constant_operand_is_converted(self):
+        # a float-valued Const must go through the bit-pattern conversion instead of being handed to claripy as-is
+        arch = archinfo.ArchAMD64()
+        cp = ConditionProcessor(arch, ailment.Manager())
+        for op in ("Add", "Mul"):
+            expr = BinaryOp(0, op, [_vvar(1, 64, 16), Const(2, 1.0, 64)], False, bits=64, floating_point=True)
+            ast = cp.claripy_ast_from_ail_condition(expr)
+            assert isinstance(ast, claripy.ast.BV) and ast.size() == 64
+
+    def test_bitwise_op_on_one_bit_operands_round_trips(self):
+        # a 1-bit operand of a bitwise op must stay a bit-vector; as a Bool, claripy coerces it into If(b, 1, 0),
+        # which has no AIL conversion
+        arch = archinfo.ArchAMD64()
+        cp = ConditionProcessor(arch, ailment.Manager())
+        a = Convert(1, 32, 1, False, _vvar(2, 32, 16))
+        b = Convert(3, 32, 1, False, _vvar(4, 32, 24))
+        for op in ("And", "Or", "Xor"):
+            expr = BinaryOp(5, op, [a, b], False, bits=1)
+            cond = BinaryOp(6, "CmpNE", [expr, Const(7, 0, 1)], False, bits=1)
+            ast = cp.claripy_ast_from_ail_condition(cond)
+            assert "If" not in repr(ast), ast
+            assert cp.convert_claripy_bool_ast(ast) is not None
+
     def test_signed_comparisons_map_to_signed_claripy_operations(self):
         arch = archinfo.ArchAMD64()
         cp = ConditionProcessor(arch, ailment.Manager())
@@ -58,6 +90,19 @@ class TestConditionProcessor(TestCase):
             cmp = BinaryOp(0, ail_op, [_vvar(1, 32, 16), _vvar(2, 32, 24)], True, bits=1)
             assert cmp.verbose_op == ail_op + "s"
             assert cp.claripy_ast_from_ail_condition(cmp).op == claripy_op
+
+    def test_stack_base_offset_operand_is_abstracted_instead_of_raising(self):
+        # A comparison against a raw stack address -- (sp+0 == 0) in a 32-bit ARM ELF of a
+        # corpus sweep -- reached the op-handler lookup, which reads .verbose_op. A
+        # StackBaseOffset has no operation, so the lookup raised AttributeError instead of
+        # falling through to the catch-all, and the whole function decompiled to nothing.
+        arch = archinfo.ArchARMEL()
+        cp = ConditionProcessor(arch, ailment.Manager())
+        cmp = BinaryOp(0, "CmpEQ", [StackBaseOffset(1, 32, 0), Const(2, 0, 32)], False, bits=1)
+        assert cp.claripy_ast_from_ail_condition(cmp) is not None
+        operand = cp.claripy_ast_from_ail_condition(StackBaseOffset(3, 32, -8))
+        assert isinstance(operand, claripy.ast.BV)
+        assert operand.size() == 32
 
 
 if __name__ == "__main__":

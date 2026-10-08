@@ -79,6 +79,7 @@ class CompleteCallingConventionsAnalysis(Analysis):
         auto_start: bool = True,
         func_graphs: dict[int, networkx.DiGraph] | None = None,
         target_functions: set[int] | None = None,
+        flavor: str | None = None,
     ):
         """
 
@@ -95,7 +96,10 @@ class CompleteCallingConventionsAnalysis(Analysis):
         :param max_function_size:   Do not perform calling convention analysis on functions whose sizes are more than
                                     `max_function_size`. Setting it to None disables this check.
         :param workers:             Number of multiprocessing workers.
+        :param flavor:              The decompilation flavor whose prototypes the analysis reads and writes (None:
+                                    the default flavor).
         """
+        self._flavor = flavor
 
         self.mode = mode
         self._recover_variables = recover_variables
@@ -169,7 +173,7 @@ class CompleteCallingConventionsAnalysis(Analysis):
                 continue
 
             func = self.kb.functions.get_by_addr(func_addr)
-            if (func.calling_convention is None or func.prototype is None) or self._force:
+            if (func.calling_convention is None or func.get_prototype(self._flavor) is None) or self._force:
                 if func.is_alignment:
                     # skip all alignments
                     continue
@@ -218,13 +222,16 @@ class CompleteCallingConventionsAnalysis(Analysis):
         prototype_source: PrototypeSource | None,
     ) -> None:
         if (
-            func.prototype is None
-            or func.is_prototype_guessed
-            or (prototype_source is not None and func.prototype_source.value < prototype_source.value)
+            func.get_prototype(self._flavor) is None
+            or func.is_prototype_guessed_for(self._flavor)
+            or (prototype_source is not None and func.get_prototype_source(self._flavor).value < prototype_source.value)
             or self._force
         ):
-            func.prototype_source = prototype_source if prototype_source is not None else PrototypeSource.NONE
-            func.prototype = prototype
+            func.set_prototype(
+                self._flavor,
+                prototype,
+                source=prototype_source if prototype_source is not None else PrototypeSource.NONE,
+            )
             func.prototype_libname = prototype_libname
 
     def work(self):
@@ -418,10 +425,10 @@ class CompleteCallingConventionsAnalysis(Analysis):
         if func.ran_cca and not self._force:
             return (
                 func.calling_convention,
-                func.prototype,
+                func.get_prototype(self._flavor),
                 func.prototype_libname,
-                func.prototype_source,
-                self.kb.variables.get_function_manager(func_addr),
+                func.get_prototype_source(self._flavor),
+                self._variable_manager_of(func_addr),
             )
 
         if (
@@ -455,6 +462,7 @@ class CompleteCallingConventionsAnalysis(Analysis):
             collect_facts=self.mode in (CallingConventionAnalysisMode.FAST, CallingConventionAnalysisMode.FASTISH),
             collect_facts_arg_uses=self.mode == CallingConventionAnalysisMode.FASTISH,
             collect_facts_arg_passthru=self.mode == CallingConventionAnalysisMode.FASTISH,
+            flavor=self._flavor,
         )
 
         if cc_analysis.cc is not None:
@@ -464,10 +472,18 @@ class CompleteCallingConventionsAnalysis(Analysis):
                 cc_analysis.prototype,
                 cc_analysis.prototype_libname if cc_analysis.prototype_libname is not None else func.prototype_libname,
                 PrototypeSource.SIMPROC if cc_analysis.proto_from_symbol else PrototypeSource.CCA_LOW,
-                self.kb.variables.get_function_manager(func_addr),
+                self._variable_manager_of(func_addr),
             )
         _l.info("Cannot determine calling convention for %r.", func)
-        return None, None, None, None, self.kb.variables.get_function_manager(func_addr)
+        return None, None, None, None, self._variable_manager_of(func_addr)
+
+    def _variable_manager_of(self, func_addr: int) -> VariableManagerInternal | None:
+        if self.mode == CallingConventionAnalysisMode.VARIABLES:
+            return self.kb.variables.get_function_manager(func_addr)
+        # fact collection does not touch variables: creating an empty manager for each function only bloats the heap
+        if self.kb.variables.has_function_manager(func_addr):
+            return self.kb.variables.get_function_manager(func_addr)
+        return None
 
     def prioritize_functions(self, func_addrs_to_prioritize: Iterable[int]):
         """
@@ -496,7 +512,12 @@ class CompleteCallingConventionsAnalysis(Analysis):
         for callee in self.kb.functions.callgraph.successors(caller_func_addr):
             if callee != caller_func_addr and callee not in d:
                 func = self.kb.functions.get_by_addr(callee)
-                tpl = func.calling_convention, func.prototype, func.prototype_libname, func.prototype_source
+                tpl = (
+                    func.calling_convention,
+                    func.get_prototype(self._flavor),
+                    func.prototype_libname,
+                    func.get_prototype_source(self._flavor),
+                )
                 d[callee] = tpl
         return d
 

@@ -14,6 +14,9 @@ from angr import Project, calling_conventions, load_shellcode, types
 from angr.calling_conventions import (
     SimArrayArg,
     SimCC,
+    SimCCARM,
+    SimCCARMHF,
+    SimCCARMLinuxSyscall,
     SimCCCdecl,
     SimCCMicrosoftAMD64,
     SimCCMicrosoftCdecl,
@@ -25,6 +28,8 @@ from angr.calling_conventions import (
     SimCCRISCV64,
     SimCCStdcall,
     SimCCSystemVAMD64,
+    SimCCX86LinuxSyscall,
+    SimComboArg,
     SimReferenceArgument,
     SimRegArg,
     SimStackArg,
@@ -59,6 +64,19 @@ test_location = os.path.join(bin_location, "tests")
 
 
 class TestCallingConvention(TestCase):
+    def test_arm_empty_struct_argument_uses_an_integer_slot(self):
+        for arch, cc_cls in ((archinfo.ArchARM(), SimCCARM), (archinfo.ArchARMHF(), SimCCARMHF)):
+            cc = cc_cls(arch)
+            empty = SimStruct({}, name="empty").with_arch(arch)
+
+            assert empty.size == 0
+
+            proto = SimTypeFunction([empty, SimTypeInt()], SimTypeInt()).with_arch(arch)
+            empty_loc, int_loc = cc.arg_locs(proto)
+            assert isinstance(empty_loc, SimStructArg)
+            assert not empty_loc.get_footprint()
+            assert int_loc == SimRegArg("r1", 4)
+
     def test_opaque_cpp_class_returns_are_placed_like_integers(self):
         for arch, cc_cls, return_reg in (
             (archinfo.ArchPcode("pa-risc:BE:32:default"), SimCCPARISC, "r28"),
@@ -429,6 +447,57 @@ class TestCallingConvention(TestCase):
             n32 = self._mips_int_arg_locs(SimCCN32LinuxSyscall, archinfo.ArchMIPSN32(endness), args)
             n64 = self._mips_int_arg_locs(SimCCN64LinuxSyscall, archinfo.ArchMIPS64(endness), args)
             assert n32 == n64, f"{endness}: n32 {n32} != n64 {n64}"
+
+    def test_arm_linux_syscall_argument_registers(self):
+        for endness in (archinfo.Endness.LE, archinfo.Endness.BE):
+            arch = archinfo.ArchARM(endness=endness)
+            cc = SimCCARMLinuxSyscall(arch)
+
+            # pread64 has three word-sized arguments followed by a loff_t. The
+            # 64-bit value skips odd r3, occupies r4:r5, and leaves r6 usable.
+            proto = SimTypeFunction(
+                [SimTypeInt(), SimTypePointer(SimTypeChar()), SimTypeInt(), SimTypeLongLong(), SimTypeInt()],
+                SimTypeInt(),
+            ).with_arch(arch)
+            locs = cc.arg_locs(proto)
+            assert locs[:3] == [SimRegArg("r0", 4), SimRegArg("r1", 4), SimRegArg("r2", 4)]
+            assert isinstance(locs[3], SimComboArg)
+            expected_wide = [SimRegArg("r4", 4), SimRegArg("r5", 4)]
+            if endness == archinfo.Endness.BE:
+                expected_wide.reverse()
+            assert locs[3].locations == expected_wide
+            assert locs[4] == SimRegArg("r6", 4)
+
+            # There is no stack fallback: the kernel receives at most seven
+            # word-sized argument slots in r0-r6.
+            with self.assertRaisesRegex(TypeError, "exhausted r0-r6"):
+                cc.arg_locs(SimTypeFunction([SimTypeInt()] * 8, SimTypeInt()).with_arch(arch))
+
+    def test_x86_linux_syscall_argument_registers(self):
+        arch = archinfo.arch_from_id("x86")
+        cc = SimCCX86LinuxSyscall(arch)
+
+        # fadvise64_64 is where the i386 kernel spells the rule out: its entry
+        # point takes fd, offset_low, offset_high, len_low, len_high and advice,
+        # so the two loff_t arguments fill ecx:edx and esi:edi and advice still
+        # reaches ebp. The first wide value starting in ecx also shows there is
+        # no even-slot alignment: it takes the next two registers as they come.
+        proto = SimTypeFunction(
+            [SimTypeInt(), SimTypeLongLong(), SimTypeLongLong(), SimTypeInt()],
+            SimTypeInt(),
+        ).with_arch(arch)
+        locs = cc.arg_locs(proto)
+        assert locs[0] == SimRegArg("ebx", 4)
+        assert isinstance(locs[1], SimComboArg)
+        assert locs[1].locations == [SimRegArg("ecx", 4), SimRegArg("edx", 4)]
+        assert isinstance(locs[2], SimComboArg)
+        assert locs[2].locations == [SimRegArg("esi", 4), SimRegArg("edi", 4)]
+        assert locs[3] == SimRegArg("ebp", 4)
+
+        # There is no stack fallback: the kernel receives at most six word-sized
+        # argument slots in ebx-ebp.
+        with self.assertRaisesRegex(TypeError, "exhausted ebx-ebp"):
+            cc.arg_locs(SimTypeFunction([SimTypeInt()] * 7, SimTypeInt()).with_arch(arch))
 
     def test_x86_cdecl_array_and_union_return(self):
         arch = archinfo.arch_from_id("x86")

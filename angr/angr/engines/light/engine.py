@@ -137,6 +137,35 @@ def longest_prefix_lookup[T](haystack: str, mapping: dict[str, T]) -> T | None:
 
 
 # noinspection PyPep8Naming
+_VEX_HANDLER_PREFIXES = (
+    "_handle_unop_",
+    "_handle_binop_",
+    "_handle_binopv_",
+    "_handle_triop_",
+    "_handle_qop_",
+    "_handle_ccall_",
+    "_handle_dirty_",
+)
+_vex_handler_name_cache: dict[type, dict[str, list[str]]] = {}
+
+
+def _vex_handler_names(cls: type) -> dict[str, list[str]]:
+    """
+    Handler method names of a SimEngineLightVEX subclass grouped by prefix. Engines are instantiated per analysis
+    run, so the dir() scan is cached per class.
+    """
+    names = _vex_handler_name_cache.get(cls)
+    if names is None:
+        names = {prefix: [] for prefix in _VEX_HANDLER_PREFIXES}
+        for name in dir(cls):
+            for prefix in _VEX_HANDLER_PREFIXES:
+                if name.startswith(prefix):
+                    names[prefix].append(name)
+                    break
+        _vex_handler_name_cache[cls] = names
+    return names
+
+
 class SimEngineLightVEX[StateType, DataType_co, ResultType, StmtDataType](
     SimEngineLight[StateType, DataType_co, Block, ResultType]
 ):
@@ -193,6 +222,7 @@ class SimEngineLightVEX[StateType, DataType_co, ResultType, StmtDataType](
                 raise TypeError(f"Handle {h} is not validated for {attr}")
             return h
 
+        handler_names = _vex_handler_names(type(self))
         self._stmt_handlers: dict[str, Callable[[Any], StmtDataType]] = {
             "Ist_WrTmp": self._handle_stmt_WrTmp,
             "Ist_Put": self._handle_stmt_Put,
@@ -227,38 +257,31 @@ class SimEngineLightVEX[StateType, DataType_co, ResultType, StmtDataType](
         }
         self._unop_handlers: dict[str, Callable[[pyvex.expr.Unop], DataType_co]] = {
             name.split("_", 3)[-1]: checked(getattr(self, name), "unop_handler")
-            for name in dir(self)
-            if name.startswith("_handle_unop_")
+            for name in handler_names["_handle_unop_"]
         }
         self._binop_handlers: dict[str, Callable[[pyvex.expr.Binop], DataType_co]] = {
             name.split("_", 3)[-1]: checked(getattr(self, name), "binop_handler")
-            for name in dir(self)
-            if name.startswith("_handle_binop_")
+            for name in handler_names["_handle_binop_"]
         }
         self._binopv_handlers: dict[str, Callable[[int, int, pyvex.expr.Binop], DataType_co]] = {
             name.split("_", 3)[-1]: checked(getattr(self, name), "binopv_handler")
-            for name in dir(self)
-            if name.startswith("_handle_binopv_")
+            for name in handler_names["_handle_binopv_"]
         }
         self._triop_handlers: dict[str, Callable[[pyvex.expr.Triop], DataType_co]] = {
             name.split("_", 3)[-1]: checked(getattr(self, name), "triop_handler")
-            for name in dir(self)
-            if name.startswith("_handle_triop_")
+            for name in handler_names["_handle_triop_"]
         }
         self._qop_handlers: dict[str, Callable[[pyvex.expr.Qop], DataType_co]] = {
             name.split("_", 3)[-1]: checked(getattr(self, name), "qop_handler")
-            for name in dir(self)
-            if name.startswith("_handle_qop_")
+            for name in handler_names["_handle_qop_"]
         }
         self._ccall_handlers: dict[str, Callable[[pyvex.expr.CCall], DataType_co]] = {
             name.split("_", 3)[-1]: checked(getattr(self, name), "ccall_handler")
-            for name in dir(self)
-            if name.startswith("_handle_ccall_")
+            for name in handler_names["_handle_ccall_"]
         }
         self._dirty_handlers: dict[str, Callable[[pyvex.stmt.Dirty], StmtDataType]] = {
             name.split("_", 3)[-1]: checked(getattr(self, name), "dirty_handler")
-            for name in dir(self)
-            if name.startswith("_handle_dirty_")
+            for name in handler_names["_handle_dirty_"]
         }
 
     def process(
@@ -421,7 +444,9 @@ class SimEngineLightVEX[StateType, DataType_co, ResultType, StmtDataType](
         assert expr.op.startswith("Iop_")
 
         # vector information
-        m = re.match(r"Iop_[^\d]+(\d+)[SU]{0,1}x(\d+)", expr.op)
+        # Matches integer vectors (Add32x4, CmpLT32Sx4), packed float vectors
+        # (Add32Fx4), and scalar-in-vector float ops (Add32F0x4, CmpLT32F0x4).
+        m = re.match(r"Iop_[^\d]+(\d+)(?:[SU]|F0?)?x(\d+)", expr.op)
         if m is not None:
             vector_size = int(m.group(1))
             vector_count = int(m.group(2))
@@ -554,6 +579,8 @@ class SimEngineLightAIL[StateType, DataType_co, StmtDataType, ResultType](
             "Reinterpret": self._handle_expr_Reinterpret,
             "Load": self._handle_expr_Load,
             "Register": self._handle_expr_Register,
+            # the default IRegister handler yields None
+            "IRegister": cast(Callable[[Any], DataType_co], self._handle_expr_IRegister),
             "ITE": self._handle_expr_ITE,
             "Extract": self._handle_expr_Extract,
             "Insert": self._handle_expr_Insert,
@@ -644,6 +671,8 @@ class SimEngineLightAIL[StateType, DataType_co, StmtDataType, ResultType](
             "MinV": self._handle_binop_MinV,
             "MaxV": self._handle_binop_MaxV,
             "HAddV": self._handle_binop_HAddV,
+            "MinF": self._handle_binop_MinF,
+            "MaxF": self._handle_binop_MaxF,
             "QAddV": self._handle_binop_QAddV,
             "QSubV": self._handle_binop_QSubV,
             "QNarrowBinV": self._handle_binop_QNarrowBinV,
@@ -808,6 +837,10 @@ class SimEngineLightAIL[StateType, DataType_co, StmtDataType, ResultType](
 
     @abstractmethod
     def _handle_expr_Register(self, expr: ailment.expression.Register) -> DataType_co: ...
+
+    def _handle_expr_IRegister(self, expr: ailment.expression.IRegister) -> DataType_co | None:
+        self._expr(expr.reg_offset)
+        return None
 
     @abstractmethod
     def _handle_expr_ITE(self, expr: ailment.expression.ITE) -> DataType_co: ...
@@ -1072,6 +1105,12 @@ class SimEngineLightAIL[StateType, DataType_co, StmtDataType, ResultType](
     @abstractmethod
     def _handle_binop_MaxV(self, expr: ailment.expression.BinaryOp) -> DataType_co: ...
 
+    def _handle_binop_MinF(self, expr: ailment.expression.BinaryOp) -> DataType_co:
+        return self._handle_binop_MinV(expr)
+
+    def _handle_binop_MaxF(self, expr: ailment.expression.BinaryOp) -> DataType_co:
+        return self._handle_binop_MaxV(expr)
+
     @abstractmethod
     def _handle_binop_HAddV(self, expr: ailment.expression.BinaryOp) -> DataType_co: ...
 
@@ -1164,6 +1203,9 @@ class SimEngineNoexprAIL[StateType, DataType_co, StmtDataType, ResultType](
 
     def _handle_expr_Register(self, expr: ailment.expression.Register) -> DataType_co | None:
         pass
+
+    def _handle_expr_IRegister(self, expr: ailment.expression.IRegister) -> DataType_co | None:
+        self._expr(expr.reg_offset)
 
     def _handle_expr_ITE(self, expr: ailment.expression.ITE) -> DataType_co | None:
         pass

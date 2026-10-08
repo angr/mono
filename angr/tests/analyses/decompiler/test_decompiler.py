@@ -1283,6 +1283,22 @@ class TestDecompiler(unittest.TestCase):
         assert '"Username: "' in code
         assert '"Password: "' in code
 
+    def test_decompiling_fauxware_ppc64_callsite_prototypes(self):
+        # callsite prototype recovery runs RDA on the caller; on PPC64 it must pick up the TOC pointer from the loader
+        # ELFv2: every function; ELFv1: one function whose callee has no prototype
+        for arch_dir, func_addrs in (("ppc64el", None), ("ppc64", [0x10000900])):
+            bin_path = os.path.join(test_location, arch_dir, "fauxware")
+            p = angr.Project(bin_path, auto_load_libs=False)
+            cfg = p.analyses[CFGFast].prep()(data_references=True, normalize=True)
+            funcs = (
+                [cfg.functions[addr] for addr in func_addrs]
+                if func_addrs is not None
+                else [f for f in cfg.functions.values() if not (f.is_plt or f.is_simprocedure or f.is_alignment)]
+            )
+            for func in funcs:
+                dec = p.analyses[Decompiler].prep(fail_fast=True)(func, cfg=cfg.model)
+                assert dec.codegen is not None and dec.codegen.text, f"Failed to decompile function {func!r}."
+
     @for_all_structuring_algos
     def test_stack_canary_removal_x8664_extra_exits(self, decompiler_options=None):
         # Test stack canary removal on functions with extra exit
@@ -2844,7 +2860,9 @@ class TestDecompiler(unittest.TestCase):
         a0_assignment_line = next(line for line in lines if " = a0;" in line)
         a0_var = a0_assignment_line.split(" = ")[0].strip()
         fmt_line = next(i for i, line in enumerate(lines) if 'fmt(stdin, "-");' in line)
-        optind_line = next(i for i, line in enumerate(lines) if f"optind < {a0_var}" in line)
+        # optind and a0 are typed unsigned; jge compares signed
+        optind_cmp = re.compile(rf"(?:\(int\))?optind < (?:\(int\))?{re.escape(a0_var)}\b")
+        optind_line = next(i for i, line in enumerate(lines) if optind_cmp.search(line))
         return_line = next(i for i, line in enumerate(lines) if "do not return" not in line and "return " in line)
         assert 0 <= fmt_line < return_line and 0 <= optind_line < return_line
 
@@ -5025,8 +5043,8 @@ class TestDecompiler(unittest.TestCase):
         assert '"current_angle_int: %d\\n"' in d.codegen.text
         assert "10.0" in d.codegen.text
         assert re.search(r"int_to_float\(\w+\)", d.codegen.text) is not None
-        assert re.search(r"increment_float\(current_angle, 10.0\)", d.codegen.text) is not None
-        assert re.search(r"increment_float\(prev_angle, 8.0\)", d.codegen.text) is not None
+        assert re.search(r"increment_float\(current_angle, 10.0f?\)", d.codegen.text) is not None
+        assert re.search(r"increment_float\(prev_angle, 8.0f?\)", d.codegen.text) is not None
         assert "if (!compare_floats(30, current_angle, prev_angle))" in d.codegen.text or re.search(
             r"(\w+) = compare_floats\(30, current_angle, prev_angle\);\s*if \(!\1\)", d.codegen.text
         )
@@ -5786,11 +5804,11 @@ class TestDecompiler(unittest.TestCase):
         assert dec.codegen is not None and dec.codegen.text is not None
         print_decompilation_result(dec)
 
-        # Ensure v0 <= 1000 branch is not flipped
+        # Ensure v0 <= 1000 branch is not flipped (the compare is signed; v0 may be typed unsigned)
         text = normalize_whitespace(dec.codegen.text)
         expected = normalize_whitespace(r"""
             (\w+) = 10;
-            if \(\1 <= 1000\) \{
+            if \((?:\(int\))?\1 <= 1000\) \{
                 \1 \+= 1;
                 \1 \+= 2;
                 \1 \+= 3;
@@ -5825,7 +5843,7 @@ class TestDecompiler(unittest.TestCase):
         # turning off cache for better speed
         proj = angr.Project(
             bin_path,
-            cache_limits={"functions": None, "cfg_nodes": None, "cfg_edges": None},
+            cache_limits={"functions": None, "cfg_nodes": None},
         )
         cfg = proj.analyses.CFG(normalize=True)
         func = proj.kb.functions[0x469200]
@@ -5876,6 +5894,26 @@ class TestDecompiler(unittest.TestCase):
         assert v11_eq_v24_line_no is not None
         assert v24_with_capacity_line_no is not None
         assert v11_eq_v24_line_no < v24_with_capacity_line_no
+
+    def test_decompiling_rust_fmt_main_c_flavor_emits_c_declarations(self, decompiler_options=None):
+        # Variable recovery lifts types through RustTypeTranslator only for the Rust flavor, so the default flavor
+        # recovers plain C types on a Rust binary and prints C declarations.
+        bin_path = os.path.join(test_location, "x86_64", "decompiler", "fmt_rust")
+        proj, cfg = load_project_with_scoped_cfg(bin_path, 0x469200)
+        func = proj.kb.functions[0x469200]
+        dec = proj.analyses.Decompiler(func, cfg=cfg, options=decompiler_options)
+        assert dec.codegen is not None
+        print_decompilation_result(dec)
+        text = str(dec.codegen.text)
+
+        rust_declarations = [
+            line.strip()
+            for line in text.split("\n")
+            if re.search(r"^\s+(?:[A-Za-z_]\w*: [^;]+|\*u8 [A-Za-z_]\w*);", line)
+        ]
+        assert not rust_declarations, f"Rust declaration syntax in C output: {rust_declarations[:5]}"
+        # 128-bit values are spelled the way C spells a fixed width
+        assert re.search(r"\n\s+u?int\d+_t \w+;", text) is not None
 
     def test_decompiling_rust_fmt_build_best_path_no_ref_using_args(self, decompiler_options=None):
         bin_path = os.path.join(test_location, "x86_64", "decompiler", "fmt_rust")
@@ -6091,7 +6129,7 @@ class TestDecompiler(unittest.TestCase):
             return __indword(3324)
             """) in decomp("test_io_inl")
         assert normalize_whitespace("""
-                if (!(char)__inbyte(233))
+                if (!__inbyte(233))
                     return 456;
                 return 123;
                 """) in decomp("test_in_cond")

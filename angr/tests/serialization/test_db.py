@@ -20,9 +20,14 @@ from angr.analyses.decompiler.decompilation_cache import DecompilationCache
 from angr.analyses.decompiler.structured_codegen import DummyStructuredCodeGenerator
 from angr.analyses.decompiler.structured_codegen.c import CConstant
 from angr.angrdb import AngrDB
+from angr.calling_conventions import SimCCMicrosoftAMD64, SimCCSystemVAMD64
+from angr.knowledge_plugins.callsite_prototypes import CallsitePrototypeKind
+from angr.knowledge_plugins.functions.function import PrototypeSource
 from angr.knowledge_plugins.structured_code import SpillingDecompilationDict
 from angr.procedures.definitions import SIM_TYPE_COLLECTIONS, SimTypeCollection
-from angr.sim_type import SimStruct, SimTypePointer
+from angr.rust import RUST_FLAVOR
+from angr.sim_type import SimStruct, SimTypeChar, SimTypeFunction, SimTypeInt, SimTypePointer
+from angr.sim_variable import SimMemoryVariable
 from angr.utils.types import find_type_refs
 from tests.common import bin_location, print_decompilation_result
 
@@ -255,7 +260,6 @@ class TestDb(unittest.TestCase):
         # force the fast path by using tiny CFG node/edge cache limits
         with (
             mock.patch.object(angr.Project, "get_cfg_node_cache_limit", return_value=5),
-            mock.patch.object(angr.Project, "get_cfg_edge_cache_limit", return_value=5),
         ):
             new_proj = AngrDB(nullpool=True).load(db_file)
 
@@ -320,7 +324,6 @@ class TestDb(unittest.TestCase):
         # force the load fast path so that all nodes end up spilled and clean
         with (
             mock.patch.object(angr.Project, "get_cfg_node_cache_limit", return_value=5),
-            mock.patch.object(angr.Project, "get_cfg_edge_cache_limit", return_value=5),
         ):
             loaded_proj = AngrDB(nullpool=True).load(db_file)
 
@@ -476,6 +479,30 @@ class TestDb(unittest.TestCase):
         assert set(new_dvm.function_managers) == nonempty_addrs
         for addr in nonempty_addrs:
             assert content(new_dvm.function_managers[addr]) == pre_content[addr]
+
+    def test_angrdb_flavored_global_managers_roundtrip(self):
+        # every flavor's global manager is stored (func_addr -1) and restored under its flavor key
+        proj = angr.Project(os.path.join(test_location, "x86_64", "fauxware"), auto_load_libs=False)
+        dvm = proj.kb.dec_variables
+        for flavor, ident in (("pseudocode", "gv_c"), ("rust", "gv_rust")):
+            manager = dvm.get_global_manager(flavor)
+            manager.add_variable("global", 0x601000, SimMemoryVariable(0x601000, 8, ident=ident))
+
+        dtemp = tempfile.mkdtemp()
+        db_file = os.path.join(dtemp, "fauxware.adb")
+        AngrDB(proj, nullpool=True).dump(db_file)
+        conn = sqlite3.connect(db_file)
+        global_rows = conn.execute("SELECT func_addr FROM dec_variables WHERE func_addr = -1").fetchall()
+        conn.close()
+        assert len(global_rows) == 2
+
+        new_dvm = AngrDB(nullpool=True).load(db_file).kb.dec_variables
+        assert set(new_dvm.global_managers) == {"pseudocode", "rust"}
+        for flavor, ident in (("pseudocode", "gv_c"), ("rust", "gv_rust")):
+            manager = new_dvm.global_managers[flavor]
+            assert manager.flavor == flavor
+            assert [v.ident for v in manager.get_variables()] == [ident]
+        shutil.rmtree(dtemp)
 
     def test_angrdb_dump_with_spilled_dec_variables(self):
         # Dumping to angrdb while dec_variables entries are spilled to the RuntimeDb LMDB store faults them back in
@@ -768,6 +795,40 @@ class TestDb(unittest.TestCase):
             assert isinstance(new_dummy.codegen, DummyStructuredCodeGenerator)
             assert new_dummy.codegen.stmt_comments == {0x1000: "hi"}
 
+    def test_angrdb_redecompile_after_argument_location_change(self):
+        # copy_fd's second argument is defined by a phi statement, which makes its argument variable its own phi
+        # variable in kb.dec_variables. After the round trip, a re-decompilation under a prototype/calling convention
+        # that moves the argument must supersede the stored one (including its phi entry); a stale one would get
+        # unified a second time and leave assign_unified_variable_names() without a name for it.
+        bin_path = os.path.join(test_location, "x86_64", "decompiler", "head.o")
+
+        proj = angr.Project(bin_path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True, data_references=True)
+        func = proj.kb.functions["copy_fd"]
+        proj.analyses.Decompiler(func, cfg=cfg.model, fail_fast=True, update_cache=True)
+        nargs = len(func.prototype.args)
+        assert nargs == 2
+
+        with tempfile.TemporaryDirectory() as td:
+            new_proj = self._roundtrip_angrdb(proj, os.path.join(td, "proj.adb"))
+
+        new_func = new_proj.kb.functions["copy_fd"]
+        new_func.calling_convention = SimCCMicrosoftAMD64(new_proj.arch)
+        new_func.prototype = SimTypeFunction([SimTypeInt(), SimTypeInt()], SimTypeInt()).with_arch(new_proj.arch)
+        new_func.prototype_source = PrototypeSource.USER
+        dec = new_proj.analyses.Decompiler(
+            new_func, cfg=new_proj.kb.cfgs.get_most_accurate(), fail_fast=True, use_cache=False
+        )
+        assert dec.codegen is not None and dec.codegen.text is not None
+        assert "copy_fd(int a0, int a1)" in dec.codegen.text
+
+        var_manager = new_proj.kb.dec_variables[new_func.addr]
+        arg_vars = sorted(
+            (v for v in var_manager._unified_variables if v.ident is not None and v.ident.startswith("arg_")),
+            key=lambda v: v.ident,
+        )
+        assert [(v.ident, v.name) for v in arg_vars] == [("arg_0", "a0"), ("arg_1", "a1")]
+
     def test_angrdb_fast_load_spilled_decompilation_caches(self):
         # When the database contains more decompilation caches than the manager may keep in memory, the serialized
         # bytes are moved directly into the LMDB backing store on load without being deserialized.
@@ -1044,6 +1105,75 @@ class TestDb(unittest.TestCase):
             assert len(new_proj.kb.functions) == len(proj.kb.functions)
         finally:
             SIM_TYPE_COLLECTIONS.pop("angrdb_test_dummy_typelib", None)
+
+    def test_angrdb_callsite_prototypes_roundtrip(self):
+        bin_path = os.path.join(test_location, "x86_64", "fauxware")
+        proj = angr.Project(bin_path, auto_load_libs=False)
+        proj.analyses.CFGFast()
+
+        cc = SimCCSystemVAMD64(proj.arch)
+        proto_a = SimTypeFunction(
+            [SimTypePointer(SimTypeChar()), SimTypeInt(signed=False)],
+            SimTypePointer(SimTypeInt()),
+            arg_names=["buf", "len"],
+        ).with_arch(proj.arch)
+        proto_b = SimTypeFunction([SimTypeInt()], None, variadic=True).with_arch(proj.arch)
+        cp = proj.kb.callsite_prototypes
+        cp.set_prototype(0x400600, cc, proto_a)
+        cp.set_prototype(0x400600, cc, proto_b, manual=True)
+        cp.set_prototype(0x400700, cc, proto_b, propagated=True)
+
+        with tempfile.TemporaryDirectory() as td:
+            db_file = os.path.join(td, "fauxware.adb")
+            new_proj = self._roundtrip_angrdb(proj, db_file)
+            new_cp = new_proj.kb.callsite_prototypes
+            assert len(new_cp) == 3
+            for addr, kind, _, prototype in cp.items():
+                assert new_cp.has_prototype(addr, kind=kind)
+                new_proto = new_cp.get_prototype(addr, kind=kind)
+                assert new_proto is not None
+                assert new_proto == prototype
+                assert new_proto.arg_names == prototype.arg_names
+                assert new_proto.variadic == prototype.variadic
+                assert new_proto._arch is not None
+                assert type(new_cp.get_cc(addr, kind=kind)) is SimCCSystemVAMD64
+            assert new_cp.is_prototype_manual(0x400600) is True
+            assert new_cp.is_prototype_manual(0x400700) is False
+            assert new_cp.is_prototype_certain(0x400700) is True
+            assert new_cp.has_prototype(0x400700, kind=CallsitePrototypeKind.PROPAGATED)
+            assert not new_cp.has_prototype(0x400700)
+
+            # a database written before the table existed loads with an empty plugin
+            with sqlite3.connect(db_file) as conn:
+                conn.execute("DROP TABLE callsite_prototypes")
+            old_proj = AngrDB(nullpool=True).load(db_file)
+            assert len(old_proj.kb.callsite_prototypes) == 0
+            assert len(old_proj.kb.functions) == len(proj.kb.functions)
+
+    def test_angrdb_flavored_callsite_prototypes_roundtrip(self):
+        bin_path = os.path.join(test_location, "x86_64", "fauxware")
+        proj = angr.Project(bin_path, auto_load_libs=False)
+
+        cc = SimCCSystemVAMD64(proj.arch)
+        c_proto = SimTypeFunction([SimTypeInt()], SimTypeInt()).with_arch(proj.arch)
+        rust_proto = SimTypeFunction([SimTypeInt(), SimTypeInt()], None).with_arch(proj.arch)
+        cp = proj.kb.callsite_prototypes
+        cp.set_prototype(0x400600, cc, c_proto)
+        cp.set_prototype(0x400600, cc, rust_proto, flavor=RUST_FLAVOR)
+        cp.set_prototype(0x400700, cc, rust_proto, manual=True, flavor=RUST_FLAVOR)
+
+        with tempfile.TemporaryDirectory() as td:
+            new_cp = self._roundtrip_angrdb(proj, os.path.join(td, "fauxware.adb")).kb.callsite_prototypes
+            assert len(new_cp) == 3
+            assert sorted(new_cp.flavors) == sorted(["pseudocode", RUST_FLAVOR])
+            for flavor in ("pseudocode", RUST_FLAVOR):
+                old = sorted((a, k.value, str(p)) for a, k, _, p in cp.items(flavor))
+                new = sorted((a, k.value, str(p)) for a, k, _, p in new_cp.items(flavor))
+                assert new == old
+            assert new_cp.get_prototype(0x400600) == c_proto
+            assert new_cp.get_prototype(0x400600, flavor=RUST_FLAVOR) == rust_proto
+            assert new_cp.is_prototype_manual(0x400700, flavor=RUST_FLAVOR) is True
+            assert new_cp.is_prototype_manual(0x400700) is None
 
 
 if __name__ == "__main__":

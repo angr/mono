@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "be995f52ee38a055d0f96d04f3e4d02192a3d743",
-      "committed_at": "2026-10-05T13:08:15-07:00",
-      "subject": "Clinic: Serialize addresses as unsigned (#7379)",
+      "commit": "fd3904c21bd15f14ebe475d16823b695701cab28",
+      "committed_at": "2026-10-07T17:45:17-07:00",
+      "subject": "FunctionManager._evict_n: Resilience against multithreaded accesses. (#7429)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "53a888d51366f7e00a54ba88285060fe9b6f60fe",
-      "committed_at": "2026-10-05T12:08:06-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#1743)",
+      "commit": "9dfc92d4e9660ad395ceda476d133c7d92ad7cb0",
+      "committed_at": "2026-10-07T19:14:35Z",
+      "subject": "Update version to 10.0.3.dev0 [ci skip]",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -48,25 +48,25 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "420b45ede562e8db46ad8898acb924e6f24c8d32",
-      "committed_at": "2026-10-05T12:08:19-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#390)",
+      "commit": "af4fdcf9661f8721f962223fa3539286e627bf07",
+      "committed_at": "2026-10-07T19:14:36Z",
+      "subject": "Update version to 10.0.3.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "claripy": {
       "upstream": "https://github.com/angr/claripy",
-      "commit": "84a71b66997afe49cbd7636c542264952b0f1571",
-      "committed_at": "2026-09-30T11:13:41Z",
-      "subject": "Update version to 9.3.7.dev0 [ci skip]",
+      "commit": "60e037e51ffcdb1f1034268bb9f0f9a6b42fc697",
+      "committed_at": "2026-10-07T19:14:39Z",
+      "subject": "Update version to 9.3.8.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "80dadfe13f878582046ed26e0e2507668d50f616",
-      "committed_at": "2026-10-05T12:41:48-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#861)",
+      "commit": "752bce544a058944b6bb2c49998fc4c22799ce75",
+      "committed_at": "2026-10-07T19:14:40Z",
+      "subject": "Update version to 10.0.3.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -83,9 +83,9 @@
     },
     "pypcode": {
       "upstream": "https://github.com/angr/pypcode",
-      "commit": "559aacdc9d363fd19477d9daa40721279cd99248",
-      "committed_at": "2026-06-29T11:33:46-07:00",
-      "subject": "ci: bump actions/setup-python from 6.2.0 to 6.3.0",
+      "commit": "17751ddba848a9d920da09ecb65c8993cfde75a8",
+      "committed_at": "2026-10-06T18:07:35-07:00",
+      "subject": "v4.0.2.dev0",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -99,9 +99,9 @@
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "08ef1010ef83fe3058350fed57b45020d4e57567",
-      "committed_at": "2026-10-05T12:07:40-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#591)",
+      "commit": "9d921fe8c1bacc3f7470afc6bb761acbc2ffbff7",
+      "committed_at": "2026-10-07T19:14:41Z",
+      "subject": "Update version to 10.0.3.dev0 [ci skip]",
       "excluded": [
         ".gitmodules"
       ],
@@ -119,13 +119,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-05T20:55:22+00:00",
+  "imported_at": "2026-10-08T03:48:38+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "6ac63bf4e32db7067538d44754dbb91771437e09",
-      "committed_at": "2026-10-05T20:15:44Z",
-      "subject": "Go pclntab layout binaries: langdetect_go and basics built with go1.4.3, go1.9.7, go1.10.8, go1.15.15 and go1.16.15.",
+      "commit": "95d664bfaf32792009ffdd7f07b194d7fd3cf0ba",
+      "committed_at": "2026-10-07T19:14:38Z",
+      "subject": "Update version to 10.0.3.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }

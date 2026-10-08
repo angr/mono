@@ -74,6 +74,7 @@ enum CConstructKind {
     CCK_VEX_CCALL_EXPRESSION = 33;
     CCK_DIRTY_EXPRESSION = 34;
     CCK_VECTOR_CONVERT = 35;
+    CCK_REINTERPRET = 36;
 }
 
 // =====================================================================================================================
@@ -147,9 +148,15 @@ message CBreakMsg {}
 message CContinueMsg {}
 
 // CSwitchCase
+// A case label is whatever recorded it: a jump table gives a small index, a lowered comparison chain gives the
+// comparison constant, which is an unsigned 64-bit value and so does not always fit in an int64. ``case_ids``
+// therefore holds each label's raw 64-bit value, and ``case_ids_signed`` says, label by label in the same
+// order, which of them to read back as negative. It is written only for an entry that has a negative label,
+// so an entry without it has none.
 message CSwitchCaseEntry {
-    repeated int64 case_ids = 1;                  // a single int or a tuple of ints
+    repeated uint64 case_ids = 1;                 // a single label or a tuple of them, as raw 64-bit values
     uint32 statements_id = 2;                     // CStatements node_id
+    repeated bool case_ids_signed = 3;            // parallel to case_ids, or empty
 }
 message CSwitchCaseMsg {
     uint32 switch_id = 1;                         // CExpression node_id
@@ -219,6 +226,7 @@ message CFunctionCallMsg {
     repeated uint32 args_ids = 5;
     // show_demangled_name / show_disambiguated_name live in Codegen.node_config; only nodes that override the
     // defaults store a NodeConfigEntry.
+    uint32 callsite_prototype_type_ref = 6;      // declared prototype of a call with no callee function; 0 = none
 }
 
 // Per-node display configuration, stored out-of-line so the common default never occupies node bodies.
@@ -286,7 +294,7 @@ message CBinaryOpMsg {
     uint32 common_type_ref = 4;
 }
 
-// CTypeCast
+// CTypeCast and CReinterpret (a bit-pattern view between two types of the same width)
 message CTypeCastMsg {
     uint32 src_type_ref = 1;
     uint32 dst_type_ref = 2;
@@ -343,6 +351,7 @@ message CVEXCCallExpressionMsg {
 // CDirtyExpression (ailment-coupled)
 message CDirtyExpressionMsg {
     bytes dirty = 1;                              // ailment Expression.to_bytes()
+    repeated uint32 operand_ids = 2;              // CExpression node_ids
 }
 
 // CVectorConvert (ailment-coupled)
@@ -400,6 +409,7 @@ message CConstructNode {
         CVEXCCallExpressionMsg cvex_ccall = 132;
         CDirtyExpressionMsg cdirty_expr = 133;
         CVectorConvertMsg cvector_convert = 134;
+        CTypeCastMsg creinterpret = 135;
     }
 }
 

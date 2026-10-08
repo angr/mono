@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 
 from angr import ailment
-from angr.calling_conventions import SimComboArg, SimReferenceArgument, SimRegArg, SimStructArg
+from angr.calling_conventions import SimComboArg, SimLyingRegArg, SimReferenceArgument, SimRegArg, SimStructArg
+from angr.knowledge_plugins.plugin import DEFAULT_FLAVOR
 from angr.sim_type import SimTypeBottom
 from angr.utils.types import dereference_simtype_by_lib
 
@@ -17,31 +18,56 @@ class ReturnMaker(AILGraphWalker):
     Traverse the AILBlock graph of a function and update .ret_exprs of all return statements.
     """
 
-    def __init__(self, ail_manager, arch, function, ail_graph):
+    def __init__(self, ail_manager, arch, function, ail_graph, flavor: str = DEFAULT_FLAVOR):
         super().__init__(ail_graph, self._handler, replace_nodes=True)
         self.ail_manager = ail_manager
         self.arch = arch
         self.function = function
+        self.flavor = flavor
 
         self.walk()
 
     def _next_atom(self) -> int:
         return self.ail_manager.next_atom()
 
+    def _resolve_return_register(self, ret_val: SimRegArg) -> tuple[int, int] | None:
+        """Resolve the return register to a concrete (offset, size) pair.
+
+        For normal registers (e.g. eax, xmm0), this is a direct lookup.
+        For x87 SimLyingRegArg ("st0"), compute from the calling convention:
+        ftop=0 at entry, ftop=-1 at return -> st0 = fpreg[7] = mm7.
+        """
+        # Normal register: direct lookup
+        if ret_val.reg_name in self.arch.registers:
+            return self.arch.registers[ret_val.reg_name]
+
+        # SimLyingRegArg ("st0"): resolve from the calling convention.
+        # ftop is 0 at the entry; the callee pops its x87 arguments and pushes the return value, so at the return
+        # site st0 = fpreg[(x87_args - 1) % 8] (mm7 without x87 arguments).
+        if isinstance(ret_val, SimLyingRegArg):
+            fpreg = self.arch.registers.get("fpreg")
+            if fpreg is not None:
+                fp_ret_offset = fpreg[0] + (((self.function.calling_convention.x87_args - 1) % 8) << 3)
+                return (fp_ret_offset, ret_val.size)
+
+        l.warning("Cannot resolve return register %s to a concrete offset.", ret_val.reg_name)
+        return None
+
     def _handle_Return(self, stmt_idx: int, stmt: ailment.Stmt.Return, block: ailment.Block | None):  # pylint:disable=unused-argument
+        prototype = self.function.get_prototype(self.flavor)
         if (
             block is not None
             and not stmt.ret_exprs
-            and self.function.prototype is not None
-            and self.function.prototype.returnty is not None
-            and type(self.function.prototype.returnty) is not SimTypeBottom
+            and prototype is not None
+            and prototype.returnty is not None
+            and type(prototype.returnty) is not SimTypeBottom
         ):
             new_stmt = stmt.copy()
             new_ret_exprs = list(new_stmt.ret_exprs)
             returnty = (
-                dereference_simtype_by_lib(self.function.prototype.returnty, self.function.prototype_libname)
+                dereference_simtype_by_lib(prototype.returnty, self.function.prototype_libname)
                 if self.function.prototype_libname
-                else self.function.prototype.returnty
+                else prototype.returnty
             )
             ret_val = self.function.calling_convention.return_val(returnty, perspective_returned=True)
             deref_size = None
@@ -56,42 +82,31 @@ class ReturnMaker(AILGraphWalker):
                 )
                 ret_val = ret_val.ptr_loc
             if isinstance(ret_val, SimRegArg):
-                reg = self.arch.registers[ret_val.reg_name]
-                new_ret_exprs.append(
-                    ailment.Expr.Register(
-                        self._next_atom(),
-                        reg[0],
-                        ret_val.size * self.arch.byte_width,
-                        reg_name=self.arch.translate_register_name(reg[0], ret_val.size),
-                        ins_addr=stmt.tags.get("ins_addr"),  # pyright: ignore[reportTypedDictNotRequiredAccess]
+                reg = self._resolve_return_register(ret_val)
+                if reg is not None:
+                    new_ret_exprs.append(
+                        ailment.Expr.Register(
+                            self._next_atom(),
+                            reg[0],
+                            ret_val.size * self.arch.byte_width,
+                            reg_name=self.arch.translate_register_name(reg[0], ret_val.size),
+                            ins_addr=stmt.tags.get("ins_addr"),  # pyright: ignore[reportTypedDictNotRequiredAccess]
+                        )
                     )
-                )
             elif isinstance(ret_val, SimComboArg):
-                # TODO: we currently only support the first register in the combo, but we should support all of them
-                # ret_val = ret_val.locations[0]
-                # reg = self.arch.registers[ret_val.reg_name]
-                # new_stmt.ret_exprs.append(
-                #     ailment.Expr.Register(
-                #         self._next_atom(),
-                #         None,
-                #         reg[0],
-                #         ret_val.size * self.arch.byte_width,
-                #         reg_name=self.arch.translate_register_name(reg[0], ret_val.size),
-                #         ins_addr=stmt.tags["ins_addr"],
-                #     )
-                # )
                 for ret_val_loc in ret_val.locations:
                     if isinstance(ret_val_loc, SimRegArg):
-                        reg = self.arch.registers[ret_val_loc.reg_name]
-                        new_ret_exprs.append(
-                            ailment.Expr.Register(
-                                self._next_atom(),
-                                reg[0],
-                                ret_val_loc.size * self.arch.byte_width,
-                                reg_name=self.arch.translate_register_name(reg[0], ret_val_loc.size),
-                                ins_addr=stmt.tags.get("ins_addr"),  # pyright: ignore[reportTypedDictNotRequiredAccess]
+                        reg = self._resolve_return_register(ret_val_loc)
+                        if reg is not None:
+                            new_ret_exprs.append(
+                                ailment.Expr.Register(
+                                    self._next_atom(),
+                                    reg[0],
+                                    ret_val_loc.size * self.arch.byte_width,
+                                    reg_name=self.arch.translate_register_name(reg[0], ret_val_loc.size),
+                                    ins_addr=stmt.tags.get("ins_addr"),  # pyright: ignore[reportTypedDictNotRequiredAccess]
+                                )
                             )
-                        )
                     else:
                         l.warning("Unsupported type of return expression %s.", type(ret_val_loc))
             else:

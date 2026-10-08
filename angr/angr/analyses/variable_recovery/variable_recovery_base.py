@@ -24,6 +24,7 @@ from angr.storage.memory_mixins import MultiValuedMemory
 from angr.utils.cowdict import DefaultChainMapCOW
 
 if TYPE_CHECKING:
+    from angr.knowledge_plugins.variables.variable_manager import VariableManagerInternal
     from angr.project import Project
     from angr.storage import SimMemoryObject
 
@@ -91,11 +92,14 @@ class VariableRecoveryBase(Analysis):
         vvar_to_vvar: dict[int, int] | None = None,
         func_graph: networkx.DiGraph[CodeNode] | networkx.DiGraph[ailment.Block] | None = None,
         entry_node_addr: int | ailment.Address | None = None,
+        flavor: str | None = None,
     ):
         self.function = func
         self.func_graph = func_graph
         self.entry_node_addr = entry_node_addr
         self.variable_manager = self.kb.variables
+        # decompilation flavor on whose behalf variables are recovered; None (no decompilation) uses the C globals
+        self.flavor = flavor
 
         self._max_iterations = max_iterations
         self._store_live_variables = store_live_variables
@@ -108,6 +112,10 @@ class VariableRecoveryBase(Analysis):
     #
     # Public methods
     #
+
+    @property
+    def global_variable_manager(self) -> VariableManagerInternal:
+        return self.variable_manager.get_global_manager(self.flavor)
 
     def get_variable_definitions(self, block_addr):
         """
@@ -178,7 +186,9 @@ class VariableRecoveryBase(Analysis):
             single_byte_var = single_byte_vars[0]
 
             if not varman.get_variable_accesses(single_byte_var):
-                # remove this variable
+                # remove this variable; atoms linked to it (e.g. an earlier &var) now refer to an overlapping one
+                replacement = min((v for v in var_list if v is not single_byte_var), key=lambda v: v.ident or "")
+                varman.rebind_variable_records(single_byte_var, replacement)
                 varman._variables.discard(single_byte_var)
 
 
@@ -386,6 +396,10 @@ class VariableRecoveryStateBase:
     @property
     def variable_manager(self):
         return self._analysis.variable_manager
+
+    @property
+    def global_variable_manager(self) -> VariableManagerInternal:
+        return self._analysis.global_variable_manager
 
     @property
     def variables(self):

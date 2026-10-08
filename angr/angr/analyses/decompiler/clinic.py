@@ -6,6 +6,7 @@ import enum
 import importlib
 import itertools
 import logging
+import math
 from collections import defaultdict, namedtuple
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard
 
 import capstone
 import networkx
+import pyvex
 
 from angr import ailment
 from angr.ailment import AILBlockRewriter, Assignment, Block, Statement
@@ -50,6 +52,7 @@ from angr.calling_conventions import (
     SimCCUsercall,
     SimComboArg,
     SimFunctionArgument,
+    SimLyingRegArg,
     SimReferenceArgument,
     SimRegArg,
     SimStackArg,
@@ -61,7 +64,7 @@ from angr.codenode import BlockNode, FuncNode
 from angr.errors import AngrDecompilationComplexityError, AngrDecompilationError, SimTranslationError
 from angr.knowledge_base import KnowledgeBase
 from angr.knowledge_plugins.cfg.memory_data import MemoryDataSort
-from angr.knowledge_plugins.functions import Function
+from angr.knowledge_plugins.functions import DEFAULT_FLAVOR, Function
 from angr.knowledge_plugins.functions.function import PrototypeSource
 from angr.knowledge_plugins.key_definitions import atoms
 from angr.knowledge_plugins.variables.variable_manager import VariableManagerInternal
@@ -76,9 +79,11 @@ from angr.sim_type import (
     SimTypeArray,
     SimTypeBottom,
     SimTypeChar,
+    SimTypeDouble,
     SimTypeFloat,
     SimTypeFunction,
     SimTypeInt,
+    SimTypeLongDouble,
     SimTypeLongLong,
     SimTypeNum,
     SimTypePointer,
@@ -111,6 +116,8 @@ from angr.utils.vex import block_branch_ins_addr
 from .ail_simplifier import AILSimplifier
 from .ailgraph_walker import AILGraphWalker, RemoveNodeNotice
 from .decompilation_options import DEFAULT_MAX_AIL_STATEMENTS
+from .edits.cache import restore_user_edits, snapshot_user_edits
+from .ireg_resolver import IRegisterResolver
 from .notes import DecompilationNote
 from .optimization_passes import (
     CONDENSING_OPTS,
@@ -440,7 +447,7 @@ class Clinic(Analysis, Serializable):
         flatten_args=False,
         constrain_callee_prototypes: bool = False,
         semvar_naming: bool = True,
-        flavor: str = "pseudocode",
+        flavor: str = DEFAULT_FLAVOR,
         variable_map: VariableMap | None = None,
         save_unoptimized_graph: bool = False,
         known_patterns: str | tuple[str, ...] | None = None,
@@ -549,6 +556,12 @@ class Clinic(Analysis, Serializable):
         self._inline_functions = inline_functions or set()
         self._inlined_counts = {} if inlined_counts is None else inlined_counts
         self._inlining_parents = inlining_parents or set()
+        # net x87 stack effect per callee, shared by the IRegisterResolver passes
+        self._x87_callee_deltas: dict[int, int | None] = {}
+        # st(0) register offset after each call (by call instruction address), filled by IRegisterResolver
+        self._x87_call_st0: dict[int, int] = {}
+        # ftop right before each call (by call instruction address), filled by IRegisterResolver
+        self._x87_call_ftop: dict[int, int] = {}
         self._desired_variables = desired_variables
         self._force_loop_single_exit = force_loop_single_exit
         self._refine_loops_with_single_successor = refine_loops_with_single_successor
@@ -711,18 +724,25 @@ class Clinic(Analysis, Serializable):
     def _decompilation_fixups(self, ail_graph):
         is_pcode_arch = ":" in self.project.arch.name
 
+        ail_graph = self._rewrite_indirect_register_accesses(ail_graph)
+
+        # We should be able to resolve all indirect register loads by this point
+
         self._remove_redundant_jump_blocks(ail_graph)
         # _fix_abnormal_switch_case_heads may re-lift from VEX blocks, so it should be placed as high up as possible
         self._fix_abnormal_switch_case_heads(ail_graph)
-        if self._rewrite_ites_to_diamonds:
-            self._rewrite_ite_expressions(ail_graph)
         self._remove_redundant_jump_blocks(ail_graph)
         if self._insert_labels:
             self._insert_block_labels(ail_graph)
 
-        # Run simplification passes
+        # Run simplification passes first so that x87 fptag NaN ITE checks and
+        # CmpF bit-manipulation patterns are simplified by peephole passes before
+        # we convert remaining ITEs to diamond control flow.
         self._update_progress(22.0, text="Optimizing fresh ailment graph")
         _, ail_graph = self._run_simplification_passes(ail_graph, OptimizationPassStage.AFTER_AIL_GRAPH_CREATION)
+
+        if self._rewrite_ites_to_diamonds:
+            self._rewrite_ite_expressions(ail_graph)
 
         # Fix "fake" indirect jumps and calls
         self._update_progress(25.0, text="Analyzing simple indirect jumps")
@@ -739,6 +759,10 @@ class Clinic(Analysis, Serializable):
         if is_pcode_arch:
             self._update_progress(29.0, text="Recovering calling conventions (AIL mode)")
             self._recover_calling_conventions(func_graph=ail_graph)
+
+        # ITE-to-diamond rewriting and other fixups above re-lift blocks from VEX, which can reintroduce raw
+        # IRegisters. Resolve them again now, while index registers (x87 ftop) are still plain registers.
+        ail_graph = self._rewrite_indirect_register_accesses(ail_graph)
 
         return self._apply_callsite_prototype_and_calling_convention(ail_graph)
 
@@ -1008,7 +1032,8 @@ class Clinic(Analysis, Serializable):
 
     def _stage_make_return_sites(self) -> None:
         self._update_progress(30.0, text="Making return sites")
-        if self.function.prototype is None or not isinstance(self.function.prototype.returnty, SimTypeBottom):
+        func_proto = self.function.get_prototype(self.flavor)
+        if func_proto is None or not isinstance(func_proto.returnty, SimTypeBottom):
             self._ail_graph = self._make_returns(self._ail_graph)
         _, self._ail_graph = self._run_simplification_passes(
             self._ail_graph, stage=OptimizationPassStage.BEFORE_SSA_LEVEL0_TRANSFORMATION
@@ -1017,6 +1042,13 @@ class Clinic(Analysis, Serializable):
     def _stage_make_function_argument_list(self) -> None:
         self._update_progress(33.0, text="Making argument list")
         self.arg_list = self._make_argument_list()
+
+        # On i386, merge adjacent 4-byte stack args into 8-byte doubles early
+        # (before SSA) so that the SSA creates 8-byte parameter VVars.  This
+        # prevents the two-half Insert pattern that produces ugly half-writes.
+        if self.project.arch.name == "X86" and self.function.get_prototype(self.flavor) is not None:
+            self.arg_list = self._early_merge_adjacent_stack_args_to_doubles(self.arg_list)
+
         self.arg_vvars = self._create_function_argument_vvars(self.arg_list)
         self.func_args = {arg_vvar for arg_vvar, _ in self.arg_vvars.values()}
 
@@ -1189,6 +1221,7 @@ class Clinic(Analysis, Serializable):
             fold_callexprs_into_conditions=self._fold_callexprs_into_conditions,
             arg_vvars=self.arg_vvars,
             preserve_vvar_ids=self._preserve_vvar_ids,
+            remove_dead_assignments=True,
         )
 
         self.arg_list = []
@@ -1286,7 +1319,7 @@ class Clinic(Analysis, Serializable):
         l.debug("Semantic naming renamed %d variables", len(var_name_mapping))
 
     def _stage_collect_externs(self) -> None:
-        self.externs = self._collect_externs(self._ail_graph, self.kb, self.variable_map)
+        self.externs = self._collect_externs(self._ail_graph, self.kb, self.variable_map, self.flavor)
 
     def _analyze_for_data_refs(self):
         # Remove alignment blocks
@@ -1459,7 +1492,7 @@ class Clinic(Analysis, Serializable):
             if (
                 not is_indirect_call_thunk
                 and target_func.calling_convention is not None
-                and target_func.prototype is not None
+                and target_func.get_prototype(self.flavor) is not None
             ):
                 continue
 
@@ -1468,40 +1501,52 @@ class Clinic(Analysis, Serializable):
                 if data.get("type", None) != "return":
                     call_sites.append(pred)
             # case 1: calling conventions and prototypes are available at every single call site
-            if call_sites and all(self.kb.callsite_prototypes.has_prototype(callsite.addr) for callsite in call_sites):
+            if call_sites and all(
+                self.kb.callsite_prototypes.has_prototype(callsite.addr, flavor=self.flavor) for callsite in call_sites
+            ):
                 continue
 
             # case 2: the callee is a SimProcedure
             if target_func.is_simprocedure:
-                cc = self.project.analyses.CallingConvention(target_func, fail_fast=self._fail_fast)  # type: ignore
+                cc = self.project.analyses.CallingConvention(
+                    target_func,
+                    fail_fast=self._fail_fast,  # type: ignore
+                    flavor=self.flavor,
+                )
                 if cc.cc is not None and cc.prototype is not None:
                     target_func.calling_convention = cc.cc
                     # Only set prototype if not already defined (preserve user-defined prototypes)
-                    if target_func.prototype is None:
-                        target_func.prototype = cc.prototype
-                        target_func.prototype_libname = cc.prototype_libname
-                        target_func.prototype_source = (
-                            PrototypeSource.SIMPROC if cc.proto_from_symbol else PrototypeSource.CCA_LOW
+                    if target_func.get_prototype(self.flavor) is None:
+                        target_func.set_prototype(
+                            self.flavor,
+                            cc.prototype,
+                            source=PrototypeSource.SIMPROC if cc.proto_from_symbol else PrototypeSource.CCA_LOW,
                         )
+                        target_func.prototype_libname = cc.prototype_libname
                     continue
 
             # case 3: the callee is a PLT function
             if target_func.is_plt:
-                cc = self.project.analyses.CallingConvention(target_func, fail_fast=self._fail_fast)  # type: ignore
+                cc = self.project.analyses.CallingConvention(
+                    target_func,
+                    fail_fast=self._fail_fast,  # type: ignore
+                    flavor=self.flavor,
+                )
                 if cc.cc is not None and cc.prototype is not None:
                     target_func.calling_convention = cc.cc
                     # Only set prototype if not already defined (preserve user-defined prototypes)
-                    if target_func.prototype is None:
-                        target_func.prototype = cc.prototype
-                        target_func.prototype_libname = cc.prototype_libname
-                        target_func.prototype_source = (
-                            PrototypeSource.SIMPROC if cc.proto_from_symbol else PrototypeSource.CCA_LOW
+                    if target_func.get_prototype(self.flavor) is None:
+                        target_func.set_prototype(
+                            self.flavor,
+                            cc.prototype,
+                            source=PrototypeSource.SIMPROC if cc.proto_from_symbol else PrototypeSource.CCA_LOW,
                         )
+                        target_func.prototype_libname = cc.prototype_libname
                     continue
 
             # case 4: fall back to call site analysis
             for callsite in call_sites:
-                if self.kb.callsite_prototypes.has_prototype(callsite.addr):
+                if self.kb.callsite_prototypes.has_prototype(callsite.addr, flavor=self.flavor):
                     continue
                 if callsite.size == 0:
                     # lifting failure?
@@ -1533,10 +1578,13 @@ class Clinic(Analysis, Serializable):
                     callsite_insn_addr=callsite_ins_addr,
                     func_graph=func_graph,
                     fail_fast=self._fail_fast,  # type: ignore
+                    flavor=self.flavor,
                 )
 
                 if cc.cc is not None and cc.prototype is not None:
-                    self.kb.callsite_prototypes.set_prototype(callsite.addr, cc.cc, cc.prototype)
+                    self.kb.callsite_prototypes.set_prototype(
+                        callsite.addr, cc.cc, cc.prototype, manual=False, flavor=self.flavor
+                    )
                     if func_graph is not None and cc.prototype.returnty is not None:
                         # patch the AIL call statement if we can find one
                         callsite_ail_block: ailment.Block | None = next(
@@ -1567,12 +1615,14 @@ class Clinic(Analysis, Serializable):
 
         # finally, recover the calling convention of the current function
         if (
-            self.function.prototype is None or self.function.calling_convention is None
-        ) or not self.function.is_prototype_groundtruth:
-            old_proto = self.function.prototype
-            old_source = self.function.prototype_source
+            self.function.get_prototype(self.flavor) is None or self.function.calling_convention is None
+        ) or not self.function.is_prototype_groundtruth_for(self.flavor):
+            old_proto = self.function.get_prototype(self.flavor)
+            old_source = self.function.get_prototype_source(self.flavor)
 
-            self.function.prototype = None  # clear it
+            # CCA reads and writes this flavor's prototypes. An empty entry (not a dropped one, which would fall back
+            # to the C prototype) makes it analyze the function and keeps a recursive call from seeing a stale one.
+            self.function.set_prototype(self.flavor, None, source=PrototypeSource.NONE)
             self.function.ran_cca = False  # also clear the ran_cca bit so CCCA runs again
             self.project.analyses.CompleteCallingConventions(
                 fail_fast=self._fail_fast,  # type: ignore
@@ -1583,15 +1633,17 @@ class Clinic(Analysis, Serializable):
                 # a function that writes rax last is not thereby returning it; its callers know whether they read
                 # it, and this is one function, so asking them is cheap
                 analyze_callsites=True,
+                flavor=self.flavor,
             )
 
+            new_proto = self.function.get_prototype(self.flavor)
             if (
                 old_source >= PrototypeSource.CCA_LOW
                 and old_proto is not None
-                and self.function.prototype is not None
+                and new_proto is not None
                 and (isinstance(old_proto.returnty, SimTypeBottom) or old_proto.returnty is None)
             ):
-                self.function.prototype.returnty = old_proto.returnty
+                new_proto.returnty = old_proto.returnty
 
     @timethis
     def _track_stack_pointers(self):
@@ -1626,6 +1678,7 @@ class Clinic(Analysis, Serializable):
                 track_memory=self._sp_tracker_track_memory,
                 cross_insn_opt_callback=_cross_insn_opt_callback,
                 initial_reg_values=initial_reg_values,
+                flavor=self.flavor,
             )
 
         spt = _run_spt()
@@ -1671,7 +1724,10 @@ class Clinic(Analysis, Serializable):
         callsite_protos = self.kb.callsite_prototypes
         candidates: list[tuple[int, SimCC, SimTypeFunction, SimCC]] = []
         for block in self.function.blocks:
-            if block.vex.jumpkind != "Ijk_Call" or callsite_protos.is_prototype_certain(block.addr) is not False:
+            if (
+                block.vex.jumpkind != "Ijk_Call"
+                or callsite_protos.is_prototype_certain(block.addr, flavor=self.flavor) is not False
+            ):
                 continue
             if any(
                 isinstance(dst, FuncNode) and not self._is_unresolvable_call_target(dst.addr)
@@ -1679,8 +1735,8 @@ class Clinic(Analysis, Serializable):
             ):
                 # direct calls use the callee's calling convention
                 continue
-            cc = callsite_protos.get_cc(block.addr)
-            proto = callsite_protos.get_prototype(block.addr)
+            cc = callsite_protos.get_cc(block.addr, flavor=self.flavor)
+            proto = callsite_protos.get_prototype(block.addr, flavor=self.flavor)
             if cc is None or proto is None or cc.CALLEE_CLEANUP:
                 continue
             if not any(isinstance(loc, SimStackArg) for loc in cc.arg_locs(proto)):
@@ -1701,10 +1757,10 @@ class Clinic(Analysis, Serializable):
 
         def _balanced_spt(subset):
             for addr, _, proto, cleanup_cc in subset:
-                callsite_protos.set_prototype(addr, cleanup_cc, proto)
+                callsite_protos.set_prototype(addr, cleanup_cc, proto, flavor=self.flavor)
             new_spt = run_spt()
             for addr, cc, proto, _ in subset:
-                callsite_protos.set_prototype(addr, cc, proto)
+                callsite_protos.set_prototype(addr, cc, proto, flavor=self.flavor)
             return new_spt if self._stack_balanced(new_spt) else None
 
         for subsets in subsets_by_size:
@@ -1715,7 +1771,7 @@ class Clinic(Analysis, Serializable):
             if solutions:
                 subset, new_spt = solutions[0]
                 for addr, _, proto, cleanup_cc in subset:
-                    callsite_protos.set_prototype(addr, cleanup_cc, proto)
+                    callsite_protos.set_prototype(addr, cleanup_cc, proto, flavor=self.flavor)
                 return new_spt
         return spt
 
@@ -1738,10 +1794,10 @@ class Clinic(Analysis, Serializable):
                     callee.returning is False
                     or callee.is_simprocedure
                     or callee.is_plt
-                    or callee.prototype_source >= PrototypeSource.SIMPROC
+                    or callee.get_prototype_source(self.flavor) >= PrototypeSource.SIMPROC
                 ):
                     continue
-                extra_pop = self.project.analyses[FactCollector].prep(kb=self.kb)(callee).extra_pop
+                extra_pop = self.project.analyses[FactCollector].prep(kb=self.kb)(callee, flavor=self.flavor).extra_pop
                 if extra_pop is None or extra_pop != spt.callee_cleanup_size_at(node):
                     return False
         return True
@@ -2210,12 +2266,12 @@ class Clinic(Analysis, Serializable):
                 continue
 
             # manually-specified call-site prototype
-            has_callsite_prototype = self.kb.callsite_prototypes.has_prototype(block.addr)
+            has_callsite_prototype = self.kb.callsite_prototypes.has_prototype(block.addr, flavor=self.flavor)
             if has_callsite_prototype:
-                manually_specified = self.kb.callsite_prototypes.is_prototype_manual(block.addr)
+                manually_specified = self.kb.callsite_prototypes.is_prototype_manual(block.addr, flavor=self.flavor)
                 if manually_specified:
-                    cc = self.kb.callsite_prototypes.get_cc(block.addr)
-                    prototype = self.kb.callsite_prototypes.get_prototype(block.addr)
+                    cc = self.kb.callsite_prototypes.get_cc(block.addr, flavor=self.flavor)
+                    prototype = self.kb.callsite_prototypes.get_prototype(block.addr, flavor=self.flavor)
 
             # function-specific prototype
             func = None
@@ -2227,15 +2283,15 @@ class Clinic(Analysis, Serializable):
                 if target is not None and target in self.kb.functions:
                     # function-specific logic when the calling target is known
                     func = self.kb.functions[target]
-                    if func.prototype is None:
+                    if func.get_prototype(self.flavor) is None:
                         func.find_declaration()
                     cc = func.calling_convention
-                    prototype = func.prototype
+                    prototype = func.get_prototype(self.flavor)
 
             # automatically recovered call-site prototype
             if (cc is None or prototype is None) and has_callsite_prototype:
-                cc = self.kb.callsite_prototypes.get_cc(block.addr)
-                prototype = self.kb.callsite_prototypes.get_prototype(block.addr)
+                cc = self.kb.callsite_prototypes.get_cc(block.addr, flavor=self.flavor)
+                prototype = self.kb.callsite_prototypes.get_prototype(block.addr, flavor=self.flavor)
 
             # ensure the prototype has been resolved
             if prototype is not None and func is not None:
@@ -2255,8 +2311,8 @@ class Clinic(Analysis, Serializable):
             new_last_stmt.tags["is_prototype_guessed"] = True
             new_last_stmt.expr.tags["is_prototype_guessed"] = True
             if func is not None:
-                new_last_stmt.tags["is_prototype_guessed"] = not func.is_prototype_groundtruth
-                new_last_stmt.expr.tags["is_prototype_guessed"] = not func.is_prototype_groundtruth
+                new_last_stmt.tags["is_prototype_guessed"] = not func.is_prototype_groundtruth_for(self.flavor)
+                new_last_stmt.expr.tags["is_prototype_guessed"] = not func.is_prototype_groundtruth_for(self.flavor)
             block.statements[-1] = new_last_stmt
 
         return ail_graph
@@ -2296,16 +2352,16 @@ class Clinic(Analysis, Serializable):
         for ail_block in ail_graph.nodes():
             if only_blocks is not None and (ail_block.addr, ail_block.idx) not in only_blocks:
                 continue
-            simplified = self._simplify_block(
+            simplified_block = self._simplify_block(
                 ail_block,
                 stack_pointer_tracker=stack_pointer_tracker,
                 cache=cache,
                 preserve_vvar_ids=preserve_vvar_ids,
                 type_hints=type_hints,
             )
-            if simplified is not None:
+            if simplified_block is not None:
                 key = ail_block.addr, ail_block.idx
-                blocks_by_addr_and_idx[key] = simplified
+                blocks_by_addr_and_idx[key] = simplified_block
 
         # update blocks_map to allow node_addr to node lookup
         def _replace_node_handler(node):
@@ -2408,6 +2464,7 @@ class Clinic(Analysis, Serializable):
         arg_vvars: dict[int, tuple[ailment.Expr.VirtualVariable, SimVariable]] | None = None,
         preserve_vvar_ids: set[int] | None = None,
         simplify_blocks: bool = True,
+        remove_dead_assignments=True,
     ) -> bool:
         """
         Simplify the entire function until it reaches a fixed point.
@@ -2418,6 +2475,8 @@ class Clinic(Analysis, Serializable):
         :return:                True if a fixed point was reached, False if the iteration limit was hit first (in
                                 which case the graph may still be simplifiable).
         """
+
+        simplified = False
 
         for idx in range(max_iterations):
             simplified = self._simplify_function_once(
@@ -2434,10 +2493,13 @@ class Clinic(Analysis, Serializable):
                 arg_vvars=arg_vvars,
                 preserve_vvar_ids=preserve_vvar_ids,
                 simplify_blocks=simplify_blocks,
+                remove_dead_assignments=remove_dead_assignments,
             )
             if not simplified:
                 return True
         return False
+
+        return simplified
 
     @timethis
     def _simplify_function_once(
@@ -2455,6 +2517,7 @@ class Clinic(Analysis, Serializable):
         arg_vvars: dict[int, tuple[ailment.Expr.VirtualVariable, SimVariable]] | None = None,
         preserve_vvar_ids: set[int] | None = None,
         simplify_blocks: bool = True,
+        remove_dead_assignments=True,
     ):
         """
         Simplify the entire function once.
@@ -2482,6 +2545,7 @@ class Clinic(Analysis, Serializable):
             removed_vvar_ids=removed_vvar_ids,
             arg_vvars=arg_vvars,
             avoid_vvar_ids=preserve_vvar_ids,
+            remove_dead_assignments=remove_dead_assignments,
         )
         # cache the simplifier's RDA analysis
         self.reaching_definitions = simp._reaching_definitions
@@ -2647,6 +2711,7 @@ class Clinic(Analysis, Serializable):
             ssa_stackvars=False,
             func_args=func_args,
             vvar_id_start=self.vvar_id_start,
+            flavor=self.flavor,
         )
         self.vvar_id_start = ssailification.max_vvar_id + 1
         self._resize_function_arguments(ssailification.resized_func_args)
@@ -2666,6 +2731,7 @@ class Clinic(Analysis, Serializable):
             ssa_stackvars=True,
             func_args=func_args,
             vvar_id_start=self.vvar_id_start,
+            flavor=self.flavor,
         )
         self.vvar_id_start = ssailification.max_vvar_id + 1
         self._resize_function_arguments(ssailification.resized_func_args)
@@ -2722,8 +2788,9 @@ class Clinic(Analysis, Serializable):
 
     @timethis
     def _make_argument_list(self) -> list[SimVariable]:
-        if self.function.calling_convention is not None and self.function.prototype is not None:
-            args: list[SimFunctionArgument] = self.function.calling_convention.arg_locs(self.function.prototype)
+        prototype = self.function.get_prototype(self.flavor)
+        if self.function.calling_convention is not None and prototype is not None:
+            args: list[SimFunctionArgument] = self.function.calling_convention.arg_locs(prototype)
             if self._flatten_args:
                 new_args = []
                 for arg in args:
@@ -2734,11 +2801,21 @@ class Clinic(Analysis, Serializable):
                 args = new_args
             arg_vars: list[SimVariable] = []
             if args:
-                arg_names = self.function.prototype.arg_names or ()
+                arg_names = prototype.arg_names or ()
                 for idx, arg in enumerate(args):
-                    if isinstance(arg, SimRegArg):
+                    if isinstance(arg, SimLyingRegArg) and arg.x87_index is not None:
+                        # st(i) at the function entry, where ftop is 0
                         argvar = SimRegisterVariable(
-                            self.project.arch.registers[arg.reg_name][0],
+                            self.project.arch.registers["fpreg"][0] + arg.x87_index * 8,
+                            arg.size,
+                            ident=f"arg_{idx}",
+                            name=arg_names[idx] if idx < len(arg_names) and arg_names[idx] else f"a{idx}",
+                            region=self.function.addr,
+                        )
+                    elif isinstance(arg, SimRegArg):
+                        # reg_offset locates a narrow value inside a big-endian register (r2_32 in r2 on s390x)
+                        argvar = SimRegisterVariable(
+                            self.project.arch.registers[arg.reg_name][0] + arg.reg_offset,
                             arg.size,
                             ident=f"arg_{idx}",
                             name=arg_names[idx] if idx < len(arg_names) and arg_names[idx] else f"a{idx}",
@@ -2784,6 +2861,17 @@ class Clinic(Analysis, Serializable):
                                 region=self.function.addr,
                                 size=arg.size or self.project.arch.bytes,
                             )
+                    elif isinstance(arg, SimComboArg):
+                        # Why does CC break Doubles on the stack into SimComboArg?
+                        assert all(isinstance(arg, SimStackArg) for arg in arg.locations)
+                        argvar = SimStackVariable(
+                            arg.locations[0].stack_offset,
+                            arg.size,
+                            base="bp",
+                            ident=f"arg_{idx}",
+                            name=arg_names[idx],
+                            region=self.function.addr,
+                        )
                     else:
                         argvar = SimVariable(
                             ident=f"arg_{idx}",
@@ -2821,6 +2909,8 @@ class Clinic(Analysis, Serializable):
                 reaching_definitions=rd,
                 stack_pointer_tracker=stack_pointer_tracker,
                 ail_manager=self._ail_manager,
+                x87_call_ftop=self._x87_call_ftop,
+                flavor=self.flavor,
             )
             stackarg_offset_manager.merge(csm.stackarg_offset_manager)
             if csm.removed_vvar_ids:
@@ -2843,7 +2933,91 @@ class Clinic(Analysis, Serializable):
         if not self._inlining_parents:
             AILGraphWalker(ail_graph, _handler, replace_nodes=True).walk()
 
+        # fix up x87 FP call return values after every callsite processing pass
+        self._fix_fp_call_return_values(ail_graph)
+
         return ail_graph, stackarg_offset_manager, removed_vvar_ids
+
+    def _fix_fp_call_return_values(self, ail_graph: networkx.DiGraph) -> None:
+        """
+        On x87, the FP return register (ST0) uses PutI/GetI (indexed array), so
+        fp_ret_offset is None and fp_ret_expr is never set on call statements.
+        Fix this with the st(0) register the IRegisterResolver tracked after the
+        call, or by scanning successor blocks for fpreg reads, for calls whose
+        callees return float/double.
+        """
+        fpreg_info = self.project.arch.registers.get("fpreg")
+        if fpreg_info is None:
+            return
+        fpreg_offset, fpreg_size = fpreg_info
+
+        for block in list(ail_graph.nodes()):
+            if not block.statements:
+                continue
+            last_stmt = block.statements[-1]
+            if not isinstance(last_stmt, ailment.Stmt.SideEffectStatement):
+                continue
+            if last_stmt.fp_ret_expr is not None:
+                continue
+
+            # Check if the callee returns a float type
+            call_expr = last_stmt.expr
+            if not isinstance(call_expr, ailment.Expr.Call):
+                continue
+            proto = self.variable_map.prototype(call_expr)
+            if proto is None or not isinstance(proto.returnty, (SimTypeFloat, SimTypeDouble)):
+                continue
+
+            ins_addr = call_expr.tags.get("ins_addr")
+            fp_reg_offset = self._x87_call_st0.get(ins_addr) if isinstance(ins_addr, int) else None
+            if fp_reg_offset is None:
+                # Find the fpreg read in a successor block
+                fp_reg_offset = self._find_fp_ret_in_successors(ail_graph, block, fpreg_offset, fpreg_size)
+            if fp_reg_offset is None:
+                continue
+
+            # Create fp_ret_expr and clear ret_expr (FP return, not integer return)
+            # Use the prototype return size (32 for float, 64 for double) so the
+            # Call expression width matches the declared type.  VEX models x87 as
+            # F64 internally, but the caller narrows via fstps/fstpl.
+            ret_bits = proto.returnty.with_arch(self.project.arch).size or 64
+            ret_bytes = max(ret_bits // 8, 1)
+            fp_ret_expr = ailment.Expr.Register(
+                self._ail_manager.next_atom(),
+                fp_reg_offset,
+                ret_bits,
+                reg_name=self.project.arch.translate_register_name(fp_reg_offset, size=ret_bytes),
+                ins_addr=last_stmt.tags.get("ins_addr"),
+            )
+            last_stmt.fp_ret_expr = fp_ret_expr
+            last_stmt.ret_expr = None
+
+    @staticmethod
+    def _find_fp_ret_in_successors(
+        ail_graph: networkx.DiGraph,
+        block: ailment.Block,
+        fpreg_offset: int,
+        fpreg_size: int,
+    ) -> int | None:
+        """Find the first fpreg register read in a successor block."""
+        for succ in ail_graph.successors(block):
+            for stmt in succ.statements:
+                if (
+                    isinstance(stmt, ailment.Stmt.Assignment)
+                    and isinstance(stmt.src, ailment.Expr.Register)
+                    and fpreg_offset <= stmt.src.reg_offset < fpreg_offset + fpreg_size
+                ):
+                    return stmt.src.reg_offset
+                # Check return statements for fpreg references
+                if isinstance(stmt, ailment.Stmt.Return) and stmt.ret_exprs:
+                    for ret_expr in stmt.ret_exprs:
+                        if (
+                            isinstance(ret_expr, ailment.Expr.Register)
+                            and fpreg_offset <= ret_expr.reg_offset < fpreg_offset + fpreg_size
+                        ):
+                            return ret_expr.reg_offset
+            break  # Only check the first successor
+        return None
 
     @timethis
     def _make_returns(self, ail_graph: networkx.DiGraph) -> networkx.DiGraph:
@@ -2854,26 +3028,21 @@ class Clinic(Analysis, Serializable):
             # unknown calling convention. cannot do much about return expressions.
             return ail_graph
 
-        ReturnMaker(self._ail_manager, self.project.arch, self.function, ail_graph)
+        ReturnMaker(self._ail_manager, self.project.arch, self.function, ail_graph, flavor=self.flavor)
 
         return ail_graph
 
     @timethis
     def _make_function_prototype(self, arg_list: list[SimVariable]):
-        if self.function.prototype is not None:
-            if self.function.is_prototype_groundtruth:
-                # do not overwrite a prototype that came from outside our own analyses
-                return
-            if isinstance(self.function.prototype.returnty, SimTypeFloat) or any(
-                isinstance(arg, SimTypeFloat) for arg in self.function.prototype.args
-            ):
-                # Type inference does not yet support floating point variables, but calling convention analysis does
-                # FIXME: remove this branch once type inference supports floating point variables
-                return
+        if self.function.is_prototype_groundtruth_for(self.flavor):
+            # do not overwrite a prototype that came from outside our own analyses
+            return
+
+        existing_proto = self.function.get_prototype(self.flavor)
 
         variables = self.kb.dec_variables[self.function.addr]
         func_args = []
-        for arg in arg_list:
+        for idx, arg in enumerate(arg_list):
             func_arg = None
             arg_ty = variables.get_variable_type(arg)
             if arg_ty is None:
@@ -2892,17 +3061,273 @@ class Clinic(Analysis, Serializable):
             else:
                 func_arg = arg_ty
 
+            # If the CC identified this argument as FP but Typehoon did not,
+            # use the CC's type.  Typehoon's constraints from FP Loads and
+            # Convs do not yet flow back to the argument variable's typevar
+            # (they attach to the Load expression's typevar instead).  This
+            # affects all stack-passed FP args (i386 double, x87 long double)
+            # and is the same root cause as the long double ground truth gap.
+            if (
+                existing_proto is not None
+                and idx < len(existing_proto.args)
+                and isinstance(existing_proto.args[idx], (SimTypeFloat, SimTypeDouble))
+                and not isinstance(func_arg, (SimTypeFloat, SimTypeDouble))
+            ):
+                func_arg = existing_proto.args[idx]
+
             func_args.append(func_arg)
+
+        # On i386 cdecl, a double parameter occupies two adjacent 4-byte stack
+        # slots.  When the compiler accesses them individually (e.g. push dword),
+        # the CC sees two separate int args instead of one double.  Merge adjacent
+        # 4-byte int stack args into doubles when they are passed together to
+        # callees expecting double parameters.
+        if self.project.arch.name == "X86":
+            func_args, arg_list = self._merge_adjacent_stack_args_to_doubles(func_args, arg_list)
 
         returnty = variables.get_variable_type(self.func_ret_var)
         if returnty is None or isinstance(returnty, SimTypeBottom):
-            if self.function.prototype is not None and self.function.prototype.returnty is not None:
-                returnty = self.function.prototype.returnty
+            if existing_proto is not None and existing_proto.returnty is not None:
+                returnty = existing_proto.returnty
             else:
                 returnty = SimTypeInt()
 
-        self.function.prototype = SimTypeFunction(func_args, returnty).with_arch(self.project.arch)
-        self.function.prototype_source = PrototypeSource.CCA_DECOMPILER
+        # Fallback: if Typehoon produced a non-FP return type but the CC
+        # detected FP operations in the function body, use the CC's FP type.
+        # Typehoon is authoritative for FP width (float vs double vs long
+        # double) -- the return statement handler strips x87 widening Convs
+        # and propagates the actual FP type.  The CC only provides a fallback
+        # when no FP constraints reach the return variable at all (e.g. the
+        # function is a single 'ret' instruction).
+        if (
+            existing_proto is not None
+            and isinstance(existing_proto.returnty, (SimTypeFloat, SimTypeDouble, SimTypeLongDouble))
+            and not isinstance(returnty, (SimTypeFloat, SimTypeDouble, SimTypeLongDouble))
+        ):
+            returnty = existing_proto.returnty
+
+        variadic = existing_proto is not None and existing_proto.variadic
+        self.function.set_prototype(
+            self.flavor,
+            SimTypeFunction(func_args, returnty, variadic=variadic).with_arch(self.project.arch),
+            source=PrototypeSource.CCA_DECOMPILER,
+        )
+
+    def _merge_adjacent_stack_args_to_doubles(
+        self,
+        func_args: list[SimType],
+        arg_list: list[SimVariable],
+    ) -> tuple[list[SimType], list[SimVariable]]:
+        """Merge adjacent 4-byte integer stack args into 8-byte doubles.
+
+        On i386 cdecl, double parameters occupy two 4-byte stack slots.  When the
+        compiler copies them byte-by-byte (e.g. push dword), the CC identifies two
+        separate int args.  Detect this by scanning callsites in the AIL: if a callee
+        expects a double and the call passes an 8-byte load spanning two of our
+        parameters, merge them.
+        """
+        if len(arg_list) < 2:
+            return func_args, arg_list
+
+        # Collect parameter stack offsets -> arg_list index
+        param_offsets: dict[int, int] = {}
+        for idx, arg in enumerate(arg_list):
+            if isinstance(arg, SimStackVariable) and arg.size == 4:
+                param_offsets[arg.offset] = idx
+
+        # If any callee in this function takes a double parameter,
+        # check if we have adjacent 4-byte int pairs that could be that double.
+        merge_pairs: set[int] = set()
+        callee_uses_double = False
+        for block_node in self.function.graph.nodes():
+            try:
+                vex = self.project.factory.block(block_node.addr, size=block_node.size).vex
+            except Exception:
+                continue
+            if vex.jumpkind != "Ijk_Call" or not isinstance(vex.next, pyvex.IRExpr.Const):
+                continue
+            callee_func = self.project.kb.functions.function(addr=vex.next.con.value)
+            callee_proto = callee_func.get_prototype(self.flavor) if callee_func is not None else None
+            if callee_proto is None:
+                continue
+            for callee_arg_ty in callee_proto.args:
+                if isinstance(callee_arg_ty, SimTypeDouble):
+                    callee_uses_double = True
+                    break
+            if callee_uses_double:
+                break
+
+        if not callee_uses_double:
+            return func_args, arg_list
+
+        # Find adjacent 4-byte int pairs that could be doubles.
+        # On cdecl, doubles are 8-byte aligned in the parameter area.
+        sorted_indices = sorted(param_offsets.keys())
+        for i in range(len(sorted_indices) - 1):
+            lo_off = sorted_indices[i]
+            hi_off = sorted_indices[i + 1]
+            if hi_off == lo_off + 4:
+                lo_idx = param_offsets[lo_off]
+                hi_idx = param_offsets[hi_off]
+                if (
+                    hi_idx == lo_idx + 1
+                    and not isinstance(func_args[lo_idx], (SimTypeFloat, SimTypeDouble))
+                    and not isinstance(func_args[hi_idx], (SimTypeFloat, SimTypeDouble))
+                ):
+                    merge_pairs.add(lo_idx)
+
+        if not merge_pairs:
+            return func_args, arg_list
+
+        # Build merged lists
+        new_func_args = []
+        new_arg_list = []
+        skip_next = False
+        for idx in range(len(arg_list)):
+            if skip_next:
+                skip_next = False
+                continue
+            if idx in merge_pairs and idx + 1 < len(arg_list):
+                new_func_args.append(SimTypeDouble())
+                lo_arg = arg_list[idx]
+                assert isinstance(lo_arg, SimStackVariable)
+                new_arg_list.append(
+                    SimStackVariable(
+                        lo_arg.offset,
+                        8,
+                        base="bp",
+                        ident=lo_arg.ident,
+                        name=lo_arg.name,
+                        region=lo_arg.region,
+                    )
+                )
+                skip_next = True
+            else:
+                new_func_args.append(func_args[idx])
+                new_arg_list.append(arg_list[idx])
+
+        return new_func_args, new_arg_list
+
+    def _early_merge_adjacent_stack_args_to_doubles(
+        self,
+        arg_list: list[SimVariable],
+    ) -> list[SimVariable]:
+        """Merge adjacent 4-byte stack args into 8-byte doubles before SSA.
+
+        This runs early (before SSA level 0) so that merged parameters get 8-byte
+        VVars, preventing the Insert-from-two-halves pattern that produces ugly
+        half-writes in the output.  The merge is only performed when a callee in
+        this function is known to accept a double parameter.
+        """
+        proto = self.function.get_prototype(self.flavor)
+        if proto is None or len(arg_list) < 2:
+            return arg_list
+
+        # Collect 4-byte integer stack arg offsets -> index
+        param_offsets: dict[int, int] = {}
+        for idx, arg in enumerate(arg_list):
+            # Only merge args currently typed as integer (not already FP)
+            if (
+                isinstance(arg, SimStackVariable)
+                and arg.size == 4
+                and idx < len(proto.args)
+                and not isinstance(proto.args[idx], (SimTypeFloat, SimTypeDouble))
+            ):
+                param_offsets[arg.offset] = idx
+
+        if len(param_offsets) < 2:
+            return arg_list
+
+        # Check whether any callee expects a double parameter
+        callee_uses_double = False
+        for block_node in self.function.graph.nodes():
+            try:
+                vex = self.project.factory.block(block_node.addr, size=block_node.size).vex
+            except Exception:
+                continue
+            if vex.jumpkind != "Ijk_Call" or not isinstance(vex.next, pyvex.IRExpr.Const):
+                continue
+            callee_func = self.project.kb.functions.function(addr=vex.next.con.value)
+            callee_proto = callee_func.get_prototype(self.flavor) if callee_func is not None else None
+            if callee_proto is None:
+                continue
+            for callee_arg_ty in callee_proto.args:
+                if isinstance(callee_arg_ty, SimTypeDouble):
+                    callee_uses_double = True
+                    break
+            if callee_uses_double:
+                break
+
+        if not callee_uses_double:
+            return arg_list
+
+        # Find adjacent 4-byte pairs
+        merge_pairs: set[int] = set()
+        sorted_offsets = sorted(param_offsets.keys())
+        for i in range(len(sorted_offsets) - 1):
+            lo_off = sorted_offsets[i]
+            hi_off = sorted_offsets[i + 1]
+            if hi_off == lo_off + 4:
+                lo_idx = param_offsets[lo_off]
+                hi_idx = param_offsets[hi_off]
+                if hi_idx == lo_idx + 1:
+                    merge_pairs.add(lo_idx)
+
+        if not merge_pairs:
+            return arg_list
+
+        # Build merged arg_list and update the function prototype
+        new_arg_list: list[SimVariable] = []
+        new_proto_args: list[SimType] = []
+        skip_next = False
+        for idx in range(len(arg_list)):
+            if skip_next:
+                skip_next = False
+                continue
+            if idx in merge_pairs and idx + 1 < len(arg_list):
+                lo_arg = arg_list[idx]
+                assert isinstance(lo_arg, SimStackVariable)
+                new_arg_list.append(
+                    SimStackVariable(
+                        lo_arg.offset,
+                        8,
+                        base="bp",
+                        ident=lo_arg.ident,
+                        name=lo_arg.name,
+                        region=lo_arg.region,
+                    )
+                )
+                new_proto_args.append(SimTypeDouble())
+                skip_next = True
+            else:
+                new_arg_list.append(arg_list[idx])
+                if idx < len(proto.args):
+                    new_proto_args.append(proto.args[idx])
+
+        new_proto = SimTypeFunction(new_proto_args, proto.returnty, variadic=proto.variadic).with_arch(
+            self.project.arch
+        )
+        assert isinstance(new_proto, SimTypeFunction)
+        self.function.set_prototype(self.flavor, new_proto)
+
+        return new_arg_list
+
+    def _prepare_function_variable_manager(self) -> dict[str, tuple[str | None, SimType | None]]:
+        """
+        Make sure kb.dec_variables holds a manager of this decompilation's flavor for the function. A manager produced
+        by another flavor carries flavor-specific types (e.g., Rust enums under C), so it is replaced with a fresh one.
+
+        :return:    User renames and manual types of the replaced manager, to be re-applied after recovery.
+        """
+        dvars = self.kb.dec_variables
+        func_addr = self.function.addr
+        user_edits = {}
+        if dvars.has_function_manager(func_addr) and not dvars.has_function_manager_for_flavor(func_addr, self.flavor):
+            user_edits = snapshot_user_edits(self.kb, func_addr)
+            del dvars[func_addr]
+            self._reset_variable_names = True
+        dvars[func_addr].flavor = self.flavor
+        return user_edits
 
     @timethis
     def _recover_and_link_variables(
@@ -2913,6 +3338,8 @@ class Clinic(Analysis, Serializable):
         vvar2vvar: dict[int, int],
         type_hints: list[tuple[atoms.VirtualVariable | atoms.MemoryLocation, str]],
     ):
+        user_edits = self._prepare_function_variable_manager()
+
         # variable recovery
         # route recovery into kb.dec_variables: VariableRecoveryBase writes to the "variables" plugin of the KB
         # it is given
@@ -2933,6 +3360,7 @@ class Clinic(Analysis, Serializable):
             vvar_to_vvar=vvar2vvar,
             type_hints=type_hints,
             variable_map=self.variable_map,
+            flavor=self.flavor,
         )
         # get ground-truth types
         var_manager = tmp_kb.variables[self.function.addr]
@@ -2943,12 +3371,41 @@ class Clinic(Analysis, Serializable):
                 for tv in vr.var_to_typevars[variable]:
                     groundtruth[tv] = vartype
 
-        if self.function.is_prototype_groundtruth:
-            assert self.function.prototype is not None
+        func_proto = self.function.get_prototype(self.flavor)
+        if func_proto is not None:
             for arg_i, (_, variable) in arg_vvars.items():
-                if arg_i < len(self.function.prototype.args):
-                    for tv in vr.var_to_typevars[variable]:
-                        groundtruth[tv] = self.function.prototype.args[arg_i]
+                if arg_i < len(func_proto.args):
+                    arg_type = func_proto.args[arg_i]
+                    # For non-guessed prototypes, inject all arg types as
+                    # ground truth.  For guessed prototypes, skip FP types
+                    # for register-passed FP args -- the CC normalizes all FP
+                    # reg args to arch.bytes, losing the float/double
+                    # distinction.  Typehoon's constraints from FP scalar
+                    # operations are more precise there.
+                    # For stack-based FP args, the CC determines width from
+                    # load size (4=float, 8=double) and is reliable.
+                    func_cc = self.function.calling_convention
+                    is_fp_reg_arg = (
+                        isinstance(variable, SimRegisterVariable)
+                        and func_cc is not None
+                        and func_cc.FP_ARG_REGS
+                        and any(
+                            self.project.arch.registers[r][0]
+                            <= variable.reg
+                            < self.project.arch.registers[r][0] + self.project.arch.registers[r][1]
+                            for r in func_cc.FP_ARG_REGS
+                            if r in self.project.arch.registers
+                        )
+                    )
+                    # Only a prototype from outside the decompiler is ground truth for every argument (feeding the
+                    # decompiler's own earlier guess back would freeze it across re-decompilations). A guessed
+                    # prototype still contributes its stack-passed FP argument types, whose widths the CC read
+                    # reliably from the load size.
+                    if self.function.is_prototype_groundtruth_for(self.flavor) or (
+                        isinstance(arg_type, (SimTypeFloat, SimTypeDouble)) and not is_fp_reg_arg
+                    ):
+                        for tv in vr.var_to_typevars[variable]:
+                            groundtruth[tv] = arg_type
 
         # get maximum sizes of each stack variable, regardless of its original type
         stackvar_max_sizes = var_manager.get_stackvar_max_sizes(self.stack_items)
@@ -2991,8 +3448,6 @@ class Clinic(Analysis, Serializable):
                     type_translator=vr.type_lifter,
                     tv_manager=vr.tv_manager,
                 )
-                # tp.pp_constraints()
-                # tp.pp_solution()
                 tp.update_variable_types(
                     self.function.addr,
                     {
@@ -3012,6 +3467,7 @@ class Clinic(Analysis, Serializable):
                         for v, t in vr.var_to_typevars.items()
                         if isinstance(v, SimMemoryVariable) and not isinstance(v, SimStackVariable)
                     },
+                    flavor=self.flavor,
                 )
                 self.typehoon = tp
             except Exception:  # pylint:disable=broad-except
@@ -3029,7 +3485,9 @@ class Clinic(Analysis, Serializable):
                 var_manager.set_variable_type(var, bottype)
 
         # Unify SSA variables
-        tmp_kb.variables.global_manager.assign_variable_names(labels=self.kb.labels, types={SimMemoryVariable})
+        tmp_kb.variables.get_global_manager(self.flavor).assign_variable_names(
+            labels=self.kb.labels, types={SimMemoryVariable}
+        )
         liveness = self.project.analyses[SLivenessAnalysis].prep()(
             self.function,
             func_graph=ail_graph,
@@ -3044,10 +3502,19 @@ class Clinic(Analysis, Serializable):
         )
         var_manager.assign_unified_variable_names(
             labels=self.kb.labels,
-            arg_names=list(self.function.prototype.arg_names) if self.function.prototype else None,
+            arg_names=list(func_proto.arg_names) if (func_proto := self.function.get_prototype(self.flavor)) else None,
             reset=self._reset_variable_names,
             func_blocks=list(ail_graph),
         )
+        if user_edits:
+            _, missing = restore_user_edits(self.kb, self.function.addr, user_edits)
+            if missing:
+                l.warning(
+                    "Function %#x: %d user-edited variables could not be carried over to flavor %s.",
+                    self.function.addr,
+                    len(missing),
+                    self.flavor,
+                )
 
         # Link variables and struct member information to every statement and expression
         for block in ail_graph.nodes():
@@ -3095,7 +3562,7 @@ class Clinic(Analysis, Serializable):
         """
 
         variable_manager = kb.variables[self.function.addr]
-        global_variables = kb.variables["global"]
+        global_variables = kb.variables.get_global_manager(self.flavor)
 
         for stmt_idx, stmt in enumerate(block.statements):
             if isinstance(stmt, ailment.Stmt.Store):
@@ -3419,10 +3886,13 @@ class Clinic(Analysis, Serializable):
         # 140017162     jz      short 1400171e1
         """
 
+        cc_reg_offsets: set[int] = {
+            self.project.arch.registers[name][0]
+            for name in ("cc_op", "cc_dep1", "cc_dep2", "cc_ndep")
+            if name in self.project.arch.registers
+        }
         for block in list(ail_graph):
-            if len(block.statements) > 1 and block.statements[0].tags.get("ins_addr") == block.statements[-1].tags.get(
-                "ins_addr"
-            ):
+            if len(block.statements) > 1 and self._is_orphaned_cond_jump_block(block, cc_reg_offsets):
                 preds = list(ail_graph.predecessors(block))
                 if len(preds) > 1 and block not in preds:
                     has_ccall = any(
@@ -3446,6 +3916,33 @@ class Clinic(Analysis, Serializable):
                                 ail_graph.add_edge(new_block, succ if succ is not block else new_block)
 
         return ail_graph
+
+    @staticmethod
+    def _is_orphaned_cond_jump_block(block: ailment.Block, cc_reg_offsets: set[int], max_extra_insns: int = 2) -> bool:
+        """
+        The block is the conditional jump instruction alone, or it is preceded by at most *max_extra_insns* instructions
+        that only write registers other than the flag thunk (e.g., ``lea esp, [esp+8]; jne``), so its condition still
+        reads the flags computed in its predecessors.
+        """
+        last_ins = block.statements[-1].tags.get("ins_addr")
+        if block.statements[0].tags.get("ins_addr") == last_ins:
+            return True
+        if not isinstance(block.statements[-1], ailment.Stmt.ConditionalJump):
+            return False
+        extra_insns = set()
+        for stmt in block.statements:
+            ins_addr = stmt.tags.get("ins_addr")
+            if ins_addr == last_ins or isinstance(stmt, ailment.Stmt.Label):
+                continue
+            if not isinstance(stmt, ailment.Stmt.Assignment):
+                return False
+            if isinstance(stmt.dst, ailment.Expr.Register):
+                if stmt.dst.reg_offset in cc_reg_offsets:
+                    return False
+            elif not isinstance(stmt.dst, ailment.Expr.Tmp):
+                return False
+            extra_insns.add(ins_addr)
+        return len(extra_insns) <= max_extra_insns
 
     def _rewrite_jump_rax_calls(self, ail_graph: networkx.DiGraph) -> networkx.DiGraph:
         """
@@ -3503,6 +4000,73 @@ class Clinic(Analysis, Serializable):
 
         return ail_graph
 
+    @staticmethod
+    def _resolve_tmp(expr: ailment.Expr.Expression, tmp_defs: dict, depth: int = 5) -> ailment.Expr.Expression:
+        """Recursively resolve a Tmp expression through its definitions."""
+        while depth > 0 and isinstance(expr, ailment.Expr.Tmp) and expr.tmp_idx in tmp_defs:
+            expr = tmp_defs[expr.tmp_idx]
+            depth -= 1
+        return expr
+
+    @staticmethod
+    def _expr_contains_cmpf(expr: ailment.Expr.Expression, tmp_defs: dict, depth: int = 10) -> bool:
+        """Check if an expression tree (resolving Tmps) contains a CmpF operation."""
+        if isinstance(expr, ailment.Expr.Tmp) and tmp_defs is not None:
+            expr = Clinic._resolve_tmp(expr, tmp_defs, depth=depth)
+        if isinstance(expr, ailment.Expr.BinaryOp) and expr.op == "CmpF":
+            return True
+        if isinstance(expr, ailment.Expr.BinaryOp):
+            return any(Clinic._expr_contains_cmpf(op, tmp_defs, depth - 1) for op in expr.operands)
+        if isinstance(expr, ailment.Expr.UnaryOp):
+            return Clinic._expr_contains_cmpf(expr.operand, tmp_defs, depth - 1)
+        if isinstance(expr, ailment.Expr.Convert):
+            return Clinic._expr_contains_cmpf(expr.operand, tmp_defs, depth - 1)
+        return False
+
+    @staticmethod
+    def _is_cmpf_ite(ite: ailment.Expr.ITE, tmp_defs: dict | None = None) -> bool:
+        """Check if an ITE's condition derives from a CmpF operation.
+
+        CMOV instructions emitted by GCC for floating-point equality checks use
+        bit extractions from CmpF results as the condition.  The X87CmpF peephole
+        optimization can simplify these ITE expressions into CmpEQ, but only if
+        they remain as ITE expressions (not converted to diamond control flow).
+        """
+        if tmp_defs is None:
+            return False
+        return Clinic._expr_contains_cmpf(ite.cond, tmp_defs)
+
+    @staticmethod
+    def _is_fptag_nan_ite(ite: ailment.Expr.ITE, tmp_defs: dict | None = None, arch=None) -> bool:
+        """Check if an ITE is an x87 fptag validity check that peephole passes will simplify.
+
+        Two forms are recognized: a branch that is a NaN constant (the classic empty-tag
+        placeholder), or a condition that reads the x87 fptag register (the placeholder branch
+        only becomes a NaN after later simplification, so the condition is the stable signal).
+        ITE operands may be Tmp expressions (possibly chained), resolved through *tmp_defs*.
+        """
+        for branch in (ite.iftrue, ite.iffalse):
+            expr = branch
+            if tmp_defs is not None:
+                expr = Clinic._resolve_tmp(expr, tmp_defs)
+            if isinstance(expr, ailment.Expr.Const) and isinstance(expr.value, float) and math.isnan(expr.value):
+                return True
+        return arch is not None and Clinic._expr_reads_fptag(ite.cond, tmp_defs, arch)
+
+    @staticmethod
+    def _expr_reads_fptag(expr: ailment.Expr.Expression, tmp_defs: dict | None, arch) -> bool:
+        """True if *expr* reads a register within the x87 fptag range (directly or as a Cmp operand)."""
+        fptag = arch.registers.get("fptag")
+        if fptag is None:
+            return False
+        lo, hi = fptag[0], fptag[0] + fptag[1]
+        e = Clinic._resolve_tmp(expr, tmp_defs) if tmp_defs is not None else expr
+        if isinstance(e, ailment.Expr.Register) and lo <= e.reg_offset < hi:
+            return True
+        if isinstance(e, ailment.Expr.BinaryOp) and e.op.startswith("Cmp"):
+            return any(Clinic._expr_reads_fptag(op, tmp_defs, arch) for op in e.operands)
+        return False
+
     def _rewrite_ite_expressions(self, ail_graph):
         cfg = self._cfg
         block_and_ite_ins_addrs = []
@@ -3512,17 +4076,27 @@ class Clinic(Analysis, Serializable):
 
             ite_ins_addrs = []
             cas_ins_addrs = set()
+            # the first ITE of an instruction is the one _create_triangle_for_ite_expression rewrites, so it alone
+            # decides (x87 fistp: the fptag check precedes the saturation ITE)
+            seen_ite_ins_addrs = set()
+            # Build a mapping from Tmp index to its defining expression so we can
+            # resolve temporaries when checking for fptag NaN ITE patterns.
+            tmp_defs: dict[int, ailment.Expr.Expression] = {}
             for stmt in block.statements:
+                if isinstance(stmt, ailment.Stmt.Assignment) and isinstance(stmt.dst, ailment.Expr.Tmp):
+                    tmp_defs[stmt.dst.tmp_idx] = stmt.src
                 if isinstance(stmt, ailment.Stmt.CAS):
                     # we do not rewrite ITE statements that are caused by CAS statements
                     cas_ins_addrs.add(stmt.tags["ins_addr"])
-                elif (
-                    isinstance(stmt, ailment.Stmt.Assignment)
-                    and isinstance(stmt.src, ailment.Expr.ITE)
-                    and stmt.tags["ins_addr"] not in ite_ins_addrs
-                    and stmt.tags["ins_addr"] not in cas_ins_addrs
-                ):
-                    ite_ins_addrs.append(stmt.tags["ins_addr"])
+                elif isinstance(stmt, ailment.Stmt.Assignment) and isinstance(stmt.src, ailment.Expr.ITE):
+                    ins_addr = stmt.tags["ins_addr"]
+                    if ins_addr in seen_ite_ins_addrs or ins_addr in cas_ins_addrs:
+                        continue
+                    seen_ite_ins_addrs.add(ins_addr)
+                    if not self._is_fptag_nan_ite(stmt.src, tmp_defs, self.project.arch) and not self._is_cmpf_ite(
+                        stmt.src, tmp_defs
+                    ):
+                        ite_ins_addrs.append(ins_addr)
 
             if ite_ins_addrs:
                 block_and_ite_ins_addrs.append((block, ite_ins_addrs))
@@ -3558,11 +4132,16 @@ class Clinic(Analysis, Serializable):
             block_addr, size=ite_ins_addr - block_addr + ite_insn_size, cross_insn_opt=False
         )
         new_head_ail = ailment.IRSBConverter.convert(new_head.vex, self._ail_manager)
-        # remove all statements between the ITE expression and the very end of the block
+        # remove all statements between the ITE expression and the very end of the block. Earlier instructions in
+        # the head may keep ITEs of their own (x87 fptag checks), so match on the instruction address.
         ite_expr_stmt_idx = None
         ite_expr_stmt = None
         for idx, stmt in enumerate(new_head_ail.statements):
-            if isinstance(stmt, ailment.Stmt.Assignment) and isinstance(stmt.src, ailment.Expr.ITE):
+            if (
+                isinstance(stmt, ailment.Stmt.Assignment)
+                and isinstance(stmt.src, ailment.Expr.ITE)
+                and stmt.tags.get("ins_addr") == ite_ins_addr
+            ):
                 ite_expr_stmt_idx = idx
                 ite_expr_stmt = stmt
                 break
@@ -3664,6 +4243,17 @@ class Clinic(Analysis, Serializable):
         # we detect such case and fix it in new_head_ail
         if not self._remove_redundant_jump_blocks_repatch_relifted_block(original_block, end_block_ail):
             return None
+
+        if self._insert_labels:
+            # labels are inserted before ITEs are rewritten; relifted blocks need their own
+            if original_block.statements and isinstance(original_block.statements[0], ailment.Stmt.Label):
+                new_head_ail.statements.insert(0, original_block.statements[0])
+            else:
+                self._insert_block_label(new_head_ail)
+            self._insert_block_label(true_block_ail)
+            self._insert_block_label(false_block_ail)
+            if end_block_ail not in ail_graph:
+                self._insert_block_label(end_block_ail)
 
         ail_graph.remove_node(original_block)
 
@@ -4138,15 +4728,17 @@ class Clinic(Analysis, Serializable):
 
     def _insert_block_labels(self, ail_graph):
         for node in ail_graph.nodes:
-            node: ailment.Block
-            lbl = ailment.Stmt.Label(
-                self._ail_manager.next_atom(), f"LABEL_{node.addr:x}", ins_addr=node.addr, block_idx=node.idx
-            )
-            node.statements.insert(0, lbl)
+            self._insert_block_label(node)
+
+    def _insert_block_label(self, node: ailment.Block) -> None:
+        lbl = ailment.Stmt.Label(
+            self._ail_manager.next_atom(), f"LABEL_{node.addr:x}", ins_addr=node.addr, block_idx=node.idx
+        )
+        node.statements.insert(0, lbl)
 
     @staticmethod
-    def _collect_externs(ail_graph, kb, variable_map: VariableMap):
-        global_vars = kb.dec_variables.global_manager.get_variables()
+    def _collect_externs(ail_graph, kb, variable_map: VariableMap, flavor: str | None):
+        global_vars = kb.dec_variables.get_global_manager(flavor).get_variables()
         walker = ailment.AILBlockRewriter()
         variables = set()
 
@@ -4175,6 +4767,24 @@ class Clinic(Analysis, Serializable):
         walker._handle_expr = handle_expr
         AILGraphWalker(ail_graph, walker.walk).walk()
         return variables
+
+    def _rewrite_indirect_register_accesses(self, ail_graph):
+        """
+        Resolve IRegister expressions (VEX GetI/PutI indexed register-array accesses, e.g. x87 fpreg[ftop]) into
+        concrete Register expressions wherever the array index is a constant. Unresolved IRegisters are left for the
+        IRegReplacer optimization pass.
+        """
+        if IRegisterResolver.has_iregisters(ail_graph):
+            IRegisterResolver(
+                self.project,
+                self.kb,
+                self.function,
+                ail_graph,
+                callee_deltas=self._x87_callee_deltas,
+                call_st0=self._x87_call_st0,
+                call_ftop=self._x87_call_ftop,
+            ).resolve()
+        return ail_graph
 
     @staticmethod
     def _collect_data_refs(ail_graph) -> dict[int, list[DataRefDesc]]:
@@ -4915,7 +5525,7 @@ class Clinic(Analysis, Serializable):
         # it (reset=False keeps every existing name) so the new buffers get the next ``v<n>`` default names
         varman.assign_unified_variable_names(
             labels=self.kb.labels,
-            arg_names=list(self.function.prototype.arg_names) if self.function.prototype else None,
+            arg_names=list(func_proto.arg_names) if (func_proto := self.function.get_prototype(self.flavor)) else None,
             reset=False,
             func_blocks=list(ail_graph),
         )
@@ -4959,9 +5569,10 @@ class Clinic(Analysis, Serializable):
                                 ):
                                     # FIXME: Parsing arg_idx out of argument ident is hacky
                                     arg_idx = int(func_arg_simvar.ident[4:])
-                                    assert self.function.prototype is not None
-                                    if arg_idx < len(self.function.prototype.args):
-                                        t = self.function.prototype.args[arg_idx]
+                                    func_proto = self.function.get_prototype(self.flavor)
+                                    assert func_proto is not None
+                                    if arg_idx < len(func_proto.args):
+                                        t = func_proto.args[arg_idx]
                                         break
 
                         if t is None:
@@ -5019,9 +5630,10 @@ class Clinic(Analysis, Serializable):
             if not self.kb.functions.contains_addr(func_addr):
                 continue
             func = self.kb.functions.get_by_addr(func_addr)
-            if func.prototype is not None and func.is_prototype_groundtruth:
+            if func.is_prototype_groundtruth_for(self.flavor):
                 # already has a "good" prototype; don't overwrite it
                 continue
+            func_proto = func.get_prototype(self.flavor)
 
             # TODO: merge the return type
             # ret_types = [proto[1] for proto in protos]
@@ -5056,26 +5668,23 @@ class Clinic(Analysis, Serializable):
             if arg_result:
                 # build a new function prototype
                 new_arg_types = []
-                func_arg_count = (
-                    len(func.prototype.args) if func.prototype is not None and func.prototype.args else max(arg_result)
-                )
+                func_arg_count = len(func_proto.args) if func_proto is not None and func_proto.args else max(arg_result)
                 for i in range(func_arg_count):
                     if i in arg_result:
                         new_arg_types.append(arg_result[i])
                     else:
-                        if func.prototype is not None:
-                            new_arg_types.append(func.prototype.args[i])
+                        if func_proto is not None:
+                            new_arg_types.append(func_proto.args[i])
                         else:
                             new_arg_types.append(default_arg_type())
                 new_type = SimTypeFunction(
                     new_arg_types,
-                    func.prototype.returnty if func.prototype is not None else default_arg_type(),
-                    label=func.prototype.label if func.prototype is not None else None,
-                    arg_names=func.prototype.arg_names if func.prototype is not None else None,
-                    variadic=func.prototype.variadic if func.prototype is not None else False,
+                    func_proto.returnty if func_proto is not None else default_arg_type(),
+                    label=func_proto.label if func_proto is not None else None,
+                    arg_names=func_proto.arg_names if func_proto is not None else None,
+                    variadic=func_proto.variadic if func_proto is not None else False,
                 ).with_arch(self.project.arch)
-                func.prototype = new_type
-                func.prototype_source = PrototypeSource.CALLSITE_DECOMPILER
+                func.set_prototype(self.flavor, new_type, source=PrototypeSource.CALLSITE_DECOMPILER)
 
     def _compute_reaching_definitions(self, func_args=None) -> SRDAModel:
         # Computing reaching definitions
@@ -5304,7 +5913,7 @@ class Clinic(Analysis, Serializable):
         clinic._cfg = cfg
 
         # Flavor.
-        clinic.flavor = msg.flavor if msg.HasField("flavor") else "pseudocode"
+        clinic.flavor = msg.flavor if msg.HasField("flavor") else DEFAULT_FLAVOR
 
         # CLEAN collections.
         clinic.vvar_to_vvar = dict(msg.vvar_to_vvar) if msg.vvar_to_vvar else None

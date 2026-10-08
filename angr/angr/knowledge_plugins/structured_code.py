@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 import lmdb
 
 import angr
+from angr.knowledge_plugins.plugin import DEFAULT_FLAVOR
 
 from .plugin import KnowledgeBasePlugin
 
@@ -83,7 +84,8 @@ class SpillingDecompilationDict(collections.abc.MutableMapping):
                         txn.put(self._lmdb_key(key), blob)
                 break
             except lmdb.MapFullError:
-                self._kb.rtdb.increase_lmdb_map_size()
+                if not self._kb.rtdb.increase_lmdb_map_size():
+                    raise
 
     def _flush_pending(self) -> None:
         if self._pending_import:
@@ -314,7 +316,7 @@ class StructuredCodeManager(KnowledgeBasePlugin):
         return [flavor for func, flavor in self.cached if func == item]
 
     def all_flavors(self, item):  # pylint:disable=no-self-use, unused-argument
-        return ["pseudocode", "rust"]
+        return [DEFAULT_FLAVOR, "rust"]
 
     def copy(self):
         raise NotImplementedError

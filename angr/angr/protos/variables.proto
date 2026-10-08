@@ -5,8 +5,8 @@ package angr.protos;
 
 
 message VariableBase {
-    string      ident = 1;
-    string      name = 2;
+    optional string ident = 1;
+    optional string name = 2;
     optional uint64 region = 3;
     optional string category = 4;
     bool        renamed = 5;
@@ -33,6 +33,13 @@ message ConstantVariable {
 message RegisterVariable {
     VariableBase    base = 1;
     uint32          reg = 2;
+    uint32          size = 3;
+}
+
+
+message ComboRegisterVariable {
+    VariableBase    base = 1;
+    repeated uint32 reg_offsets = 2;  // SimComboRegisterVariable.reg_offsets, in order
     uint32          size = 3;
 }
 
@@ -99,6 +106,7 @@ message VariableManagerInternal {
     repeated MemoryVariable memvars = 3;
     repeated StackVariable stackvars = 4;
     repeated ConstantVariable constvars = 13;
+    repeated ComboRegisterVariable comboregvars = 16;
     // Variable accesses
     repeated VariableAccess accesses = 5;
     // Unified variables
@@ -106,6 +114,7 @@ message VariableManagerInternal {
     repeated RegisterVariable unified_regvars = 7;
     repeated MemoryVariable unified_memvars = 8;
     repeated StackVariable unified_stackvars = 9;
+    repeated ComboRegisterVariable unified_comboregvars = 17;
     repeated Var2Unified var2unified = 10;
     // Types
     repeated VariableType types = 11;
@@ -115,4 +124,6 @@ message VariableManagerInternal {
     repeated Phi2Var phi2var = 12;
     // Named local types (VariableManagerInternal.types), e.g., structs recovered by type inference
     repeated LocalType local_types = 15;
+    // Decompiler flavor (e.g., "pseudocode", "rust") that produced this manager; unset means unknown
+    optional string flavor = 18;
 }

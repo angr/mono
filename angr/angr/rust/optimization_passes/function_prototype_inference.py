@@ -1,13 +1,24 @@
 from __future__ import annotations
 
+from angr.ailment.block import Block
 from angr.ailment.expression import BinaryOp, Call, Const, UnaryOp, VirtualVariable
-from angr.ailment.statement import Assignment, ConditionalJump, Jump, Label, Return, SideEffectStatement
+from angr.ailment.statement import (
+    Assignment,
+    ConditionalJump,
+    Jump,
+    Label,
+    Return,
+    SideEffectStatement,
+    Statement,
+)
 from angr.analyses.decompiler.optimization_passes.optimization_pass import OptimizationPass, OptimizationPassStage
 from angr.analyses.decompiler.variable_map import variable_map_of
 from angr.knowledge_plugins.functions.function import PrototypeSource
+from angr.rust import RUST_FLAVOR
 from angr.rust.analyses.rust_calling_convention import Pathfinder
 from angr.rust.mixins import CFAMixin, SSAVariableMixin
 from angr.rust.sim_type import RustSimEnum, RustSimTypeFunction, is_composite_type
+from angr.sim_type import SimTypeFunction
 
 
 class FunctionPrototypeInference(OptimizationPass, CFAMixin, SSAVariableMixin):
@@ -65,8 +76,8 @@ class FunctionPrototypeInference(OptimizationPass, CFAMixin, SSAVariableMixin):
         call_prototype = vm.prototype(call_expr)
         if isinstance(call_prototype, RustSimTypeFunction):
             existing_prototype = call_prototype
-        elif isinstance(func.prototype, RustSimTypeFunction):
-            existing_prototype = func.prototype
+        elif isinstance(func_prototype := func.get_prototype(RUST_FLAVOR), RustSimTypeFunction):
+            existing_prototype = func_prototype
 
         if existing_prototype is not None and not self._can_refine_call_prototype(existing_prototype):
             vm.set_prototype(call_expr, existing_prototype)
@@ -101,8 +112,7 @@ class FunctionPrototypeInference(OptimizationPass, CFAMixin, SSAVariableMixin):
             inferred_prototype = existing_prototype
 
         vm.set_prototype(call_expr, inferred_prototype)
-        func.prototype = inferred_prototype
-        func.prototype_source = PrototypeSource.CCA_DECOMPILER
+        func.set_prototype(RUST_FLAVOR, inferred_prototype, source=PrototypeSource.CCA_DECOMPILER)
 
     def _rewrite_retbuf_call(self, call_expr: Call):
         """If the call has a retbuf arg0, rewrite it into Assignment(dst_stack_vvar, call)."""
@@ -132,7 +142,6 @@ class FunctionPrototypeInference(OptimizationPass, CFAMixin, SSAVariableMixin):
         vm.set_prototype(call, prototype)
         dst_vvar = self.new_stack_vvar(arg0.operand.stack_offset, call.bits, arg0.operand.tags)
         dst_vvar.tags["type"] = returnty  # pyright: ignore[reportGeneralTypeIssues]
-        self.project.kb.type_hints.add_type_hint(dst_vvar, returnty, self._func.addr)
         return Assignment(self.manager.next_atom(), dst_vvar, call, **call.tags)
 
     def _apply_return_type_hint(self, call_expr: Call, stmt):
@@ -227,21 +236,37 @@ class FunctionPrototypeInference(OptimizationPass, CFAMixin, SSAVariableMixin):
         return has_return
 
     def _analyze(self, cache=None):
+        vm = variable_map_of(self.manager)
+        # (block, stmt_idx, original stmt, original call prototype, rewritten stmt)
+        rewrites: list[tuple[Block, int, Statement, SimTypeFunction | None, Assignment]] = []
         for block in self._graph.nodes:
             for stmt_idx, stmt in enumerate(block.statements):
                 if isinstance(stmt, SideEffectStatement) and isinstance(stmt.expr, Call):
                     call_expr = stmt.expr
-                    self._infer_call_prototype(call_expr, block)
-                    new_stmt = self._rewrite_retbuf_call(call_expr)
-                    if new_stmt is not None:
-                        block.statements[stmt_idx] = new_stmt
                 elif isinstance(stmt, Assignment) and isinstance(stmt.src, Call):
                     call_expr = stmt.src
-                    self._infer_call_prototype(call_expr, block)
-                    new_stmt = self._rewrite_retbuf_call(call_expr)
-                    if new_stmt is not None:
-                        block.statements[stmt_idx] = new_stmt
-                    else:
-                        self._apply_return_type_hint(call_expr, stmt)
+                else:
+                    continue
+                self._infer_call_prototype(call_expr, block)
+                old_prototype = vm.prototype(call_expr)
+                new_stmt = self._rewrite_retbuf_call(call_expr)
+                if new_stmt is not None:
+                    block.statements[stmt_idx] = new_stmt
+                    rewrites.append((block, stmt_idx, stmt, old_prototype, new_stmt))
+                elif isinstance(stmt, Assignment):
+                    self._apply_return_type_hint(call_expr, stmt)
+
+        # arg0 is not a pure out-buffer if the slot's earlier value still reaches a use the call also reaches (e.g.,
+        # a &mut self method); without a phi no single vvar holds that value, so keep the call writing through &slot
+        ambiguous = self.ambiguous_new_stack_vvars()
+        for block, stmt_idx, old_stmt, old_prototype, new_stmt in rewrites:
+            assert isinstance(new_stmt.dst, VirtualVariable)
+            if new_stmt.dst.varid in ambiguous:
+                block.statements[stmt_idx] = old_stmt
+                vm.set_prototype(new_stmt.src, old_prototype)
+                del self._new_stack_vvars[new_stmt.dst.varid]
+            else:
+                self.project.kb.type_hints.add_type_hint(new_stmt.dst, new_stmt.dst.tags["type"], self._func.addr)
+
         self.fix_stack_vvar_uses()
         self.out_graph = self._graph

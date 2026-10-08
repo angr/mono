@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import ClassVar
+
 from .pypcode_native import (  # pylint:disable=no-name-in-module
     Disassembly,
     Instruction,
@@ -18,7 +20,7 @@ class OpFormat:
     @staticmethod
     def fmt_vn(vn: Varnode) -> str:
         if vn.space.name == "const":
-            return "%#x" % vn.offset
+            return f"{vn.offset:#x}"
         elif vn.space.name == "register":
             name = vn.getRegisterName()
             if name:
@@ -127,7 +129,7 @@ class PcodePrettyPrinter:
 
     DEFAULT_OP_FORMAT = OpFormat()
 
-    OP_FORMATS = {
+    OP_FORMATS: ClassVar[dict[OpCode, OpFormat]] = {
         OpCode.BOOL_AND: OpFormatBinary("&&"),
         OpCode.BOOL_NEGATE: OpFormatUnary("!"),
         OpCode.BOOL_OR: OpFormatBinary("||"),
