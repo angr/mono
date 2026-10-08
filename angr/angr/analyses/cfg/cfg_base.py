@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 import archinfo
+import capstone
 import networkx
 import pyvex
 from archinfo.arch_arm import get_real_address_if_arm, is_arm_arch
@@ -27,7 +28,7 @@ from cle import (
     TLSObject,
 )
 from cle.backends import NamedRegion
-from sortedcontainers import SortedDict
+from sortedcontainers import SortedDict, SortedSet
 
 from angr.analyses.analysis import Analysis
 from angr.analyses.stack_pointer_tracker import StackPointerTracker
@@ -63,6 +64,25 @@ if TYPE_CHECKING:
 
 
 l = logging.getLogger(name=__name__)
+
+
+def _conflicting_decodings(arch: archinfo.Arch, node: CFGNode, other: CFGNode) -> bool:
+    """
+    Check if node and other overlap and decode the bytes they share into different instructions. Breaking node where
+    other starts would then cut an instruction in half, so normalization has to leave both of them alone: one of the
+    two decodings is wrong, and normalize() cannot tell which one.
+    """
+
+    node_addr = get_real_address_if_arm(arch, node.addr)
+    other_addr = get_real_address_if_arm(arch, other.addr)
+    if not node_addr <= other_addr < node_addr + node.size:
+        return False
+    node_ins = [get_real_address_if_arm(arch, addr) for addr in node.instruction_addrs]
+    other_ins = [get_real_address_if_arm(arch, addr) for addr in other.instruction_addrs]
+    if not node_ins or not other_ins or other_addr not in node_ins[1:]:
+        return True
+    shared = node_ins[node_ins.index(other_addr) :]
+    return shared[: len(other_ins)] != other_ins[: len(shared)]
 
 
 class CFGBase(Analysis):
@@ -179,7 +199,9 @@ class CFGBase(Analysis):
         # IndirectJump object that describe all indirect exits found in the binary
         # stores as a map between addresses and IndirectJump objects
         self.indirect_jumps: dict[int, IndirectJump] = {}
-        self._indirect_jumps_to_resolve = set()
+        # a sorted set, not a set: resolving one indirect jump builds blocks and occupies bytes that the next
+        # resolver reads, so the order they come out of here decides the CFG. IndirectJump orders by address.
+        self._indirect_jumps_to_resolve: SortedSet = SortedSet()
         # indirect jumps whose resolution was postponed because the data references that bound an unbounded jump
         # table were not collected yet. only used when _defer_unbounded_jumptables is enabled (CFGFast).
         self._deferred_indirect_jumps: set[IndirectJump] = set()
@@ -809,9 +831,11 @@ class CFGBase(Analysis):
                         max_mapped_addr = segment.min_addr + min(segment.memsize, segment.filesize)
                         tpl = (segment.min_addr, max_mapped_addr)
                         segments.append(tpl)
-                if (not b.sections and segments) or force_segment:
-                    # Use segments directly when force_segment is True or when the ELF has no section headers
-                    # at all.
+                # Regions.max_addr is None exactly when no region in the container is mapped into memory.
+                sections_mapped = b.sections.max_addr is not None
+                if (not sections_mapped and segments) or force_segment:
+                    # Use segments directly when force_segment is True or when the ELF's sections map nothing,
+                    # which includes an ELF with no section headers at all.
                     memory_regions += segments
                 elif sections and segments:
                     # are there executable segments with no sections inside?
@@ -1284,7 +1308,8 @@ class CFGBase(Analysis):
 
     def normalize(self):
         """
-        Normalize the CFG, making sure that there are no overlapping basic blocks.
+        Normalize the CFG, making sure that there are no overlapping basic blocks. self.normalized is set only if
+        every overlapping block was split; blocks that cannot be split leave the CFG unnormalized.
 
         Note that this method will not alter transition graphs of each function in self.kb.functions. You may call
         normalize() on each Function object to normalize their transition graphs.
@@ -1294,6 +1319,7 @@ class CFGBase(Analysis):
 
         graph = self.graph
 
+        unsplittable_pairs = 0
         smallest_nodes = {}  # indexed by end address of the node
         end_addr_to_node = {}  # a dictionary from node key to node *if* only one node exists for the key
         end_addr_to_nodes = defaultdict(list)  # a dictionary from node key to nodes *if* more than one node exist
@@ -1351,7 +1377,7 @@ class CFGBase(Analysis):
                     del end_addr_to_nodes[key_to_find]
                     continue
 
-                self._normalize_core(
+                unsplittable_pairs += self._normalize_core(
                     graph, callstack_key, smallest_node, other_nodes, smallest_nodes, end_addr_to_nodes
                 )
 
@@ -1379,18 +1405,16 @@ class CFGBase(Analysis):
                                 break
                             next_node = lst[i + 1]
                             if node is not next_node and node.addr <= next_node.addr < node.addr + node.size:
-                                # umm, those nodes are overlapping, but they must have different end addresses
+                                # umm, those nodes are overlapping
                                 nodekey_a = node.addr + node.size, callstack_key
                                 nodekey_b = next_node.addr + next_node.size, callstack_key
-                                if nodekey_a == nodekey_b:
-                                    # error handling: this will only happen if we have completely overlapping nodes
-                                    # caused by different jumps (one of the jumps is probably incorrect), which usually
-                                    # indicates an error in CFG recovery. we print a warning and skip this node
-                                    l.warning(
-                                        "Found completely overlapping nodes %s. It usually indicates an error in CFG "
-                                        "recovery. Skip.",
+                                if _conflicting_decodings(self.project.arch, node, next_node):
+                                    l.debug(
+                                        "Cannot break %s where %s starts: they decode into different instructions.",
                                         node,
+                                        next_node,
                                     )
+                                    unsplittable_pairs += 1
                                     continue
 
                                 if nodekey_a in smallest_nodes and nodekey_b in smallest_nodes:
@@ -1404,7 +1428,13 @@ class CFGBase(Analysis):
                                 smallest_nodes.pop(nodekey_a, None)
                                 smallest_nodes.pop(nodekey_b, None)
 
-        self.normalized = True
+        if unsplittable_pairs:
+            l.warning(
+                "%d pairs of overlapping nodes decode into different instructions and could not be split. It usually "
+                "indicates an error in CFG recovery.",
+                unsplittable_pairs,
+            )
+        self.normalized = not unsplittable_pairs
 
     def _normalize_core(
         self,
@@ -1414,12 +1444,23 @@ class CFGBase(Analysis):
         other_nodes,
         smallest_nodes,
         end_addr_to_nodes,
-    ):
+    ) -> int:
+        smallest_addr = get_real_address_if_arm(self.project.arch, smallest_node.addr)
+        unsplittable_pairs = 0
+        splittable_nodes = []
+        for n in other_nodes:
+            if get_real_address_if_arm(self.project.arch, n.addr) != smallest_addr and _conflicting_decodings(
+                self.project.arch, n, smallest_node
+            ):
+                l.debug("Cannot break %s where %s starts: they decode into different instructions.", n, smallest_node)
+                unsplittable_pairs += 1
+                continue
+            splittable_nodes.append(n)
+        other_nodes = splittable_nodes
+
         # Break other nodes
         for n in other_nodes:
-            new_size = get_real_address_if_arm(self.project.arch, smallest_node.addr) - get_real_address_if_arm(
-                self.project.arch, n.addr
-            )
+            new_size = smallest_addr - get_real_address_if_arm(self.project.arch, n.addr)
             if new_size == 0:
                 # This node has the same size as the smallest one. Don't touch it.
                 continue
@@ -1570,6 +1611,8 @@ class CFGBase(Analysis):
             for n in other_nodes:
                 if n.addr in self.indirect_jumps:
                     del self.indirect_jumps[n.addr]
+
+        return unsplittable_pairs
 
     #
     # Job management
@@ -1927,6 +1970,8 @@ class CFGBase(Analysis):
                     and block.size > 0
                     and len(block.instruction_addrs) == 2
                     and block.vex.jumpkind == "Ijk_Boring"
+                    # push ordinal; jmp _resolve
+                    and self._pushes_a_relocation_ordinal(block)
                 )
             except SimError:
                 # catch any exceptions that may raise during VEX block lifting
@@ -1999,6 +2044,7 @@ class CFGBase(Analysis):
         """
 
         functions_to_remove = {}
+        inferred_targets_by_jump = defaultdict(set)
 
         all_func_addrs = sorted(set(functions.keys()))
         ij_by_funcaddr = defaultdict(list)  # unresolved indirect jumps indexed by function address
@@ -2116,6 +2162,15 @@ class CFGBase(Analysis):
 
             for f_addr in functions_to_merge:
                 functions_to_remove[f_addr] = func_addr
+                inferred_targets_by_jump[max_unresolved_jump_addr].add(f_addr)
+
+        # The functions above are merged because their entries are inferred to be targets of an otherwise unresolved
+        # indirect jump. Record that inference in the CFG as well: changing block ownership without adding the
+        # corresponding transitions leaves every merged block unreachable in the rebuilt function graph.
+        for jump_addr, target_addrs in inferred_targets_by_jump.items():
+            if not self._record_irrational_function_targets(jump_addr, target_addrs):
+                for target_addr in target_addrs:
+                    del functions_to_remove[target_addr]
 
         # merge all functions
         for to_remove, merge_with in functions_to_remove.items():
@@ -2135,6 +2190,37 @@ class CFGBase(Analysis):
         unresolved indirect jumps are merged into it.
         """
         return end
+
+    def _record_irrational_function_targets(self, jump_addr: int, target_addrs: set[int]) -> bool:
+        jump = self.indirect_jumps[jump_addr]
+        src_node = self.model.get_any_node(jump_addr, force_fastpath=True)
+        if src_node is None:
+            return False
+
+        target_nodes = {
+            target_addr: self.model.get_any_node(target_addr, force_fastpath=True) for target_addr in target_addrs
+        }
+        if any(target_node is None for target_node in target_nodes.values()):
+            return False
+
+        for target_node in target_nodes.values():
+            assert target_node is not None
+            self.graph.add_edge(
+                src_node,
+                target_node,
+                jumpkind=jump.jumpkind,
+                ins_addr=jump.ins_addr,
+                stmt_idx=jump.stmt_idx,
+            )
+
+        unresolvable_target = self.model.get_any_node(self._unresolvable_jump_target_addr, force_fastpath=True)
+        if unresolvable_target is not None and self.graph.has_edge(src_node, unresolvable_target):
+            self.graph.remove_edge(src_node, unresolvable_target)
+
+        jump.resolved_targets.update(target_addrs)
+        self.kb.indirect_jumps.update_resolved_addrs(jump_addr, target_addrs)
+        self.kb.unresolved_indirect_jumps.discard(jump_addr)
+        return True
 
     def _process_irrational_function_starts(
         self, functions, predetermined_function_addrs, blockaddr_to_funcaddr: dict[AddressType, MethodType]
@@ -2860,6 +2946,28 @@ class CFGBase(Analysis):
                 for stmt in vex.statements
             )
         return False
+
+    @staticmethod
+    def _pushes_a_relocation_ordinal(block) -> bool:
+        """
+        Check if the block is the `push <ordinal>; jmp _resolve` body of a lazy-binding PLT stub.
+
+        The two-instruction test in _remove_dummy_plt_stubs is written for that shape, but on its own it
+        only counts instructions, so any two-instruction tail call matches it. A thunk that transforms an
+        argument before jumping to an imported function has the same shape and is a real function with
+        real callers.
+
+        Only the push is checked here. That the block then leaves is the caller's
+        `block.vex.jumpkind == "Ijk_Boring"` condition.
+
+        :param block:   The block instance.
+        :return: True if the block is two instructions and the first pushes an immediate.
+        """
+        insns = block.capstone.insns
+        if len(insns) != 2 or insns[0].mnemonic != "push":
+            return False
+        operands = insns[0].operands
+        return len(operands) == 1 and operands[0].type == capstone.x86.X86_OP_IMM
 
     @staticmethod
     def _is_noop_block(arch: archinfo.Arch, block) -> bool:

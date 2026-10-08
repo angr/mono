@@ -1242,15 +1242,37 @@ class CStatements(CStatement):
         self.addr = addr
 
     def c_repr_chunks(self, indent=0, asexpr=False):
+        return self._c_repr_chunks(indent=indent, asexpr=asexpr, terminate_trailing_label=True)
+
+    def _c_repr_chunks(self, indent=0, asexpr=False, *, terminate_trailing_label):
         indent_str = self.indent_str(indent)
         if self.codegen.display_block_addrs:
             yield indent_str, None
             yield f"/* Block {hex(self.addr) if self.addr is not None else 'unknown'} */", None
             yield "\n", None
         for stmt in self.statements:
-            yield from stmt.c_repr_chunks(indent=indent, asexpr=asexpr)
+            if isinstance(stmt, CStatements):
+                # CStatements may be a transparent sequence nested inside another sequence. A label at the end of
+                # the inner sequence still labels the next statement in the outer sequence.
+                yield from stmt._c_repr_chunks(indent=indent, asexpr=asexpr, terminate_trailing_label=False)
+            else:
+                yield from stmt.c_repr_chunks(indent=indent, asexpr=asexpr)
             if asexpr:
                 yield ", ", None
+        if not asexpr and terminate_trailing_label and isinstance(self._last_nonempty_statement(), CLabel):
+            # A C label prefixes a statement; it is not a complete statement itself. Finish it only at the boundary
+            # of the enclosing sequence, after looking through transparent nested sequences.
+            yield indent_str, None
+            yield ";\n", None
+
+    def _last_nonempty_statement(self) -> CStatement | None:
+        for stmt in reversed(self.statements):
+            if isinstance(stmt, CStatements):
+                stmt = stmt._last_nonempty_statement()
+                if stmt is None:
+                    continue
+            return stmt
+        return None
 
 
 class CAILBlock(CStatement):
@@ -5089,10 +5111,15 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
         else_node = (
             None
             if stmt.false_target is None
-            else CGoto(self._handle(stmt.false_target), None, tags=stmt.tags, codegen=self)
+            else CGoto(self._handle(stmt.false_target), stmt.false_target_idx, tags=stmt.tags, codegen=self)
         )
         return CIfElse(
-            [(self._handle(stmt.condition), CGoto(self._handle(stmt.true_target), None, tags=stmt.tags, codegen=self))],
+            [
+                (
+                    self._handle(stmt.condition),
+                    CGoto(self._handle(stmt.true_target), stmt.true_target_idx, tags=stmt.tags, codegen=self),
+                )
+            ],
             else_node=else_node,
             cstyle_ifs=self.cstyle_ifs,
             tags=stmt.tags,
@@ -5726,9 +5753,11 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
             and child.type is not None
         ):
             # this is a problem. sign-extension only happens when the SOURCE of the cast is signed
-            # a child whose type has no size (e.g., a function or a bottom type) is as wide as the conversion says
-            child_bits = child.type.size if child.type.size is not None else expr.from_bits
-            child_ty = self.default_simtype_from_bits(child_bits, expr.is_signed)
+            # child.type.size is None for a SimTypeBottom and 0 for a struct that reached us with no
+            # fields, and neither can be the width of an integer cast. The AIL conversion carries the
+            # source width, so fall back to it whenever the rendered type does not supply one.
+            child_size = child.type.size
+            child_ty = self.default_simtype_from_bits(child_size or expr.from_bits, expr.is_signed)
             child = CTypeCast(None, child_ty, child, codegen=self)
 
         return CTypeCast(None, dst_type.with_arch(self.project.arch), child, tags=expr.tags, codegen=self)

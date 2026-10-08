@@ -75,6 +75,7 @@ class AddressTransformationTypes(int, enum.Enum):
     ShiftRight = 6
     Add = 7
     Load = 8
+    AlignmentMask = 9
 
 
 class AddressTransformation:
@@ -861,7 +862,7 @@ class JumpTableResolver(IndirectJumpResolver):
 
         self.resolve_calls = resolve_calls
 
-        self._bss_regions = None
+        self._bss_regions: list[tuple[int, int]] = []
         # the maximum number of resolved targets. Will be initialized from CFG.
         self._max_targets = 0
 
@@ -1115,14 +1116,18 @@ class JumpTableResolver(IndirectJumpResolver):
             elif not potential_call_table and not is_arm:
                 l.debug("Indirect jump at %#x does not look like a jump table. Skip.", addr)
                 return False, None
-            if (
-                potential_call_table
-                and transformations
-                and next(iter(transformations.values())).op != AddressTransformationTypes.Load
-            ):
-                # targets of call tables must be directly loaded from memory
-                l.debug("Indirect jump/call at %#x does not look like an indirect call from a call table. Skip", addr)
-                return False, None
+            if potential_call_table:
+                # the alignment mask that the lifter puts on the branch target is not part of the address
+                # computation, so it does not say anything about where the target came from
+                addr_trans = [
+                    tran for tran in transformations.values() if tran.op is not AddressTransformationTypes.AlignmentMask
+                ]
+                if addr_trans and addr_trans[0].op != AddressTransformationTypes.Load:
+                    # targets of call tables must be directly loaded from memory
+                    l.debug(
+                        "Indirect jump/call at %#x does not look like an indirect call from a call table. Skip", addr
+                    )
+                    return False, None
 
         # Debugging output
         if l.level == logging.DEBUG:
@@ -1587,6 +1592,34 @@ class JumpTableResolver(IndirectJumpResolver):
                             AddressTransformationTypes.ShiftRight, [AddressSingleton, stmt.data.args[1].con.value]
                         )
                         continue
+                    elif (
+                        stmt.data.op.startswith("Iop_And")
+                        and isinstance(stmt, pyvex.stmt.WrTmp)
+                        and isinstance(stmt.data.args[0], pyvex.IRExpr.RdTmp)
+                        and isinstance(stmt.data.args[1], pyvex.IRExpr.Const)
+                        and block.tyenv.sizeof(stmt.tmp) == self.project.arch.bits
+                        and stmt.data.args[1].con.value == self._instruction_alignment_mask()
+                    ):
+                        # PowerPC ignores the low two bits of the count and link registers, so the lifter masks the
+                        # target of every bcctr and bclr.
+                        # e.g.
+                        #        IRSB 0x4c6b38
+                        #  + 01 | t17 = GET:I32(gpr30)
+                        #  + 02 | t16 = Add32(t17,0xffffeb8c)
+                        #  + 03 | t18 = LDbe:I32(t16)
+                        #  + 05 | t1 = GET:I32(gpr9)
+                        #  + 06 | t2 = Shl32(t1,0x02)
+                        #  + 09 | t19 = Add32(t18,t2)
+                        #  + 10 | t22 = LDbe:I32(t19)
+                        #  + 13 | t8 = Add32(t22,t18)
+                        #    16 | PUT(ctr) = t8
+                        #  + 18 | t23 = And32(t8,0xfffffffc)
+                        #  + Next: t23
+                        stmts_to_remove.append(stmt_loc)
+                        transformations[(stmt_loc[0], stmt.tmp)] = AddressTransformation(
+                            AddressTransformationTypes.AlignmentMask, [AddressSingleton, stmt.data.args[1].con.value]
+                        )
+                        continue
                 elif isinstance(stmt.data, pyvex.IRExpr.Load):
                     assert isinstance(stmt, pyvex.stmt.WrTmp)
                     # Got it!
@@ -1872,6 +1905,9 @@ class JumpTableResolver(IndirectJumpResolver):
         def handle_or1(a):
             return a | 1
 
+        def handle_alignment_mask(con, a):
+            return a & con
+
         def handle_lshift(num_bits, a):
             return a << num_bits
 
@@ -1905,6 +1941,10 @@ class JumpTableResolver(IndirectJumpResolver):
                     raise NotImplementedError("Unsupported truncation operation.")
             elif tran_op is AddressTransformationTypes.Or1:
                 lam = handle_or1
+            elif tran_op is AddressTransformationTypes.AlignmentMask:
+                lam = functools.partial(
+                    handle_alignment_mask, next(iter(arg for arg in args if arg is not AddressSingleton))
+                )
             elif tran_op is AddressTransformationTypes.ShiftLeft:
                 lam = functools.partial(handle_lshift, next(iter(arg for arg in args if arg is not AddressSingleton)))
             elif tran_op is AddressTransformationTypes.ShiftRight:
@@ -2027,10 +2067,14 @@ class JumpTableResolver(IndirectJumpResolver):
                     if jump_base_addr.tmp_1 == addr_holder[1]:
                         # swap the two tmps
                         jump_base_addr.tmp, jump_base_addr.tmp_1 = jump_base_addr.tmp_1, jump_base_addr.tmp
-                    # Load the concrete base address
-                    with contextlib.suppress(SimError):
-                        # silently eat the claripy exception
-                        jump_base_addr.base_addr = state.solver.eval(state.scratch.temps[jump_base_addr.tmp_1])
+                    # Load the concrete base address. The statement that adds the base is removed
+                    # from the slice before the slice runs, so this tmp holds a value only when some
+                    # other statement that stayed in the slice wrote it.
+                    base_addr_expr = state.scratch.temps[jump_base_addr.tmp_1]
+                    if base_addr_expr is not None:
+                        with contextlib.suppress(SimError):
+                            # silently eat the claripy exception
+                            jump_base_addr.base_addr = state.solver.eval(base_addr_expr)
             else:
                 # We do not support the cases where the base address involves more than one addition.
                 # One such case exists in libc-2.27.so shipped with Ubuntu x86 where esi is used as the address of the
@@ -2070,6 +2114,12 @@ class JumpTableResolver(IndirectJumpResolver):
         # we use this to differentiate between traditional jump tables (where each entry is some blocks that belong to
         # the current function) and vtables (where each entry is a function).
         if stride < load_size:
+            if load_size != project.arch.bytes or stmts_adding_base_addr:
+                # A vtable holds pointers that are jumped to as they are. These entries are narrower than a pointer, or
+                # a base address is added to them, so this is an offset table whose address interval came out too
+                # imprecise to tell where the table ends.
+                l.debug("The address of the jump table at %#x is too imprecise to bound the table. Skip.", addr)
+                return None
             stride = load_size
             total_cases = jumptable_addr.cardinality // load_size
             sort = "vtable"  # it's probably a vtable!
@@ -2211,6 +2261,16 @@ class JumpTableResolver(IndirectJumpResolver):
         ):
             l.debug(
                 "Jump table %#x might have jump targets outside mapped memory regions. "
+                "Continue to resolve it from the next data source.",
+                addr,
+            )
+            return None
+
+        if any(start <= min_jumptable_addr < start + size for start, size in self._bss_regions):
+            # The bytes there are the loader's zero fill rather than the program's data, so whatever
+            # this reads is an artifact of how the object was loaded.
+            l.debug(
+                "Jump table %#x is read out of memory that is only zero-filled. "
                 "Continue to resolve it from the next data source.",
                 addr,
             )
@@ -2433,12 +2493,32 @@ class JumpTableResolver(IndirectJumpResolver):
     def _find_bss_region(self):
         self._bss_regions = []
 
-        # TODO: support other sections other than '.bss'.
-        # TODO: this is very hackish. fix it after the chaos.
-        for section in self.project.loader.main_object.sections:
-            if section.name == ".bss":
-                self._bss_regions.append((section.vaddr, section.memsize))
-                break
+        main_object = self.project.loader.main_object
+        tls_start, tls_end = self._tls_block(main_object)
+        for section in main_object.sections:
+            if not section.memsize:
+                continue
+            try:
+                zero_filled = section.only_contains_uninitialized_data
+            except NotImplementedError:
+                # A backend that builds sections without modelling their content cannot say.
+                continue
+            if not zero_filled:
+                continue
+            if tls_start <= section.vaddr < tls_end:
+                # A thread-local zero-fill section describes the initial image of a thread's
+                # thread-local block rather than memory at its own address. An ELF .tbss is laid over
+                # the addresses the linker gave to whatever follows the thread-local template, so
+                # what a read there returns is that section's data and is not uninitialized.
+                continue
+            self._bss_regions.append((section.vaddr, section.memsize))
+
+    @staticmethod
+    def _tls_block(obj) -> tuple[int, int]:
+        if not obj.tls_used or obj.tls_data_start is None:
+            return 0, 0
+        start = obj.mapped_base + obj.tls_data_start
+        return start, start + (obj.tls_block_size or 0)
 
     def _init_registers_on_demand(self, state):
         # for uninitialized read using a register as the source address, we replace them in memory on demand
@@ -2457,7 +2537,7 @@ class JumpTableResolver(IndirectJumpResolver):
                 read_length = read_length.args[3]  # max
             if read_length > 16:
                 return
-            new_read_addr = claripy.BVV(UninitReadMeta.uninit_read_base, state.arch.bits)
+            new_read_addr = claripy.BVV(UninitReadMeta.uninit_read_base, read_addr.size())
             UninitReadMeta.uninit_read_base += read_length
 
             # replace the expression in registers
@@ -2720,6 +2800,18 @@ class JumpTableResolver(IndirectJumpResolver):
         if vex_block.jumpkind == "Ijk_NoDecode":
             return False
         return vex_block.size != 0
+
+    def _instruction_alignment_mask(self) -> int | None:
+        """
+        Build the mask that clears the bits an instruction address cannot use on this architecture.
+
+        :return:    The mask, or None if instructions may start at any byte.
+        """
+
+        alignment = self.project.arch.instruction_alignment
+        if alignment is None or alignment <= 1:
+            return None
+        return ((1 << self.project.arch.bits) - 1) & ~(alignment - 1)
 
     def _is_address_mapped(self, addr: int) -> bool:
         return (

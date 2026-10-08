@@ -2105,6 +2105,7 @@ class Clinic(Analysis, Serializable):
         """
         Rewrite tail jumps to functions as call statements.
         """
+        function_block_addrs = {block.addr for block in ail_graph}
         for block in list(ail_graph.nodes()):
             if ail_graph.out_degree[block] > 1:
                 continue
@@ -2125,7 +2126,11 @@ class Clinic(Analysis, Serializable):
                 continue
 
             for slot_name, target in slots:
-                if not isinstance(target, ailment.Const) or not self.kb.functions.contains_addr(target.value):
+                if (
+                    not isinstance(target, ailment.Const)
+                    or target.value in function_block_addrs
+                    or not self.kb.functions.contains_addr(target.value)
+                ):
                     continue
                 if target.value == self.function.addr:
                     # a jump back to the current function is a loop back edge, not a call to other functions
@@ -3789,8 +3794,10 @@ class Clinic(Analysis, Serializable):
                         # Create a new global variable if there isn't one already
                         global_vars = global_variables.get_global_variables(symbol.rebased_addr)
                         if not global_vars:
-                            global_var = SimMemoryVariable(symbol.rebased_addr, symbol.size, name=symbol.name)
-                            global_var.renamed = True
+                            global_var = SimMemoryVariable(
+                                symbol.rebased_addr, symbol.size, name=symbol.name or f"g_{symbol.rebased_addr:x}"
+                            )
+                            global_var.renamed = bool(symbol.name)
                             global_variables.add_variable("global", global_var.addr, global_var)
                             global_vars = {global_var}
                 if global_vars:
@@ -4739,23 +4746,21 @@ class Clinic(Analysis, Serializable):
     @staticmethod
     def _collect_externs(ail_graph, kb, variable_map: VariableMap, flavor: str | None):
         global_vars = kb.dec_variables.get_global_manager(flavor).get_variables()
-        walker = ailment.AILBlockRewriter()
         variables = set()
 
-        def handle_expr(
-            expr_idx: int,
-            expr: ailment.expression.Expression,
-            stmt_idx: int,
-            stmt: ailment.statement.Statement | None,
-            block: ailment.Block | None,
-        ):
-            for v in [
-                variable_map.variable(expr),
-                variable_map.reference_variable(expr),
-            ]:
-                if v and v in global_vars:
-                    variables.add(v)
-            return ailment.AILBlockRewriter._handle_expr(walker, expr_idx, expr, stmt_idx, stmt, block)
+        class ExternCollector(ailment.AILBlockRewriter):
+            """Collect references to global variables while rewriting expressions."""
+
+            def _enter_expr(self, expr_idx, expr, stmt_idx, stmt, block):
+                for v in [
+                    variable_map.variable(expr),
+                    variable_map.reference_variable(expr),
+                ]:
+                    if v and v in global_vars:
+                        variables.add(v)
+                return super()._enter_expr(expr_idx, expr, stmt_idx, stmt, block)
+
+        walker = ExternCollector()
 
         def handle_Store(stmt_idx: int, stmt: ailment.statement.Store, block: ailment.Block | None):
             store_var = variable_map.variable(stmt)
@@ -4764,7 +4769,6 @@ class Clinic(Analysis, Serializable):
             return ailment.AILBlockRewriter._handle_Store(walker, stmt_idx, stmt, block)
 
         walker.stmt_handlers[ailment.statement.Store] = handle_Store
-        walker._handle_expr = handle_expr
         AILGraphWalker(ail_graph, walker.walk).walk()
         return variables
 

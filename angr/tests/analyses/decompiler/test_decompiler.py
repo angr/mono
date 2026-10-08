@@ -10,6 +10,7 @@ import re
 import time
 import unittest
 from functools import wraps
+from unittest import mock
 
 import networkx
 
@@ -509,11 +510,23 @@ class TestDecompiler(unittest.TestCase):
         p.analyses[CompleteCallingConventionsAnalysis].prep()(recover_variables=False, analyze_callsites=True)
 
         f = cfg.functions["process_file"]
-        dec = p.analyses[Decompiler].prep(fail_fast=True)(f, cfg=cfg.model, options=decompiler_options)
+        aliased_entries = []
+        original_make_switch_cases_core = PhoenixStructurer._make_switch_cases_core  # pylint:disable=protected-access
+
+        def audit_switch_entries(structurer, *args, **kwargs):
+            head, cases, default = args[0], args[2], args[4]
+            for case_value, case_node in cases.items():
+                if default is case_node:
+                    aliased_entries.append((head.addr, case_value, case_node.addr))
+            return original_make_switch_cases_core(structurer, *args, **kwargs)
+
+        with mock.patch.object(PhoenixStructurer, "_make_switch_cases_core", audit_switch_entries):
+            dec = p.analyses[Decompiler].prep(fail_fast=True)(f, cfg=cfg.model, options=decompiler_options)
         assert dec.codegen is not None, f"Failed to decompile function {f!r}."
         print_decompilation_result(dec)
         code = dec.codegen.text
         assert code is not None
+        self.assertFalse(aliased_entries, f"case/default metadata selected the same live node: {aliased_entries!r}")
         # the reconstructed switch and its case bodies survive: without the fix, structuring drops the outer switch
         # entirely, leaving only a small fragment (~1.4k chars) that is missing these cases and their bodies.
         assert "switch (" in code
@@ -524,6 +537,14 @@ class TestDecompiler(unittest.TestCase):
         assert "print_size(" in code
         # no unstructured switch head statement leaked into the output
         assert "IncompleteSwitchCaseHeadStatement" not in code
+        self.assertRegex(
+            code,
+            re.compile(
+                r"case 7:.*?case 1:\s+[A-Za-z_]\w* = 1;\s+return 1;\s+"
+                r"default:\s+[A-Za-z_]\w* = 1;\s+break;",
+                re.DOTALL,
+            ),
+        )
 
     @for_all_structuring_algos
     def test_decompiling_true_x86_64_0(self, decompiler_options=None):
@@ -2113,6 +2134,36 @@ class TestDecompiler(unittest.TestCase):
         assert "setlocale(" in d.codegen.text
         assert "NULL);" in d.codegen.text, "The arguments for setlocale() are missing"
 
+        # fadvise has a conditional tail jump to fdadvise.
+        f = proj.kb.functions["fadvise"]
+        d = proj.analyses[Decompiler].prep(fail_fast=True)(f, cfg=cfg.model, options=decompiler_options)
+        print_decompilation_result(d)
+        assert "return fdadvise(" in d.codegen.text
+
+    def test_decompiling_thumb_self_loop_as_loop(self):
+        bin_path = os.path.join(test_location, "armel", "Nucleo_read_hyperterminal.elf")
+        proj = angr.Project(bin_path, auto_load_libs=False)
+        function_symbol = proj.loader.find_symbol("HardFault_Handler")
+        assert function_symbol is not None
+
+        cfg = proj.analyses.CFGFast(normalize=True, function_starts=[function_symbol.rebased_addr])
+        func = cfg.functions[function_symbol.rebased_addr]
+
+        clinic = proj.analyses.Clinic(func, cfg=cfg.model)
+        assert clinic.graph is not None
+        clinic_entry = next(block for block in clinic.graph if block.addr == func.addr)
+        self.assertTrue(clinic.graph.has_edge(clinic_entry, clinic_entry))
+        self.assertIsInstance(clinic_entry.statements[-1], ailment.Stmt.Jump)
+
+        for structurer in (SAILRStructurer.NAME, PhoenixStructurer.NAME):
+            with self.subTest(structurer=structurer):
+                dec = proj.analyses[Decompiler].prep(fail_fast=True)(
+                    func, cfg=cfg.model, options=[(get_structurer_option(), structurer)]
+                )
+                assert dec.codegen is not None and dec.codegen.text is not None
+                self.assertIn("while (1)", dec.codegen.text)
+                self.assertEqual(dec.codegen.text.count(f"{func.name}("), 1)
+
     @for_all_structuring_algos
     def test_decompiling_du_di_set_alloc(self, decompiler_options=None):
         bin_path = os.path.join(test_location, "x86_64", "decompiler", "du")
@@ -3043,6 +3094,34 @@ class TestDecompiler(unittest.TestCase):
         print_decompilation_result(d)
 
         assert d.codegen.text.count("switch") == 0
+
+    @structuring_algo("sailr")
+    def test_touch_shifted_goto_destination_preserves_errno_path(self, decompiler_options=None):
+        bin_path = os.path.join(test_location, "x86_64", "decompiler", "touch_touch_no_switch.o")
+        proj = angr.Project(bin_path, auto_load_libs=False, load_debug_info=True)
+        cfg = proj.analyses.CFGFast(normalize=True, data_references=True)
+        f = cfg.kb.functions.function(name="touch", plt=False)
+        assert f is not None
+
+        d = proj.analyses[Decompiler].prep(fail_fast=True)(
+            f,
+            cfg=cfg.model,
+            options=decompiler_options,
+            preset="full",
+            use_cache=False,
+            update_cache=False,
+        )
+
+        assert d.codegen is not None and d.codegen.text is not None
+        error_region = re.search(
+            r'else if \(!no_create\)\s*\{(?P<body>.*?dcgettext\(NULL, "setting times of %s", 5\).*?)\n\s*\}',
+            d.codegen.text,
+            re.DOTALL,
+        )
+        assert error_region is not None
+        error_region_body = error_region.group("body")
+        self.assertNotIn("else if (!v2)", error_region_body)
+        self.assertIn('error(0, v5, dcgettext(NULL, "setting times of %s", 5));', error_region_body)
 
     @structuring_algo("sailr")
     def disabled_test_continuous_small_switch_cluster(self, decompiler_options=None):
@@ -5641,6 +5720,24 @@ class TestDecompiler(unittest.TestCase):
 
         # ensure decompling this function should not take over 30 seconds - it was taking at least two minutes before
         # recent optimizations
+
+    def test_decompiling_armel_go_boundserror(self, decompiler_options=None):
+        # An ARM32 register-offset store (strb rX, [rB, rI]) lets the traversal pair a stack base with a
+        # .rodata address in the index register, producing an ~800 KB stack variable that swallowed the
+        # frame of runtime.boundsError.Error.
+        bin_path = os.path.join(test_location, "armel", "decompiler", "errorpaths_go")
+        proj, cfg = load_project_with_scoped_cfg(bin_path, 0x2744C)
+
+        start = time.time()
+        dec = proj.analyses[Decompiler].prep(fail_fast=True)(
+            cfg.functions[0x2744C], cfg=cfg.model, options=decompiler_options
+        )
+        elapsed = time.time() - start
+        assert dec.codegen is not None and dec.codegen.text is not None
+        print_decompilation_result(dec)
+
+        assert "|Stack bp-" not in dec.codegen.text, "an unresolved stack variable leaked into the output"
+        assert elapsed <= 120, f"Decompiling runtime.boundsError.Error took {elapsed} seconds"
 
     def test_fastfail_intrinsic(self, decompiler_options=None):
         bin_path = os.path.join(test_location, "x86_64", "windows", "fastfail.exe")
