@@ -25,7 +25,10 @@ from angr.calling_conventions import (
     SimCCN32LinuxSyscall,
     SimCCN64,
     SimCCN64LinuxSyscall,
+    SimCCPowerPC,
+    SimCCPowerPC64,
     SimCCRISCV64,
+    SimCCS390X,
     SimCCStdcall,
     SimCCSystemVAMD64,
     SimCCX86FreeBSDSyscall,
@@ -40,7 +43,7 @@ from angr.calling_conventions import (
     SimTypeInt,
     default_cc,
 )
-from angr.engines.pcode.cc import SimCCPARISC
+from angr.engines.pcode.cc import SimCCPARISC, SimCCSPARC
 from angr.errors import AngrTypeError
 from angr.sim_type import (
     SimCppClass,
@@ -388,6 +391,34 @@ class TestCallingConvention(TestCase):
             cc, [SimTypePointer(SimTypeChar()), TypeRef("int64_t", SimTypeLongLong()), SimTypeInt()]
         ) == [[SimStackArg(0x4, 4)], [SimStackArg(0x8, 4), SimStackArg(0xC, 4)], [SimStackArg(0x10, 4)]]
 
+    def test_opaque_cpp_class_argument_is_placed_like_an_integer(self):
+        # sim_type invents one of these for a class a demangled C++ name mentions and angr never
+        # saw the definition of: no members, and a size forced to one word.
+        def locs(cc, arch, arg_ty):
+            proto = SimTypeFunction([SimTypeInt(), arg_ty], SimTypeInt()).with_arch(arch)
+            return [loc.get_footprint() for loc in cc.arg_locs(proto)]
+
+        # conventions that inherit SimCC.next_arg rather than overriding it, so the placement
+        # below is the base method's and not an ABI override's
+        for arch, cc_cls in (
+            (archinfo.ArchS390X(), SimCCS390X),
+            (archinfo.ArchPPC32(), SimCCPowerPC),
+            (archinfo.ArchPPC64(), SimCCPowerPC64),
+            (archinfo.ArchMIPS64(), SimCCN64),
+            (archinfo.ArchMIPSN32(), SimCCN32),
+            (archinfo.ArchPcode("sparc:BE:32:default"), SimCCSPARC),
+        ):
+            cc = cc_cls(arch)
+            opaque = SimCppClass(unique_name="Opaque", name="Opaque", members={}, size=32)
+            placed = locs(cc, arch, opaque)
+            assert placed == locs(cc, arch, SimTypeNum(32)), f"{arch.name}: {placed}"
+
+            # a class angr does have the members of is a real aggregate, and a convention that has
+            # not been taught how to lay one out still says so
+            pair = SimStruct({"a": SimTypeInt(), "b": SimTypeInt()}, name="Pair")
+            with self.assertRaises(TypeError):
+                locs(cc, arch, pair)
+
     def _mips_int_arg_locs(self, cc_cls, arch, arg_types):
         proto = SimTypeFunction(arg_types, SimTypeInt()).with_arch(arch)
         locs = []
@@ -609,6 +640,90 @@ class TestCallingConvention(TestCase):
             [SimRegArg("edx", 4)],
             [SimStackArg(0x4, 4)],
         ]
+
+    def test_simcc_arg_locs_returnty_none(self):
+        # SimTypeFunction documents returnty=None as void, and SimCC.arg_session accepts it. Rust
+        # decompilation produces such prototypes: when arg0 is a return buffer the return type moves
+        # into arg0 as a reference and returnty is left None. return_in_implicit_outparam must answer
+        # False for it rather than reaching for its size.
+        func_proto = SimTypeFunction([SimTypeInt(), SimTypeInt()], None)
+
+        arch = archinfo.ArchAMD64()
+        cc = SimCCMicrosoftAMD64(arch)
+        assert cc.return_in_implicit_outparam(None) is False
+
+        reg_names = []
+        for loc in cc.arg_locs(func_proto.with_arch(arch)):
+            assert isinstance(loc, SimRegArg)
+            reg_names.append(loc.reg_name)
+        assert reg_names == ["rcx", "rdx"]
+
+        for arch_cls in [archinfo.ArchAMD64, archinfo.ArchX86, archinfo.ArchARM]:
+            proto = func_proto.with_arch(arch_cls())
+            cc_cls = default_cc(arch_cls.name)
+            assert cc_cls is not None
+            arch_cc = cc_cls(arch_cls())
+
+            # It should not raise any exception!
+            arg_locs = list(arch_cc.arg_locs(proto))
+            assert len(arg_locs) == 2
+
+    def test_microsoft_amd64_array_return(self):
+        # Regression test: an array is an aggregate, and the Microsoft x64 convention returns one the
+        # way it returns a struct of the same size. Only return_val said otherwise, so a caller of a
+        # function whose recovered return type was an array decompiled to nothing. The sizes are the
+        # ones type inference produced on a real Windows x86-64 binary: unsigned int[2] and [4].
+        arch = archinfo.ArchAMD64()
+        cc = SimCCMicrosoftAMD64(arch)
+
+        small = SimTypeFixedSizeArray(SimTypeInt(), 2).with_arch(arch)
+        large = SimTypeFixedSizeArray(SimTypeInt(), 4).with_arch(arch)
+        small_struct = SimStruct({"a": SimTypeInt(), "b": SimTypeInt()}, name="two").with_arch(arch)
+        large_struct = SimStruct({f"f{i}": SimTypeInt() for i in range(4)}, name="four").with_arch(arch)
+
+        # Eight bytes come back in RAX, one element per half -- the same two locations a struct of
+        # the same layout gets. Compared as locations, not as footprints: SimStructArg.get_footprint
+        # coalesces a register's pieces into one span and SimArrayArg.get_footprint does not, so the
+        # footprints differ for identical placements.
+        small_ret = cc.return_val(small)
+        small_struct_ret = cc.return_val(small_struct)
+        assert isinstance(small_ret, SimArrayArg)
+        assert isinstance(small_struct_ret, SimStructArg)
+        assert small_ret.locs == [SimRegArg("rax", 4, 0), SimRegArg("rax", 4, 4)]
+        assert small_ret.locs == list(small_struct_ret.locs.values())
+        assert cc.return_in_implicit_outparam(small) is False
+
+        # Sixteen bytes do not fit, so the caller passes a hidden pointer in RCX and the callee
+        # returns it in RAX. Both are the struct's answer for the same size.
+        large_ret = cc.return_val(large)
+        returned = cc.return_val(large, perspective_returned=True)
+        large_struct_ret = cc.return_val(large_struct)
+        assert isinstance(large_ret, SimReferenceArgument)
+        assert isinstance(returned, SimReferenceArgument)
+        assert isinstance(large_struct_ret, SimReferenceArgument)
+        assert large_ret.ptr_loc == SimRegArg("rcx", 8)
+        assert returned.ptr_loc == SimRegArg("rax", 8)
+        assert set(large_ret.get_footprint()) == set(large_struct_ret.get_footprint())
+        assert cc.return_in_implicit_outparam(large) is True
+
+        # return_in_implicit_outparam already answered True for the array before this change, so
+        # arg_locs was shifting the declared arguments along for a return value return_val refused
+        # to place. The two now agree: the hidden pointer takes RCX and the arguments follow it.
+        proto = SimTypeFunction([SimTypeInt(), SimTypeInt()], large).with_arch(arch)
+        assert [list(loc.get_footprint()) for loc in cc.arg_locs(proto)] == [
+            [SimRegArg("rdx", 4)],
+            [SimRegArg("r8", 4)],
+        ]
+
+        # An array with no size has no layout to give, and the base class's refusal is the answer.
+        # SimTypeArray.size is 0 rather than None for a length-less array and that 0 propagates
+        # outwards, so a sized array holding an unsized one is refused as well.
+        unsized = SimTypeFixedSizeArray(SimTypeInt(), None).with_arch(arch)
+        nested = SimTypeFixedSizeArray(unsized, 2).with_arch(arch)
+        assert (unsized.size, nested.size) == (0, 0)
+        for ty in (unsized, nested):
+            with self.assertRaises(AngrTypeError):
+                cc.return_val(ty)
 
 
 if __name__ == "__main__":
