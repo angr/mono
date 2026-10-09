@@ -200,6 +200,19 @@ class TestMemoryMerge(TestCase):
         parents = list(page.parents())
         assert len(parents) == 3
 
+    def test_ultra_page_cross_boundary_merge_issue_6314(self):
+        BASE = 3 * 4096
+        state0 = SimState(project=minimal_project("AMD64"), mode="symbolic")
+        state1 = state0.copy()
+        state0.memory.store(BASE + 4094, claripy.BVS("sym1", 9 * 8))
+        state1.memory.store(BASE + 4090, claripy.BVS("sym2", 16 * 8))
+        merged, _, anything_merged = state0.merge(state1)
+        assert anything_merged is True
+        assert merged.memory.load(BASE + 4094, size=9).op == "If"
+        page = next(iter(state0.memory._pages.values()))
+        assert page._contains(-1, 0) is False
+        assert page._contains(page.symbolic_bitmap.size + 1, 0) is False
+
 
 if __name__ == "__main__":
     unittest.main()

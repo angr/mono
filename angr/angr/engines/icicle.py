@@ -103,6 +103,12 @@ class IcicleEngine(SuccessorsEngine):
         return "Ijk_Sys_syscall"
 
     @staticmethod
+    def _next_ip(emu: Icicle) -> int:
+        """The address after the instruction icicle stopped on, with the Thumb bit set in Thumb mode."""
+        thumb = IcicleEngine._is_arm(emu.architecture) and emu.isa_mode == 1
+        return emu.reg_read("next_pc") | thumb
+
+    @staticmethod
     def _get_pages(state: SimState[int, int]) -> set[int]:
         """
         Unfortunately, the memory model doesn't have a way to get all pages.
@@ -203,9 +209,9 @@ class IcicleEngine(SuccessorsEngine):
 
     @staticmethod
     def _convert_icicle_state_to_angr(
-        emu: Icicle, translation_data: IcicleStateTranslationData, status: VmExit
+        emu: Icicle, translation_data: IcicleStateTranslationData, status: VmExit, base_state: SimState[int, int]
     ) -> SimState[int, int]:
-        state = translation_data.base_state.copy()
+        state = base_state.copy()
 
         # 1. Copy the register values
         for register in translation_data.registers:
@@ -215,7 +221,7 @@ class IcicleEngine(SuccessorsEngine):
             state.registers.store("pc", (emu.pc | 1) if emu.isa_mode == 1 else emu.pc)
 
         # Restore TLS base from FS/GS_OFFSET (register copy clobbers it).
-        arch_name = translation_data.base_state.arch.name
+        arch_name = base_state.arch.name
         if arch_name == "AMD64":
             state.regs.fs = emu.reg_read("FS_OFFSET")
         elif arch_name == "X86":
@@ -244,20 +250,18 @@ class IcicleEngine(SuccessorsEngine):
                 state.history.jumpkind = "Ijk_SigSEGV"
             elif exc == ExceptionCode.Syscall:
                 state.history.jumpkind = IcicleEngine._syscall_jumpkind(arch_name, emu)
-                # Icicle stops at the syscall instruction (unlike VEX
-                # which computes the next IP during lifting), so we
-                # advance IP using archinfo's instruction_alignment.
-                # x86 (variable-length): alignment is 1, but all syscall variants are 2 bytes.
-                syscall_len = translation_data.base_state.arch.instruction_alignment
-                if syscall_len is None or syscall_len < 2:
-                    syscall_len = 2
-                state.regs.ip = emu.pc + syscall_len
-            elif exc == ExceptionCode.Halt:
-                state.history.jumpkind = "Ijk_Exit"
+                state.regs.ip = IcicleEngine._next_ip(emu)
             elif exc == ExceptionCode.InvalidInstruction:
                 state.history.jumpkind = "Ijk_NoDecode"
             else:
                 state.history.jumpkind = "Ijk_EmFail"
+        elif status == VmExit.Halt and exc == ExceptionCode.Sleep:  # wfi/wfe
+            state.history.jumpkind = "Ijk_Yield"
+            state.regs.ip = IcicleEngine._next_ip(emu)
+        elif status == VmExit.Halt:
+            state.history.jumpkind = "Ijk_Exit"
+        elif status == VmExit.Breakpoint and exc == ExceptionCode.SoftwareBreakpoint:
+            state.history.jumpkind = "Ijk_SigTRAP"
         else:
             state.history.jumpkind = "Ijk_Boring"
 
@@ -302,11 +306,12 @@ class IcicleEngine(SuccessorsEngine):
 
         copied_registers = IcicleEngine._sync_registers(emu, state, register_names)
 
-        if IcicleEngine._is_thumb(state.arch, icicle_arch, state.addr):
-            emu.pc = state.addr & ~1
+        pc = state.addr
+        if IcicleEngine._is_thumb(state.arch, icicle_arch, pc):
+            emu.pc = pc & ~1
             emu.isa_mode = 1
         elif "arm" in icicle_arch:  # Hack to work around us calling it r15t
-            emu.pc = state.addr
+            emu.pc = pc
 
         # Sync mapping/permission deltas.
         page_size = state.memory.page_size
@@ -325,7 +330,7 @@ class IcicleEngine(SuccessorsEngine):
                     candidate_pages.add(page_num)
             mapped_pages = set(base.mapped_pages)
             writable_pages = set(base.writable_pages)
-            base_state_pages = base.base_state.memory._pages
+            base_state_pages = state.memory._pages
 
         for page_num in candidate_pages:
             addr = page_num * page_size
@@ -352,7 +357,7 @@ class IcicleEngine(SuccessorsEngine):
                     # below, so this is the only place to seed their content.
                     IcicleEngine._write_page(emu, state, page_num)
             elif old_mapped and new_mapped and base is not None:
-                base_perm_bits = base.base_state.memory.permissions(addr).concrete_value
+                base_perm_bits = state.memory.permissions(addr).concrete_value
                 if base_perm_bits != perm_bits:
                     emu.mem_protect(addr, page_size, perm_bits)
 
@@ -374,7 +379,6 @@ class IcicleEngine(SuccessorsEngine):
         IcicleEngine._sync_edge_hitmap(emu, state)
 
         return IcicleStateTranslationData(
-            base_state=state,
             registers=copied_registers if base is None else base.registers,
             mapped_pages=mapped_pages,
             writable_pages=writable_pages,
@@ -434,11 +438,12 @@ class IcicleEngine(SuccessorsEngine):
         IcicleEngine._sync_registers(emu, state, translation_data.registers)
 
         # Explicitly set PC (the register copy may have written it to a sub-register).
-        if IcicleEngine._is_thumb(state.arch, icicle_arch, state.addr):
-            emu.pc = state.addr & ~1
+        pc = state.addr
+        if IcicleEngine._is_thumb(state.arch, icicle_arch, pc):
+            emu.pc = pc & ~1
             emu.isa_mode = 1
         else:
-            emu.pc = state.addr
+            emu.pc = pc
 
         page_size = state.memory.page_size
         mapped_pages = set(translation_data.mapped_pages)
@@ -458,7 +463,6 @@ class IcicleEngine(SuccessorsEngine):
             IcicleEngine._write_page(emu, state, page_num)
 
         return IcicleStateTranslationData(
-            base_state=state,
             registers=translation_data.registers,
             mapped_pages=mapped_pages,
             writable_pages=writable_pages,
@@ -546,7 +550,7 @@ class IcicleEngine(SuccessorsEngine):
         for addr in added_breakpoints:
             emu.remove_breakpoint(addr)
 
-        result = IcicleEngine._convert_icicle_state_to_angr(emu, translation_data, status)
+        result = IcicleEngine._convert_icicle_state_to_angr(emu, translation_data, status, state)
 
         # Advance the VM's generation so any other plugin copies still pointing
         # at the prior generation falls into the snapshot-restore path on its

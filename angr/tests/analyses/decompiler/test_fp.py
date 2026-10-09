@@ -1065,7 +1065,9 @@ class TestI386PrototypelessCalleePushes:
 
         callee = cfg.functions[callee_addr]
         proj.analyses[Decompiler].prep(fail_fast=True)(callee, cfg=cfg.model)
-        assert callee.calling_convention is None and callee.prototype is not None
+        assert callee.prototype is not None
+        # a callee whose convention could not be recovered keeps its prototype
+        callee.calling_convention = None
 
         caller = cfg.functions[caller_addr]
         dec = proj.analyses[Decompiler].prep(fail_fast=True)(caller, cfg=cfg.model)
@@ -1857,6 +1859,50 @@ class TestX87ReturnPrototype:
         assert f"__longlong_as_double({m.group(1)}) + " in text, text
 
 
+class TestX87PushEcxFrame:
+    """MSVC reserves a double-sized frame with `push ecx; push ecx`. The pushes read ecx, but they are not uses of an
+    argument: cdecl must still match and the value left on the x87 stack is the return value (test_arrays.exe)."""
+
+    @classmethod
+    def setup_class(cls):
+        path = os.path.join(bin_location, "tests", "i386", "test_arrays.exe")
+        if not os.path.exists(path):
+            pytest.skip(f"{path} not found")
+        cls.set_exp = 0x40B8F4
+        cls.frnd = 0x40B136
+        cls.proj, cls.cfg = load_project_with_scoped_cfg(
+            path,
+            cls.set_exp,
+            extra_func_addrs=[cls.frnd],
+            window=0x40,
+            expand_call_tree=False,
+            project_kwargs={"auto_load_libs": False},
+        )
+
+    def _text(self, addr: int) -> str:
+        func = self.cfg.functions[addr]
+        dec = self.proj.analyses[Decompiler].prep(fail_fast=True)(func, cfg=self.cfg.model)
+        assert dec.codegen is not None and dec.codegen.text is not None
+        _assert_no_x87_leaks(dec.codegen.text)
+        return dec.codegen.text
+
+    def test_set_exp(self):
+        # _set_exp(double x, int exp): rewrites the exponent field in a stack copy and reloads it into st(0)
+        func = self.cfg.functions[self.set_exp]
+        assert func.calling_convention is not None
+        text = self._text(self.set_exp)
+        assert re.search(r"double sub_40b8f4\(double a0, [\w ]+ a1\)", text), text
+        assert "0x3fe" in text, text
+        assert "32783" in text, text
+        assert re.search(r"return \w+;", text), text
+
+    def test_frnd(self):
+        # _frnd(double x): fld; frndint; fstp; fld
+        text = self._text(self.frnd)
+        assert "double sub_40b136(double a0)" in text, text
+        assert "rint(a0)" in text, text
+
+
 class TestX87IntReturnClassifier:
     """An integer-returning classifier that reads its double argument via the x87 stack and writes `mov ax, imm16` on
     one path is not a float-returning function (x87_dclass_win32.exe)."""
@@ -2015,6 +2061,9 @@ class TestS390XLongDouble:
         # mxbr / lcxbr ; dxbr, each stored through the hidden return pointer
         assert re.search(r"\*\(\(long double \*\)a0\) = v\d+ \* v\d+;", text), text
         assert re.search(r"\*\(\(long double \*\)a0\) = v\d+ / -\(v\d+\);", text), text
+        # r1 gets 32-bit integer halves (Insert(r1, 4, r0)) and is used as an address; it is not a double
+        assert "double v" not in text.replace("long double v", ""), text
+        assert "__double_as_longlong" not in text, text
 
     def test_sqrtl_finite_hidden_pointer_return(self):
         # ld %f0/%f2 ; sqxbr %f0,%f0 ; std %f0/%f2 into (%r2): f0 holds the high half, not a double return value
