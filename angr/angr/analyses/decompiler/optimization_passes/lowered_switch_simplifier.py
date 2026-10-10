@@ -213,7 +213,8 @@ class LoweredSwitchSimplifier(StructuringOptimizationPass):
 
     def _analyze_simplified_region(self, region, initial=False):
         super()._analyze_simplified_region(region, initial=initial)
-        finder = SwitchClusterFinder(region, variable_map_of(self.manager))
+        assert self._ri is not None
+        finder = SwitchClusterFinder(region, variable_map_of(self._ri.ail_manager))
         self._switches_present_in_code = len(finder.var2switches.values())
 
     def _check(self):
@@ -373,6 +374,10 @@ class LoweredSwitchSimplifier(StructuringOptimizationPass):
                 new_head.statements[-1] = switch_stmt
                 # update the block
                 self._update_block(original_head, new_head)
+                # A shared case can itself become a switch head later in this pass. Keep its recorded owners attached
+                # to the replacement block identity.
+                if original_head in node_to_heads:
+                    node_to_heads[new_head].update(node_to_heads.pop(original_head))
                 modified = True
 
                 # sanity check that no switch head points to either itself
@@ -403,6 +408,13 @@ class LoweredSwitchSimplifier(StructuringOptimizationPass):
                         node = worklist.popleft()
                         if node not in graph_copy:
                             continue
+                        if node is new_head:
+                            # the walk reached the switch head this iteration just built: a redundant
+                            # comparison upstream of it was removed and left it with no in-edges. taking it
+                            # would delete the switch and every case body hanging off it, so give up on the
+                            # rewrite instead and leave the graph to the rest of the preset.
+                            self.out_graph = None
+                            return False
                         successors = list(graph_copy.successors(node))
                         graph_copy.remove_node(node)
                         for succ in successors:
@@ -435,7 +447,25 @@ class LoweredSwitchSimplifier(StructuringOptimizationPass):
                 next_id = 0 if succ_node.idx is None else succ_node.idx + 1
                 graph_copy.remove_node(succ_node)
                 for head in heads:
-                    node_copy = succ_node.deep_copy(self.manager)
+                    if succ_node.statements and isinstance(succ_node.statements[-1], IncompleteSwitchCaseHeadStatement):
+                        # This custom statement has no deep_copy(), but each duplicated switch head still needs its
+                        # own mutable case-address list.
+                        last_stmt = succ_node.statements[-1]
+                        last_stmt_copy = IncompleteSwitchCaseHeadStatement(
+                            last_stmt.idx,
+                            last_stmt.switch_variable.deep_copy(self.manager),
+                            list(last_stmt.case_addrs),
+                            peephole_optimized=last_stmt.peephole_optimized,
+                            **last_stmt.tags,
+                        )
+                        node_copy = succ_node.copy(
+                            statements=[
+                                *(stmt.deep_copy(self.manager) for stmt in succ_node.statements[:-1]),
+                                last_stmt_copy,
+                            ]
+                        )
+                    else:
+                        node_copy = succ_node.deep_copy(self.manager)
                     node_copy.idx = next_id
                     next_id += 1
 
