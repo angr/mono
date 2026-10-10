@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "446645927ef7c93365b5f12fe4fd61f5e3cee75e",
-      "committed_at": "2026-10-09T17:34:46-07:00",
-      "subject": "Clinic: Consider variable liveness ranges when recognizing stack variables from SSA VVars. (#7479)",
+      "commit": "d1e9ec806cae8c49139cd96a738dcc0821a5023d",
+      "committed_at": "2026-10-10T09:02:05Z",
+      "subject": "Update version to 10.0.4.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "40430970460b92bcb64a107d0866f0bd00cee82e",
-      "committed_at": "2026-10-09T09:56:12-07:00",
-      "subject": "Declare last_used_directory and stop clearing it when the dialog is cancelled (#1735)",
+      "commit": "466634a20f8779287da04bfc536ac968a9bc235e",
+      "committed_at": "2026-10-10T09:02:08Z",
+      "subject": "Update version to 10.0.4.dev0 [ci skip]",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -48,9 +48,9 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "cb557c1b1d0b77dd33d0887a128d300ee4fd87ba",
-      "committed_at": "2026-10-09T10:30:36-07:00",
-      "subject": "Correct aarch64 fpcr size to 8 bytes (#391)",
+      "commit": "c251f433c93c7a220102eddf25be60e68fc28d44",
+      "committed_at": "2026-10-10T09:02:10Z",
+      "subject": "Update version to 10.0.4.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -64,9 +64,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "5d5929e29c22587f0338b2d55f7193a7098326eb",
-      "committed_at": "2026-10-09T03:57:49-07:00",
-      "subject": "PE: Report a no-DEP image's sections as executable when it enters a non-executable one (#867)",
+      "commit": "201dd1b3464e42dc409da425ef985306e7d3e0c5",
+      "committed_at": "2026-10-10T09:02:15Z",
+      "subject": "Update version to 10.0.4.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -99,9 +99,9 @@
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "230652b4b1a9371c1dc994d25df7057054cfc08c",
-      "committed_at": "2026-10-08T13:33:44-07:00",
-      "subject": "Fix ffi cache race condition on windows (#593)",
+      "commit": "b28bc9f295ba5e5fc9c1bdafdf2f45e52a72dada",
+      "committed_at": "2026-10-10T09:02:18Z",
+      "subject": "Update version to 10.0.4.dev0 [ci skip]",
       "excluded": [
         ".gitmodules"
       ],
@@ -119,13 +119,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-10T03:47:59+00:00",
+  "imported_at": "2026-10-10T15:59:36+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "4f47ff3f35a35b7d84af61eda461ab5a193a251d",
-      "committed_at": "2026-10-09T23:54:24Z",
-      "subject": "Go corpus: strcat (h += Sprintf on 386, I386_PROGS) and mapmake (make(map) shapes, GO127_PROGS) with go1.27.1.",
+      "commit": "bf588a0bbd795117732096fe315bcbaf187e9f61",
+      "committed_at": "2026-10-10T09:02:13Z",
+      "subject": "Update version to 10.0.4.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
