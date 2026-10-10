@@ -3,7 +3,9 @@ from __future__ import annotations
 import io
 import logging
 import mmap
+import os
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import cast
 from uuid import UUID
 
@@ -29,6 +31,29 @@ class UefiDriverLoadError(Exception):
     """
 
 
+class ModuleFileType(IntEnum):
+    """
+    The FFS file types that encapsulate an executable module image.
+
+    The UEFI Platform Initialization specification, volume 3, requires a file of each of these types to contain
+    exactly one PE32 or TE section, which is the image this backend loads. The file types left out hold data
+    (RAW, FREEFORM), padding, or a nested firmware volume, which the tree walk descends into on its own.
+    """
+
+    SECURITY_CORE = 0x03
+    PEI_CORE = 0x04
+    DXE_CORE = 0x05
+    PEIM = 0x06
+    DRIVER = 0x07
+    COMBINED_PEIM_DRIVER = 0x08
+    APPLICATION = 0x09
+    MM = 0x0A
+    COMBINED_MM_DXE = 0x0C
+    MM_CORE = 0x0D
+    MM_STANDALONE = 0x0E
+    MM_CORE_STANDALONE = 0x0F
+
+
 class UefiFirmware(Backend):
     """
     A UEFI firmware blob loader. Support is provided by the ``uefi_firmware`` package.
@@ -37,16 +62,24 @@ class UefiFirmware(Backend):
     is_default = True
 
     @classmethod
-    def _to_bytes(cls, fileobj: io.IOBase):
+    def _to_bytes(cls, fileobj) -> bytes | mmap.mmap:
+        """
+        Get the whole contents of a stream as a bytes-like object.
+
+        The loader only promises that a stream supports ``read`` and ``seek``, and ``is_compatible`` is offered
+        streams that belong to some other backend entirely, so nothing richer may be assumed here.
+        """
+        # mmap maps the whole file behind a descriptor, so it is the contents of the stream only when the stream
+        # spans that file. An archive member shares its container's descriptor and does not, and there is
+        # nothing to map in an empty file, so check both before taking the shortcut.
         try:
             fileno = fileobj.fileno()
-        except io.UnsupportedOperation:
+            size = os.fstat(fileno).st_size
+            fileobj.seek(0, io.SEEK_END)
+            if size > 0 and fileobj.tell() == size:
+                return mmap.mmap(fileno, 0, access=mmap.ACCESS_READ)
+        except (AttributeError, OSError, ValueError):
             pass
-        else:
-            return mmap.mmap(fileno, 0, access=mmap.ACCESS_READ)
-
-        if isinstance(fileobj, io.BytesIO):
-            return fileobj.getbuffer()
 
         # fuck it, we'll do it live
         fileobj.seek(0)
@@ -93,6 +126,10 @@ class UefiFirmware(Backend):
                 child.parent_object = self
                 self.child_objects.append(child)
 
+        # a module with no base relocations can only be mapped where it was linked, so let those claim their
+        # addresses before the relocatable ones are packed around them
+        self.child_objects.sort(key=lambda child: child.pic)
+
         if self.child_objects:
             self._arch = self.child_objects[0].arch
         else:
@@ -113,7 +150,7 @@ class UefiFirmware(Backend):
         is_firmware_file = isinstance(uefi_obj, uefi_firmware.uefi.FirmwareFile)
         old_uuid = self._current_file
         if is_firmware_file:
-            if uefi_obj.type == 7:  # driver
+            if uefi_obj.type in ModuleFileType:
                 uuid = UUID(bytes=uefi_obj.guid)
                 self._drivers_pending[uuid] = UefiModulePending()
                 self._current_file = uuid
