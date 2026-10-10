@@ -10,11 +10,13 @@
     "`forked` follows upstream, and upstream is not of one mind: ci-settings'",
     "test.py runs every suite one process per test in the container lane,",
     "while angr-management's own ci.yml and coverage.yml run it under",
-    "`-n auto` with no --forked at all. This follows each component's own",
-    "CI, which is why angr-management is the one suite here that is not",
-    "forked -- and forking it is not merely a preference: on macOS a fork",
-    "with CoreFoundation already initialised segfaults, which is what it did",
-    "here before the setting was corrected."
+    "`-n auto` with no --forked at all, and pysoot's runs a bare `pytest`.",
+    "This follows each component's own CI, which is why angr-management and",
+    "pysoot are the two suites here that are not forked -- and for neither is",
+    "it merely a preference. A fork on macOS after CoreFoundation has been",
+    "initialised segfaults, which is what angr-management did here before the",
+    "setting was corrected, and a fork after jpype has started a JVM is fatal",
+    "the same way, which is what pysoot did on macos-14."
   ],
   "jobs": [
     {
