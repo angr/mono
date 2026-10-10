@@ -3,19 +3,23 @@ from __future__ import annotations
 import sys
 
 import angr
+
+# There is no top-level claripy any more: angr/angr#6550 moved the code into
+# angr, which aliases angr.rustylib.claripy as angr.claripy at import time.
+# The alias carries no __version__, so the line below prints none.
+from angr import claripy
 import archinfo
-import claripy
 import cle
 import pypcode
 import pyvex
 import z3
 
 print("angr", angr.__version__)
-print("cle", cle.__version__, "claripy", claripy.__version__, "pyvex", pyvex.__version__)
+print("cle", cle.__version__, "pyvex", pyvex.__version__)
 print("archinfo", archinfo.__version__, "pypcode", pypcode.__version__)
 
 # The z3 version is the one nix/python-overlay.nix pins (passed by the flake).
-# z3.get_version_string() is "4.13.0" for PyPI release "4.13.0.0"; compare the
+# z3.get_version_string() is "5.0.0" for PyPI release "5.0.0.0"; compare the
 # numeric tuple (major, minor, build, revision) instead.
 pinned_z3 = sys.argv[1]
 print("z3", z3.get_version_string(), z3.get_version(), "pinned", pinned_z3)

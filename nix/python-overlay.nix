@@ -78,6 +78,9 @@ let
   # component requirement against it at evaluation time. When upstream bumps a
   # `==` pin or raises a floor above the provided version, evaluation fails
   # with a message naming the package; extend the table rather than relaxing.
+  # Where two components ask for different exact versions, the table provides
+  # one and `stalePins` below records the other, with the measurement that
+  # says the component is fine on the provided one.
   #
   # These packages are resolved only by the component derivations and exposed
   # as `monoPinned.<name>`; they deliberately do NOT replace the canonical
@@ -87,21 +90,26 @@ let
   pinned = {
     "z3-solver" =
       let
-        version = "4.13.0.0";
+        version = "5.0.0.0";
         # PyPI wheels: fastest reliable route (a source build of z3 takes
         # tens of minutes and nixpkgs' z3 recipe carries patches for 4.16).
+        # 5.0.0.0 raised the glibc floor its manylinux wheels declare, by a
+        # different amount per architecture, and the macOS version its Darwin
+        # wheels declare -- so every platform tag below changed, not just the
+        # version. It also publishes `py3` wheels where 4.13.0.0 published
+        # `py2.py3`, which is the `python` argument to fetchPypi.
         wheels = {
           x86_64-linux = {
-            platform = "manylinux2014_x86_64";
-            hash = "sha256-jELegrbj/37mEofQPHr4qZ+fZVTN0SBMa5vKlv8ct/s=";
+            platform = "manylinux_2_27_x86_64";
+            hash = "sha256-VXGUm0er7meTWusF255IrxTtls7aGPb/i3XrOQG7nFQ=";
           };
           aarch64-linux = {
-            platform = "manylinux2014_aarch64";
-            hash = "sha256-nWIgIqNRHAWZFcVrLCMchLXBvhuC9FfXVg3aPZFkdP4=";
+            platform = "manylinux_2_38_aarch64";
+            hash = "sha256-jVpADt0yp0krc//tV1Z3uPCuBEAcaGC32LPHnF/2Cec=";
           };
           aarch64-darwin = {
-            platform = "macosx_11_0_arm64";
-            hash = "sha256-vKfVmmmaRAJHU3whgMUZ1oLJ3zUgoWziiPztYacNJT0=";
+            platform = "macosx_13_0_arm64";
+            hash = "sha256-N9RM88kMTEYp2KB0tDK78Gww7ZN7dseQiN+dZTSrpQo=";
           };
         };
         wheel =
@@ -116,7 +124,11 @@ let
           pname = "z3_solver";
           inherit version;
           format = "wheel";
-          python = "py2.py3";
+          # `python` names the tag in the filename and `dist` the path segment
+          # on files.pythonhosted.org; fetchPypi defaults both to "py2.py3"
+          # independently, so setting only one builds a URL that 404s.
+          python = "py3";
+          dist = "py3";
           abi = "none";
           inherit (wheel) platform hash;
         };
@@ -143,6 +155,28 @@ let
     });
   };
 
+  # Components whose declared `==` pin is behind the table on purpose. An
+  # entry names the pin the component keeps and the provided version it was
+  # measured against, and it only applies while `pinned` still provides that
+  # version -- so the next bump throws again and asks for a fresh measurement
+  # instead of carrying an exemption nobody re-checked.
+  #
+  # claripy is the only entry. angr/angr#6550 moved claripy's code into angr,
+  # which now carries it at angr/angr/claripy and asks for 5.0.0.0;
+  # github.com/angr/claripy is no longer where it is developed and its
+  # pyproject still says `z3-solver==4.13.0.0`. Built against 5.0.0.0,
+  # claripy's own suite runs the same 334 tests to the same single skip
+  # ("Usually hangs" in test_strings.py) that it does on 4.13.0.0, test_fp.py
+  # and test_z3.py included.
+  stalePins = {
+    claripy = {
+      "z3-solver" = {
+        keeps = "4.13.0.0";
+        measuredAgainst = "5.0.0.0";
+      };
+    };
+  };
+
   # Enforce the table against a requirement string from `component`.
   matchVersion = op: spec: builtins.match (".*" + op + "[[:space:]]*([0-9][0-9A-Za-z.!+-]*).*") spec;
   # Every version constraint a component writes against a pinned package has
@@ -154,6 +188,10 @@ let
     let
       name = specName spec;
       provided = pinned.${name}.version;
+      # The one exact pin this component may keep after the table moved past
+      # it, or null once the table moves again. See `stalePins`.
+      stale = stalePins.${component}.${name} or null;
+      allowedStale = if stale != null && stale.measuredAgainst == provided then stale.keeps else null;
       constraints = builtins.filter (c: c != "") (
         lib.splitString "," (lib.removePrefix (specName spec) (lib.toLower spec))
       );
@@ -167,8 +205,16 @@ let
         in
         if !modelled then
           throw "${component} constrains ${name} with `${constraint}`, which nix/python-overlay.nix does not model; extend checkPinned"
-        else if exact != null && builtins.head exact != provided then
-          throw "${component} requires ${name}==${builtins.head exact} but nix/python-overlay.nix provides ${provided}; update the `pinned` table"
+        else if exact != null && builtins.head exact != provided && builtins.head exact != allowedStale then
+          throw (
+            "${component} requires ${name}==${builtins.head exact} but nix/python-overlay.nix provides ${provided}; "
+            + (
+              if stale == null then
+                "update the `pinned` table"
+              else
+                "its `stalePins` entry was measured against ${stale.measuredAgainst}, so re-measure and update that entry"
+            )
+          )
         else if floor != null && !(lib.versionAtLeast provided (builtins.head floor)) then
           throw "${component} requires ${name}>=${builtins.head floor} but nix/python-overlay.nix provides ${provided}; update the `pinned` table"
         else
