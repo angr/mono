@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 import archinfo
+import capstone
 import networkx
 import pyvex
 from archinfo.arch_arm import get_real_address_if_arm, is_arm_arch
@@ -27,7 +28,7 @@ from cle import (
     TLSObject,
 )
 from cle.backends import NamedRegion
-from sortedcontainers import SortedDict
+from sortedcontainers import SortedDict, SortedSet
 
 from angr.analyses.analysis import Analysis
 from angr.analyses.stack_pointer_tracker import StackPointerTracker
@@ -179,7 +180,9 @@ class CFGBase(Analysis):
         # IndirectJump object that describe all indirect exits found in the binary
         # stores as a map between addresses and IndirectJump objects
         self.indirect_jumps: dict[int, IndirectJump] = {}
-        self._indirect_jumps_to_resolve = set()
+        # a sorted set, not a set: resolving one indirect jump builds blocks and occupies bytes that the next
+        # resolver reads, so the order they come out of here decides the CFG. IndirectJump orders by address.
+        self._indirect_jumps_to_resolve: SortedSet = SortedSet()
         # indirect jumps whose resolution was postponed because the data references that bound an unbounded jump
         # table were not collected yet. only used when _defer_unbounded_jumptables is enabled (CFGFast).
         self._deferred_indirect_jumps: set[IndirectJump] = set()
@@ -809,9 +812,11 @@ class CFGBase(Analysis):
                         max_mapped_addr = segment.min_addr + min(segment.memsize, segment.filesize)
                         tpl = (segment.min_addr, max_mapped_addr)
                         segments.append(tpl)
-                if (not b.sections and segments) or force_segment:
-                    # Use segments directly when force_segment is True or when the ELF has no section headers
-                    # at all.
+                # Regions.max_addr is None exactly when no region in the container is mapped into memory.
+                sections_mapped = b.sections.max_addr is not None
+                if (not sections_mapped and segments) or force_segment:
+                    # Use segments directly when force_segment is True or when the ELF's sections map nothing,
+                    # which includes an ELF with no section headers at all.
                     memory_regions += segments
                 elif sections and segments:
                     # are there executable segments with no sections inside?
@@ -1927,6 +1932,8 @@ class CFGBase(Analysis):
                     and block.size > 0
                     and len(block.instruction_addrs) == 2
                     and block.vex.jumpkind == "Ijk_Boring"
+                    # push ordinal; jmp _resolve
+                    and self._pushes_a_relocation_ordinal(block)
                 )
             except SimError:
                 # catch any exceptions that may raise during VEX block lifting
@@ -1999,6 +2006,7 @@ class CFGBase(Analysis):
         """
 
         functions_to_remove = {}
+        inferred_targets_by_jump = defaultdict(set)
 
         all_func_addrs = sorted(set(functions.keys()))
         ij_by_funcaddr = defaultdict(list)  # unresolved indirect jumps indexed by function address
@@ -2116,6 +2124,15 @@ class CFGBase(Analysis):
 
             for f_addr in functions_to_merge:
                 functions_to_remove[f_addr] = func_addr
+                inferred_targets_by_jump[max_unresolved_jump_addr].add(f_addr)
+
+        # The functions above are merged because their entries are inferred to be targets of an otherwise unresolved
+        # indirect jump. Record that inference in the CFG as well: changing block ownership without adding the
+        # corresponding transitions leaves every merged block unreachable in the rebuilt function graph.
+        for jump_addr, target_addrs in inferred_targets_by_jump.items():
+            if not self._record_irrational_function_targets(jump_addr, target_addrs):
+                for target_addr in target_addrs:
+                    del functions_to_remove[target_addr]
 
         # merge all functions
         for to_remove, merge_with in functions_to_remove.items():
@@ -2135,6 +2152,37 @@ class CFGBase(Analysis):
         unresolved indirect jumps are merged into it.
         """
         return end
+
+    def _record_irrational_function_targets(self, jump_addr: int, target_addrs: set[int]) -> bool:
+        jump = self.indirect_jumps[jump_addr]
+        src_node = self.model.get_any_node(jump_addr, force_fastpath=True)
+        if src_node is None:
+            return False
+
+        target_nodes = {
+            target_addr: self.model.get_any_node(target_addr, force_fastpath=True) for target_addr in target_addrs
+        }
+        if any(target_node is None for target_node in target_nodes.values()):
+            return False
+
+        for target_node in target_nodes.values():
+            assert target_node is not None
+            self.graph.add_edge(
+                src_node,
+                target_node,
+                jumpkind=jump.jumpkind,
+                ins_addr=jump.ins_addr,
+                stmt_idx=jump.stmt_idx,
+            )
+
+        unresolvable_target = self.model.get_any_node(self._unresolvable_jump_target_addr, force_fastpath=True)
+        if unresolvable_target is not None and self.graph.has_edge(src_node, unresolvable_target):
+            self.graph.remove_edge(src_node, unresolvable_target)
+
+        jump.resolved_targets.update(target_addrs)
+        self.kb.indirect_jumps.update_resolved_addrs(jump_addr, target_addrs)
+        self.kb.unresolved_indirect_jumps.discard(jump_addr)
+        return True
 
     def _process_irrational_function_starts(
         self, functions, predetermined_function_addrs, blockaddr_to_funcaddr: dict[AddressType, MethodType]
@@ -2860,6 +2908,28 @@ class CFGBase(Analysis):
                 for stmt in vex.statements
             )
         return False
+
+    @staticmethod
+    def _pushes_a_relocation_ordinal(block) -> bool:
+        """
+        Check if the block is the `push <ordinal>; jmp _resolve` body of a lazy-binding PLT stub.
+
+        The two-instruction test in _remove_dummy_plt_stubs is written for that shape, but on its own it
+        only counts instructions, so any two-instruction tail call matches it. A thunk that transforms an
+        argument before jumping to an imported function has the same shape and is a real function with
+        real callers.
+
+        Only the push is checked here. That the block then leaves is the caller's
+        `block.vex.jumpkind == "Ijk_Boring"` condition.
+
+        :param block:   The block instance.
+        :return: True if the block is two instructions and the first pushes an immediate.
+        """
+        insns = block.capstone.insns
+        if len(insns) != 2 or insns[0].mnemonic != "push":
+            return False
+        operands = insns[0].operands
+        return len(operands) == 1 and operands[0].type == capstone.x86.X86_OP_IMM
 
     @staticmethod
     def _is_noop_block(arch: archinfo.Arch, block) -> bool:

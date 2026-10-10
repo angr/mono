@@ -752,10 +752,10 @@ class Clinic(Analysis, Serializable):
 
         # We should be able to resolve all indirect register loads by this point
 
-        self._remove_redundant_jump_blocks(ail_graph)
+        self._remove_redundant_jump_blocks(ail_graph, self.entry_node_addr)
         # _fix_abnormal_switch_case_heads may re-lift from VEX blocks, so it should be placed as high up as possible
         self._fix_abnormal_switch_case_heads(ail_graph)
-        self._remove_redundant_jump_blocks(ail_graph)
+        self._remove_redundant_jump_blocks(ail_graph, self.entry_node_addr)
         if self._insert_labels:
             self._insert_block_labels(ail_graph)
 
@@ -1456,7 +1456,7 @@ class Clinic(Analysis, Serializable):
 
         ail_graph = self._make_ailgraph()
         self._blocks_by_addr_and_size = None
-        self._remove_redundant_jump_blocks(ail_graph)
+        self._remove_redundant_jump_blocks(ail_graph, self.entry_node_addr)
 
         # full-function constant-only propagation
         self._update_progress(33.0, text="Constant propagation")
@@ -2201,6 +2201,7 @@ class Clinic(Analysis, Serializable):
         """
         Rewrite tail jumps to functions as call statements.
         """
+        function_block_addrs = {block.addr for block in ail_graph}
         for block in list(ail_graph.nodes()):
             if ail_graph.out_degree[block] > 1:
                 continue
@@ -2221,7 +2222,11 @@ class Clinic(Analysis, Serializable):
                 continue
 
             for slot_name, target in slots:
-                if not isinstance(target, ailment.Const) or not self.kb.functions.contains_addr(target.value):
+                if (
+                    not isinstance(target, ailment.Const)
+                    or target.value in function_block_addrs
+                    or not self.kb.functions.contains_addr(target.value)
+                ):
                     continue
                 if target.value == self.function.addr:
                     # a jump back to the current function is a loop back edge, not a call to other functions
@@ -4060,8 +4065,10 @@ class Clinic(Analysis, Serializable):
                         # Create a new global variable if there isn't one already
                         global_vars = global_variables.get_global_variables(symbol.rebased_addr)
                         if not global_vars:
-                            global_var = SimMemoryVariable(symbol.rebased_addr, symbol.size, name=symbol.name)
-                            global_var.renamed = True
+                            global_var = SimMemoryVariable(
+                                symbol.rebased_addr, symbol.size, name=symbol.name or f"g_{symbol.rebased_addr:x}"
+                            )
+                            global_var.renamed = bool(symbol.name)
                             global_variables.add_variable("global", global_var.addr, global_var)
                             global_vars = {global_var}
                 if global_vars:
@@ -5035,7 +5042,7 @@ class Clinic(Analysis, Serializable):
             )
 
     @staticmethod
-    def _remove_redundant_jump_blocks(ail_graph):
+    def _remove_redundant_jump_blocks(ail_graph, entry_node_addr: ailment.Address):
         def first_conditional_jump(block: ailment.Block) -> ailment.Stmt.ConditionalJump | None:
             for stmt in block.statements:
                 if isinstance(stmt, ailment.Stmt.ConditionalJump):
@@ -5045,7 +5052,9 @@ class Clinic(Analysis, Serializable):
         # note that blocks don't have labels inserted at this point
         for node in list(ail_graph.nodes):
             if (
-                len(node.statements) == 1
+                # the entry block stays even when it only jumps: later stages look it up by entry_node_addr
+                (node.addr, node.idx) != entry_node_addr
+                and len(node.statements) == 1
                 and isinstance(node.statements[0], ailment.Stmt.Jump)
                 and isinstance(node.statements[0].target, ailment.Expr.Const)
             ):

@@ -26,6 +26,8 @@ from angr.rustylib.ailment import (  # pylint:disable=import-error,no-name-in-mo
 # pylint: disable=missing-class-docstring
 # pylint: disable=line-too-long
 
+BIN_LOCATION = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "binaries", "tests"))
+
 
 def _vex_arch(arch: archinfo.Arch) -> PyvexArch:
     """archinfo's Arch does not nominally satisfy pyvex's Arch protocol (RegisterOffset/Endness vs int/str)."""
@@ -37,6 +39,12 @@ class TestIrsb(unittest.TestCase):
         "554889E54883EC40897DCC488975C048C745F89508400048C745F0B6064000488B45C04883C008488B00BEA70840004889C7E883FEFFFF"
     )
     block_addr = 0x4006C6
+    # A Linux kernel text address: an ordinary address for a 64-bit target that
+    # does not fit in a signed 64-bit integer.
+    high_block_addr = 0xFFFFFFFF81000330
+    # Where kernel text starts on x86-64 Linux. Mapping an ordinary
+    # position-independent executable there puts its code at those addresses.
+    high_load_addr = 0xFFFFFFFF81000000
 
     def test_convert_from_vex_irsb(self):
         arch = archinfo.arch_from_id("AMD64")
@@ -44,6 +52,20 @@ class TestIrsb(unittest.TestCase):
         irsb = pyvex.IRSB(self.block_bytes, self.block_addr, _vex_arch(arch), opt_level=0)
         ablock = ailment.IRSBConverter.convert(irsb, manager)
         assert ablock  # TODO: test if this conversion is valid
+
+    def test_convert_from_vex_irsb_at_high_address(self):
+        arch = archinfo.arch_from_id("AMD64")
+        irsb = pyvex.IRSB(self.block_bytes, self.high_block_addr, _vex_arch(arch), opt_level=0)
+        from_py = VEXIRSBConverter.convert(irsb, ailment.Manager())
+        from_lift = VEXIRSBConverter.convert_from_lift(
+            arch, self.high_block_addr, self.block_bytes, ailment.Manager(), opt_level=0
+        )
+        assert from_py == from_lift
+        for block in (from_py, from_lift):
+            assert block.addr == self.high_block_addr
+            assert block.statements
+            for stmt in block.statements:
+                assert self.high_block_addr <= stmt.tags["ins_addr"] < self.high_block_addr + irsb.size
 
     def test_convert_from_pcode_irsb(self):
         arch = archinfo.arch_from_id("AMD64")
@@ -54,6 +76,55 @@ class TestIrsb(unittest.TestCase):
         irsb = p.factory.block(self.block_addr).vex
         ablock = ailment.IRSBConverter.convert(irsb, manager)
         assert ablock  # TODO: test if this conversion is valid
+
+    def test_convert_from_pcode_irsb_at_high_address(self):
+        # The P-code converter assigns Manager.ins_addr from Python, which the
+        # VEX converter never does.
+        manager = ailment.Manager()
+        p = angr.Project(
+            os.path.join(BIN_LOCATION, "x86_64", "decompiler", "loop"),
+            auto_load_libs=False,
+            main_opts={"base_addr": self.high_load_addr},
+            engine=angr.engines.UberEnginePcode,
+        )
+        symbol = p.loader.find_symbol("loop")
+        assert symbol is not None
+        block_addr = symbol.rebased_addr
+        assert block_addr > 0x7FFFFFFFFFFFFFFF
+        irsb = p.factory.block(block_addr).vex
+        ablock = ailment.IRSBConverter.convert(irsb, manager)
+        assert ablock.addr == block_addr
+        assert manager.block_addr == block_addr
+        ins_addr = manager.ins_addr
+        assert ins_addr is not None
+        assert block_addr <= ins_addr < block_addr + irsb.size
+
+    def test_pcode_cbranch_gets_a_fallthrough_when_no_branch_follows(self):
+        # A p-code CBRANCH takes its fall-through from the BRANCH op that follows it. The PA-RISC
+        # SLEIGH spec emits its nullification bookkeeping after the CBRANCH instead, so nothing
+        # follows to supply one and the conditional jump used to reach structuring with no false
+        # target at all.
+        base = os.path.join(os.path.dirname(__file__), "..", "..", "..", "binaries", "tests")
+        path = os.path.normpath(os.path.join(base, "hppa", "ruby-bindex-cruby.so"))
+        if not os.path.exists(path):
+            self.skipTest(f"missing binary {path}")
+        proj = angr.Project(
+            path,
+            auto_load_libs=False,
+            main_opts={"backend": "elf", "arch": archinfo.ArchPcode("pa-risc:BE:32:default")},
+        )
+        cfg = proj.analyses.CFGFast(normalize=True)
+        manager = ailment.Manager()
+        checked = 0
+        for function in cfg.functions.values():
+            for block_addr in function.block_addrs_set:
+                block = ailment.IRSBConverter.convert(proj.factory.block(block_addr).vex, manager)
+                for stmt in block.statements:
+                    if isinstance(stmt, ailment.Stmt.ConditionalJump):
+                        assert stmt.true_target is not None, f"no true target at {block_addr:#x}"
+                        assert stmt.false_target is not None, f"no false target at {block_addr:#x}"
+                        checked += 1
+        assert checked > 0, "no conditional jumps converted, so the assertions above proved nothing"
 
     def test_convert_pcode_uppercase_memory_space(self):
         arch = archinfo.ArchPcode("6502:LE:16:default")
@@ -367,6 +438,46 @@ class TestVexOpParity(unittest.TestCase):
                     mismatches.append((name, f"{key}: rust={rust[key]!r} py={expected!r}"))
 
         assert not mismatches, "vexop parity mismatches:\n" + "\n".join(f"  {n}: {m}" for n, m in mismatches[:50])
+
+
+class TestPcodeUnmodeledOpOutput(unittest.TestCase):
+    """A p-code op the converter cannot model still writes its output varnode, so the
+    converter has to define that output. SuperH ``fsca`` computes its sine/cosine pair
+    with two CALLOTHER ops; dropping their writes left the uniques they define with no
+    definition at all, and the FLOAT2FLOAT that reads them back asserted."""
+
+    # test-instr_sh4 has six `fsca` blocks; this one is a single instruction.
+    fsca_addr = 0x45125C
+
+    def test_callother_output_is_defined(self):
+        path = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "binaries", "tests", "sh4", "test-instr_sh4")
+        )
+        proj = angr.Project(path, auto_load_libs=False, engine=angr.engines.UberEnginePcode)
+        block = proj.factory.block(self.fsca_addr)
+        ablock = ailment.IRSBConverter.convert(block.vex, ailment.Manager())
+
+        dirty: list[tuple[ailment.Expr.Tmp, ailment.Expr.DirtyExpression]] = []
+        read: set[int] = set()
+        for stmt in ablock.statements:
+            if not isinstance(stmt, ailment.Stmt.Assignment):
+                continue
+            src = stmt.src
+            dst = stmt.dst
+            if isinstance(src, ailment.Expr.DirtyExpression):
+                assert isinstance(dst, ailment.Expr.Tmp)
+                dirty.append((dst, src))
+            elif isinstance(dst, ailment.Expr.Register) and isinstance(src, ailment.Expr.Convert):
+                operand = src.operand
+                if isinstance(operand, ailment.Expr.Tmp):
+                    read.add(operand.tmp_idx)
+
+        assert len(dirty) == 2
+        for dst, src in dirty:
+            assert src.callee == "CALLOTHER"
+            assert dst.bits == 32
+        # both halves of the pair are read back out of the temporaries just defined
+        assert {dst.tmp_idx for dst, _ in dirty} == read
 
 
 if __name__ == "__main__":
