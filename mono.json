@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "cbf401653b4555b5f33c0ceb291f69b4efae27e8",
-      "committed_at": "2026-10-08T18:24:26-07:00",
-      "subject": "Phoenix: Do not drop phi statements when creating multi-stmt exprs. (#7435)",
+      "commit": "446645927ef7c93365b5f12fe4fd61f5e3cee75e",
+      "committed_at": "2026-10-09T17:34:46-07:00",
+      "subject": "Clinic: Consider variable liveness ranges when recognizing stack variables from SSA VVars. (#7479)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "9dfc92d4e9660ad395ceda476d133c7d92ad7cb0",
-      "committed_at": "2026-10-07T19:14:35Z",
-      "subject": "Update version to 10.0.3.dev0 [ci skip]",
+      "commit": "40430970460b92bcb64a107d0866f0bd00cee82e",
+      "committed_at": "2026-10-09T09:56:12-07:00",
+      "subject": "Declare last_used_directory and stop clearing it when the dialog is cancelled (#1735)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -48,9 +48,9 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "af4fdcf9661f8721f962223fa3539286e627bf07",
-      "committed_at": "2026-10-07T19:14:36Z",
-      "subject": "Update version to 10.0.3.dev0 [ci skip]",
+      "commit": "cb557c1b1d0b77dd33d0887a128d300ee4fd87ba",
+      "committed_at": "2026-10-09T10:30:36-07:00",
+      "subject": "Correct aarch64 fpcr size to 8 bytes (#391)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -64,9 +64,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "c192fb6913ff1d1fa2a9b0bfdd208118b70a46ec",
-      "committed_at": "2026-10-08T15:31:49-07:00",
-      "subject": "elf: Fix `DT_VERNEED` misparsing (#866)",
+      "commit": "5d5929e29c22587f0338b2d55f7193a7098326eb",
+      "committed_at": "2026-10-09T03:57:49-07:00",
+      "subject": "PE: Report a no-DEP image's sections as executable when it enters a non-executable one (#867)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -119,13 +119,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-09T03:47:56+00:00",
+  "imported_at": "2026-10-10T03:47:59+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "95d664bfaf32792009ffdd7f07b194d7fd3cf0ba",
-      "committed_at": "2026-10-07T19:14:38Z",
-      "subject": "Update version to 10.0.3.dev0 [ci skip]",
+      "commit": "4f47ff3f35a35b7d84af61eda461ab5a193a251d",
+      "committed_at": "2026-10-09T23:54:24Z",
+      "subject": "Go corpus: strcat (h += Sprintf on 386, I386_PROGS) and mapmake (make(map) shapes, GO127_PROGS) with go1.27.1.",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
