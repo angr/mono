@@ -7,9 +7,12 @@ import sys
 import tempfile
 import unittest
 
+import archinfo
 import pefile
 
 import cle
+from cle.backends.pe.pe import arch_from_machine_type
+from cle.backends.pe.symbol import WinSymbol
 from cle.backends.pe.symbolserver import PDBInfo
 from cle.structs import MemRegionSort
 
@@ -206,6 +209,15 @@ class TestPEBackend(unittest.TestCase):
         ld = cle.Loader(exe, auto_load_libs=False)
         assert ld.find_symbol("main")
 
+    def test_invalid_export_forwarder_encoding(self):
+        exe = os.path.join(TEST_BASE, "tests", "x86_64", "windows", "invalid_export_forwarder.dll")
+        ld = cle.Loader(exe, auto_load_libs=False)
+
+        symbol = ld.main_object.get_symbol("forwarded_export")
+        assert isinstance(symbol, WinSymbol)
+        assert symbol.forwarder == "u\x9fer32.MessageBoxA"
+        assert "u\x9fer32.dll" in ld.main_object.deps
+
     @requires_pyxdia
     def test_debug_symbol_paths_flat_layout(self):
         """Test loading PDB from debug_symbol_paths with flat layout."""
@@ -392,6 +404,24 @@ class TestPEBackend(unittest.TestCase):
         assert [section.name for section in obj.sections] == [".rdata", ".rsrc"]
         assert not any(section.is_executable for section in obj.sections)
 
+    def test_image_without_dep_that_enters_a_section_gains_no_header_region(self):
+        # cle reports the mapped image headers as a region for an image that enters inside them,
+        # which is the shape a packer with its loader stub in the header slack has. Three facts
+        # decline this one, in the order the code reads them and any one of them enough: it is a
+        # 64-bit image, where Windows enforces no-execute whatever the DEP bit says; its entry
+        # lands in .text; and its AddressOfEntryPoint 0x1000 is above the 0x200 of headers the
+        # loader maps.
+        exe = os.path.join(TEST_BASE, "tests", "x86_64", "test_rol.exe")
+        ld = cle.Loader(exe, auto_load_libs=False)
+        obj = ld.main_object
+        assert isinstance(obj, cle.PE)
+
+        assert not obj.supports_nx
+        entry_section = obj.find_section_containing(obj.entry)
+        assert entry_section is not None
+        assert entry_section.name == ".text"
+        assert [sec.name for sec in obj.sections] == [".text"]
+
 
 # pylint: disable=no-self-use
 class TestPESectionMappedSize(unittest.TestCase):
@@ -435,6 +465,35 @@ class TestPESectionMappedSize(unittest.TestCase):
         assert reloc.memsize == 0x202E
         assert reloc.filesize == 0xE25000
         assert obj.max_addr - obj.mapped_base < 0x4F02E
+
+
+class TestPEMachineTypes(unittest.TestCase):
+    """
+    Test the architecture a PE file header's machine type resolves to.
+    """
+
+    # IMAGE_FILE_MACHINE_POWERPC and IMAGE_FILE_MACHINE_POWERPCFP
+    powerpc_machine_types = (0x1F0, 0x1F1)
+
+    def test_powerpc_is_32_bit_little_endian(self):
+        for machine_type in self.powerpc_machine_types:
+            arch = arch_from_machine_type(pefile.MACHINE_TYPE[machine_type])
+
+            assert arch.name == "PPC32"
+            assert arch.bits == 32
+            assert arch.memory_endness == archinfo.Endness.LE
+
+    # IMAGE_FILE_MACHINE_WCEMIPSV2, IMAGE_FILE_MACHINE_MIPS16, IMAGE_FILE_MACHINE_MIPSFPU and
+    # IMAGE_FILE_MACHINE_MIPSFPU16
+    mips_machine_types = (0x169, 0x266, 0x366, 0x466)
+
+    def test_mips_is_32_bit_little_endian(self):
+        for machine_type in self.mips_machine_types:
+            arch = arch_from_machine_type(pefile.MACHINE_TYPE[machine_type])
+
+            assert arch.name == "MIPS32"
+            assert arch.bits == 32
+            assert arch.memory_endness == archinfo.Endness.LE
 
 
 if __name__ == "__main__":

@@ -874,7 +874,12 @@ class SimCC:
             return None
         ty_size = ty.size if ty.size is not None else self.RETURN_VAL.size * self.arch.byte_width
         if ty_size > self.RETURN_VAL.size * self.arch.byte_width:
-            assert self.OVERFLOW_RETURN_VAL is not None
+            if self.OVERFLOW_RETURN_VAL is None:
+                raise AngrTypeError(
+                    f"{self} returns {ty} in {self.RETURN_VAL}, which holds "
+                    f"{self.RETURN_VAL.size * self.arch.byte_width} of its {ty_size} bits, and declares no "
+                    "OVERFLOW_RETURN_VAL. Consider overriding return_val to implement its ABI logic"
+                )
             return SimComboArg([self.RETURN_VAL, self.OVERFLOW_RETURN_VAL])
         return self.RETURN_VAL.refine(size=ty_size // self.arch.byte_width, arch=self.arch, is_fp=False)
 
@@ -890,6 +895,9 @@ class SimCC:
             arg_type = arg_type.type
         if isinstance(arg_type, (SimTypeArray, SimTypeFixedSizeArray)):  # hack
             arg_type = SimTypePointer(arg_type.elem_type).with_arch(self.arch)
+        if opaque_cpp_class(arg_type):
+            assert arg_type.size is not None
+            arg_type = SimTypeNum(arg_type.size, signed=False)
         if isinstance(arg_type, (SimStruct, SimUnion, SimTypeFixedSizeArray)):
             raise TypeError(
                 f"{self} doesn't know how to store aggregate type {type(arg_type)}. Consider overriding next_arg to "
@@ -1691,7 +1699,7 @@ class SimCCMicrosoftAMD64(SimCC):
     def return_in_implicit_outparam(self, ty):
         if isinstance(ty, TypeRef):
             ty = ty.type
-        if isinstance(ty, (SimTypeBottom, SimTypeRef, SimTypeFloat)):
+        if ty is None or isinstance(ty, (SimTypeBottom, SimTypeRef, SimTypeFloat)):
             return False
         size = ty.size
         return size is not None and size > self.STRUCT_RETURN_THRESHOLD
@@ -1713,12 +1721,23 @@ class SimCCMicrosoftAMD64(SimCC):
                 chosen = SimTypePointer(SimTypeBottom()).with_arch(self.arch)
             return self.return_val(chosen, perspective_returned=perspective_returned)
 
-        if not isinstance(ty, SimStruct):
+        # An array is an aggregate too, and it goes where a struct of its size goes: into RAX below
+        # the threshold, through the hidden out-parameter above it. return_in_implicit_outparam
+        # answers on ty.size alone, so it already agrees with this for an array.
+        #
+        # An array whose size is not a positive number of bits has no layout to give, and the base
+        # class's refusal is the right answer for it. Testing the size covers all three ways of
+        # getting there at once, because SimTypeArray.size is 0 for a length-less array and
+        # propagates through nesting: no length, no element size, or an unsized array inside one.
+        sized_array = isinstance(ty, SimTypeArray) and bool(ty.size)
+        if not isinstance(ty, SimStruct) and not sized_array:
             return super().return_val(ty, perspective_returned)
 
-        if ty.size > self.STRUCT_RETURN_THRESHOLD:
+        size = ty.size
+        assert size is not None
+        if size > self.STRUCT_RETURN_THRESHOLD:
             # TODO this code is duplicated a ton of places. how should it be a function?
-            byte_size = ty.size // self.arch.byte_width
+            byte_size = size // self.arch.byte_width
             referenced_locs = [SimStackArg(offset, self.arch.bytes) for offset in range(0, byte_size, self.arch.bytes)]
             referenced_loc = refine_locs_with_struct_type(self.arch, referenced_locs, ty)
             if perspective_returned:
