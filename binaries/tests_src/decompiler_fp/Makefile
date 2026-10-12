@@ -46,7 +46,7 @@ ASM_BINS := \
 	x87_narrow_store_i386.o \
 	x87_sibling_store_i386.o
 
-all: $(BINS) $(ASM_BINS) $(OBJ_BINS) x87_math_amd64 x87_ld_local_i386_O0.o libm_names_amd64
+all: $(BINS) $(ASM_BINS) $(OBJ_BINS) x87_math_amd64 x87_ld_local_i386_O0.o x87_narrow_cond_i386_O1.o libm_names_amd64
 
 x87_math_amd64: x87_math.c
 	$(CC) $(X87_MATH_FLAGS) -o $@ $< -lm
@@ -58,6 +58,10 @@ libm_names_amd64: libm_names.c
 # x87 long double stack local (fstpt/fldt) narrowed to float
 x87_ld_local_i386_O0.o: x87_ld_local.c
 	$(CC) -O0 -m32 -mfpmath=387 -fno-pic -c -o $@ $<
+
+# float arithmetic narrowed inside double expressions: a branch condition, a constant added, an int divisor
+x87_narrow_cond_i386_O1.o: x87_narrow_cond.c
+	$(CC) -O1 -m32 -mfpmath=387 -fno-pic -c -o $@ $<
 
 fp_basic_i386_O0: $(SRC)
 	$(CC) -O0 $(I386_FLAGS) -o $@ $<
@@ -238,3 +242,12 @@ all: sret_ptr_amd64.o
 
 sret_ptr_amd64.o: sret_ptr_amd64.s
 	nasm -f elf64 -o $@ $<
+
+# a double above FLT_MAX narrowed to float, linked at address 0 as a raw AArch64 image (load it as a blob)
+OBJ_BINS += fp_narrow_overflow_aarch64.bin
+all: fp_narrow_overflow_aarch64.bin
+
+fp_narrow_overflow_aarch64.bin: fp_narrow_overflow.c
+	clang --target=aarch64-none-elf -O1 -ffreestanding -fno-pic -c -o fp_narrow_overflow_aarch64.o $<
+	ld.lld --image-base=0 -Ttext=0 --oformat=binary -e narrow_big -o $@ fp_narrow_overflow_aarch64.o
+	rm -f fp_narrow_overflow_aarch64.o

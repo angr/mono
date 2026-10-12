@@ -1734,6 +1734,37 @@ class TestX87ExceptionProbe:
             assert text.count("1.0 / 0.0") == 1, text
 
 
+class TestX87NarrowedFloatArithmetic:
+    """Float arithmetic narrowed inside double expressions keeps its width and stays float arithmetic: a float sum
+    inside a double product in a branch condition, a float sum plus a double constant, and a float difference divided
+    by an int converted to double (x87_narrow_cond_i386_O1.o)."""
+
+    @classmethod
+    def setup_class(cls):
+        path = os.path.join(_fp_dir, "x87_narrow_cond_i386_O1.o")
+        if not os.path.exists(path):
+            pytest.skip(f"{path} not found")
+        cls.proj = angr.Project(path, auto_load_libs=False)
+        cls.cfg = cls.proj.analyses[CFGFast].prep()(normalize=True)
+
+    def _text(self, name: str) -> str:
+        dec = self.proj.analyses[Decompiler].prep(fail_fast=True)(self.cfg.functions[name], cfg=self.cfg.model)
+        assert dec.codegen is not None and dec.codegen.text is not None
+        return dec.codegen.text
+
+    def test_condition_recovered(self):
+        text = self._text("x87_narrow_cond")
+        assert "if ((*a0 + a0[1] + a0[2]) * a1 > a2)" in text, text
+
+    def test_sum_plus_double_constant(self):
+        text = self._text("x87_narrow_add_const")
+        assert "return a1 * *a0 + a0[1] + 1.0;" in text, text
+
+    def test_difference_over_int_divisor(self):
+        text = self._text("x87_narrow_div_int")
+        assert "(float)((a0[1] - *a0) / (double)a1)" in text, text
+
+
 class TestX87StackArgs:
     """Functions that take their arguments on the x87 stack and pop them (MSVC _CI* and _ftol helpers) list them in
     their prototypes, and their callers pass them and keep the st(0) results (x87_stack_args_i386.o)."""
@@ -2354,3 +2385,16 @@ class TestReturnedPointerArgument:
         assert dec.codegen is not None and dec.codegen.text is not None
         text = dec.codegen.text
         assert text.startswith("void bump_void(") and "return;" in text, text
+
+
+def test_double_above_flt_max_narrowed_to_float():
+    # a raw AArch64 image: the load of the global double 1e300 folds to a constant, and fcvt s0, d0 narrows it to a
+    # value float cannot hold, so the conversion stays unfolded
+    path = os.path.join(_fp_dir, "fp_narrow_overflow_aarch64.bin")
+    proj = angr.Project(
+        path, auto_load_libs=False, main_opts={"backend": "blob", "arch": "AARCH64", "base_addr": 0, "entry_point": 0}
+    )
+    cfg = proj.analyses[CFGFast].prep()(normalize=True)
+    dec = proj.analyses[Decompiler].prep(fail_fast=True)(cfg.functions[0], cfg=cfg.model)
+    assert dec.codegen is not None and dec.codegen.text is not None
+    assert "return (float)1e+300;" in dec.codegen.text, dec.codegen.text
