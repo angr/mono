@@ -99,9 +99,9 @@
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "b28bc9f295ba5e5fc9c1bdafdf2f45e52a72dada",
-      "committed_at": "2026-10-10T09:02:18Z",
-      "subject": "Update version to 10.0.4.dev0 [ci skip]",
+      "commit": "da4ce952c04f74ca3727cbcdf2d66bd3b13a839d",
+      "committed_at": "2026-10-12T05:06:02Z",
+      "subject": "Pin to bitstring<5.",
       "excluded": [
         ".gitmodules"
       ],
@@ -119,7 +119,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-10T15:59:36+00:00",
+  "imported_at": "2026-10-12T18:11:57+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
