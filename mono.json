@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "b7e295af6fb73e6b279a74987ae0aca1c201be46",
-      "committed_at": "2026-10-13T01:58:32-07:00",
-      "subject": "CodeGen: Add flavor-independent marker bases for node classes. (#7537)",
+      "commit": "e6eac8c9224374cefbfc4d4b8ced7170dd7ed151",
+      "committed_at": "2026-10-13T13:38:20-07:00",
+      "subject": "Phoenix: Use the switch's out-successor as its end boundary. (#7541)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -119,7 +119,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-13T18:11:53+00:00",
+  "imported_at": "2026-10-13T20:54:14+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
