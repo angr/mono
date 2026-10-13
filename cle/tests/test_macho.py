@@ -13,6 +13,7 @@ from cle import MachO
 from cle.backends.backend import FunctionHintSource
 from cle.backends.macho.macho_enums import LoadCommands, MachoFiletype, SectionAttributes, SectionType
 from cle.backends.macho.section import MachOSection
+from cle.backends.macho.symbol import LIBRARY_ORDINAL_EXECUTABLE, SYMBOL_TYPE_SECT, BindingSymbol, SymbolTableSymbol
 
 TEST_BASE = os.path.join(os.path.dirname(os.path.realpath(__file__)), os.path.join("..", "..", "binaries"))
 
@@ -304,6 +305,65 @@ def test_instruction_sections():
     assert macho.sections_map["__TEXT,__cstring"].attributes == 0
 
 
+def test_symbol_is_function():
+    machofile = os.path.join(TEST_BASE, "tests", "x86_64", "fauxware.macho")
+    ld = cle.Loader(machofile, auto_load_libs=False)
+    macho = ld.main_object
+    assert isinstance(macho, cle.MachO)
+
+    symbols = {sym.name: sym for sym in macho.symbols if isinstance(sym, SymbolTableSymbol)}
+
+    # The four symbols defined in a section that holds instructions, and nothing else.
+    assert {name for name, sym in symbols.items() if sym.is_function} == {
+        "_authenticate",
+        "_accepted",
+        "_rejected",
+        "_main",
+    }
+
+    # _sneaky is an N_SECT symbol too, but its section holds data.
+    assert symbols["_sneaky"].section is not None
+    assert symbols["_sneaky"].section.full_name == "__DATA,__data"
+    assert not symbols["_sneaky"].is_function
+
+    # __mh_execute_header names the first section of __TEXT and addresses the Mach-O header in front of it.
+    header = symbols["__mh_execute_header"]
+    assert header.sym_type == SYMBOL_TYPE_SECT
+    assert header.section is not None
+    assert header.section.full_name == "__TEXT,__text"
+    assert not header.section.contains_addr(header.rebased_addr)
+    assert not header.is_function
+
+    # An undefined symbol defines nothing here, so it names no code here either.
+    assert symbols["_printf"].is_import
+    assert symbols["_printf"].section is None
+    assert not symbols["_printf"].is_function
+
+
+def test_arm_thumb_definition_carries_the_flag_in_its_address():
+    machofile = os.path.join(TEST_BASE, "tests", "armhf", "FileProtection-05.armv7.macho")
+    ld = cle.Loader(machofile, auto_load_libs=False)
+    macho = ld.main_object
+    assert isinstance(macho, cle.MachO)
+    assert macho.arch.name == "ARMEL"
+
+    symbols = {sym.name: sym for sym in macho.symbols if isinstance(sym, SymbolTableSymbol)}
+
+    # n_value is 0x83a8 and n_desc says Thumb. ELF would have stated both in st_value.
+    main = symbols["_main"]
+    assert main.is_function
+    assert main.is_thumb_definition
+    assert main.rebased_addr == 0x83A9
+
+    # The one ARM-mode definition in this image keeps the address the file gives it.
+    helpers = symbols[" stub helpers"]
+    assert helpers.is_function
+    assert not helpers.is_thumb_definition
+    assert helpers.rebased_addr == 0xA2F0
+
+    assert sum(1 for sym in symbols.values() if sym.is_function) == 74
+
+
 def test_find_symbol():
     machofile = os.path.join(TEST_BASE, "tests", "x86_64", "fauxware.macho")
     ld = cle.Loader(machofile, auto_load_libs=False)
@@ -443,6 +503,36 @@ def test_non_macho_magic_is_reported():
         assert f"{magic:#010x}" in message
 
 
+def test_bundle():
+    """A compiler-produced dlopen-ed plugin bundle is linked relative to zero"""
+    machofile = os.path.join(TEST_BASE, "tests", "x86_64", "macho_bundle")
+    bundle = cle.Loader(machofile, auto_load_libs=False).main_object
+    assert isinstance(bundle, MachO)
+
+    assert bundle.filetype == MachoFiletype.MH_BUNDLE
+    assert bundle.pic
+    assert bundle.linked_base == bundle.mapped_base == 0
+
+
+def test_bundle_special_library_ordinals():
+    """A bundle can bind against its loader or defer symbol lookup to runtime"""
+    machofile = os.path.join(TEST_BASE, "tests", "x86_64", "macho_bundle")
+    macho = cle.Loader(machofile, auto_load_libs=False).main_object
+    assert isinstance(macho, MachO)
+
+    nlist_imports = [sym for sym in macho.symbols if isinstance(sym, SymbolTableSymbol) and sym.is_import]
+    assert {(sym.name, sym.library_ordinal, sym.library_name) for sym in nlist_imports} == {
+        ("_flat_value", 0xFE, None),
+        ("_host_value", LIBRARY_ORDINAL_EXECUTABLE, None),
+    }
+
+    binding_imports = [sym for sym in macho.symbols if isinstance(sym, BindingSymbol)]
+    assert {(sym.name, sym.library_ordinal, sym.library_name) for sym in binding_imports} == {
+        ("_flat_value", -2, None),
+        ("_host_value", -1, None),
+    }
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     test_dummy()
@@ -456,6 +546,8 @@ if __name__ == "__main__":
     test_instruction_sections()
     test_zero_vmsize_segment()
     test_filesize_larger_than_vmsize()
+    test_bundle()
+    test_bundle_special_library_ordinals()
 
 
 def test_relocatable_object():

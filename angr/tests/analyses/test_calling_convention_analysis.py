@@ -14,7 +14,7 @@ import archinfo
 
 import angr
 from angr.analyses import Decompiler
-from angr.analyses.calling_convention import FactCollector
+from angr.analyses.calling_convention import CallingConventionAnalysis, FactCollector
 from angr.analyses.calling_convention.utils import is_sane_register_variable
 from angr.analyses.complete_calling_conventions import (
     DEAD_WORKER_GRACE_PERIOD,
@@ -27,14 +27,26 @@ from angr.calling_conventions import (
     SimCCMicrosoftAMD64,
     SimCCMicrosoftCdecl,
     SimCCMicrosoftFastcall,
+    SimCCS390X,
     SimCCStdcall,
+    SimCCSyscall,
     SimCCSystemVAMD64,
+    SimCCX86FreeBSDSyscall,
     SimFunctionArgument,
     SimRegArg,
     SimStackArg,
 )
+from angr.codenode import BlockNode
 from angr.errors import AngrRuntimeError
-from angr.sim_type import SimTypeBottom, SimTypeDouble, SimTypeFloat, SimTypeFunction, SimTypeInt, SimTypeLongLong
+from angr.sim_type import (
+    SimTypeBottom,
+    SimTypeDouble,
+    SimTypeFloat,
+    SimTypeFunction,
+    SimTypeInt,
+    SimTypeLongLong,
+    SimTypeShort,
+)
 from angr.utils.ssa import get_reg_offset_base
 from tests.common import bin_location, load_project_with_scoped_cfg, requires_binaries_private
 
@@ -65,6 +77,49 @@ def _reg_names(locs: list[SimFunctionArgument]) -> list[str]:
 # pylint: disable=missing-class-docstring
 # pylint: disable=no-self-use
 class TestCallingConventionAnalysis(unittest.TestCase):
+    def test_demangled_wchar_t_has_the_target_size(self):
+        # std::ctype<wchar_t>::do_toupper(wchar_t) const, in a Linux libstdc++ and in a MinGW executable
+        for binary, addr, arg_type, bits in (
+            (os.path.join(test_location, "x86_64", "libstdc++.so.6"), 0x4C80C0, SimTypeInt, 32),
+            (os.path.join(test_location, "x86_64", "windows", "simple_crackme_x64.exe"), 0x428C80, SimTypeShort, 16),
+        ):
+            project, _ = load_project_with_scoped_cfg(binary, addr, project_kwargs={"auto_load_libs": False})
+            prototype = project.kb.functions[addr].prototype
+            assert prototype is not None
+            assert isinstance(prototype.args[1], arg_type)
+            assert prototype.args[1].size == bits
+
+    def test_aarch64_32bit_register_args_are_kept(self):
+        # glibc's socket(int, int, int) and umask(int) read their arguments as w registers for the system call
+        binary = os.path.join(test_location, "aarch64", "libc.so.6")
+        project = angr.Project(binary, auto_load_libs=False)
+        cfg = project.analyses.CFGFast(normalize=True)
+        project.analyses.CompleteCallingConventions(recover_variables=True, cfg=cfg.model)
+        for name, args in (("socket", 3), ("umask", 1)):
+            prototype = project.kb.functions[name].prototype
+            assert prototype is not None
+            assert len(prototype.args) == args
+
+    def test_aarch64_w_read_past_an_unread_argument_register_stays_a_w_read(self):
+        # a call to a static C++ member function, which its demangled name gives a `this`, seems to pass w4 after the
+        # caller set x0-x3 itself: with x3 not read, w4 keeps its name, which SimCC._match does not take as an argument
+        args: set[SimRegArg | SimStackArg] = {
+            SimRegArg("x0", 8),
+            SimRegArg("x1", 4),
+            SimRegArg("x2", 8),
+            SimRegArg("x4", 4),
+        }
+        CallingConventionAnalysis._drop_detached_aarch64_reads(  # pylint: disable=protected-access
+            args, {"x1": SimRegArg("w1", 4), "x4": SimRegArg("w4", 4)}
+        )
+        assert args == {SimRegArg("x0", 8), SimRegArg("x1", 4), SimRegArg("x2", 8), SimRegArg("w4", 4)}
+        # a member function that never reads `this` reads w1 alone, which stays its second argument
+        args = {SimRegArg("x1", 4)}
+        CallingConventionAnalysis._drop_detached_aarch64_reads(  # pylint: disable=protected-access
+            args, {"x1": SimRegArg("w1", 4)}
+        )
+        assert args == {SimRegArg("x1", 4)}
+
     def test_itanium_qualified_free_function_does_not_gain_this(self):
         """Machine facts must disambiguate namespace functions from members."""
         binary = os.path.join(test_location, "x86_64", "cpp_qualified_symbols.so")
@@ -121,6 +176,50 @@ class TestCallingConventionAnalysis(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_s390x_plt_without_cfg_jumpout(self):
+        binary_path = os.path.join(test_location, "s390x", "fauxware")
+        project = angr.Project(binary_path, auto_load_libs=False)
+        cfg = project.analyses.CFGFast(normalize=True, data_references=True)
+
+        puts = cfg.functions.function(name="puts", plt=True)
+        assert puts is not None
+        assert len(puts.jumpout_sites) == 0
+
+        cca = project.analyses.CallingConvention(puts, cfg=cfg.model)
+        assert isinstance(cca.cc, SimCCS390X)
+        assert cca.prototype is not None
+        assert len(cca.prototype.args) == 1
+        assert isinstance(cca.prototype.returnty, SimTypeInt)
+        assert cca.proto_from_symbol
+
+        plt_name = project.loader.find_plt_stub_name(puts.addr)
+        assert plt_name == "puts"
+        symbol = project.loader.find_symbol(plt_name)
+        assert symbol is not None
+        hooker = project.hooked_by(symbol.rebased_addr)
+        assert hooker is not None
+        hooker.cc = None
+
+        cca_with_default_cc = project.analyses.CallingConvention(puts, cfg=cfg.model)
+        assert isinstance(cca_with_default_cc.cc, SimCCS390X)
+        assert cca_with_default_cc.prototype is not None
+        assert cca_with_default_cc.proto_from_symbol
+
+        binary_path = os.path.join(test_location, "s390x", "simcc")
+        project = angr.Project(binary_path, auto_load_libs=False)
+        cfg = project.analyses.CFGFast(normalize=True, data_references=True)
+
+        printf_chk = cfg.functions.function(name="__printf_chk", plt=True)
+        assert printf_chk is not None
+        assert len(printf_chk.jumpout_sites) == 0
+
+        cca = project.analyses.CallingConvention(printf_chk, cfg=cfg.model)
+        assert isinstance(cca.cc, SimCCS390X)
+        assert cca.prototype is not None
+        assert len(cca.prototype.args) == 2
+        assert cca.prototype.variadic
+        assert cca.proto_from_symbol
 
     @requires_binaries_private
     def test_cgc_binary1(self):
@@ -973,6 +1072,29 @@ class TestCallingConventionAnalysis(unittest.TestCase):
             assert type(thunk.calling_convention) is SimCCStdcall
             assert thunk.prototype is not None and len(thunk.prototype.args) == arg_count
 
+    def test_ret_site_outside_the_local_graph(self):
+        # Two functions whose tails overlap share the ret instruction: the block holding it belongs to
+        # the other function, so the transition into it leaves this one. Function.normalize() splits
+        # our block at that boundary and moves its return-site flag onto the shared block, which the
+        # local transition graph does not contain. Guessing the return type must survive that.
+        binary_path = os.path.join(test_location, "x86_64", "fauxware")
+        proj = angr.Project(binary_path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+        func = cfg.functions[0x4007E0]  # __libc_csu_init
+        ret_block = func.ret_sites[0]
+        assert ret_block in func.graph
+
+        insn_addrs = proj.factory.block(ret_block.addr, size=ret_block.size).instruction_addrs
+        shared = BlockNode(insn_addrs[-1], ret_block.addr + ret_block.size - insn_addrs[-1])
+        entered_from = BlockNode(insn_addrs[-2], insn_addrs[-1] - insn_addrs[-2])
+        func.transit_to(entered_from, shared, outside=True, ins_addr=entered_from.addr)
+        func.normalize()
+        assert func.ret_sites == [shared]
+        assert shared not in func.graph
+
+        cca = proj.analyses.CallingConvention(func, cfg=cfg.model, analyze_callsites=False, collect_facts=True)
+        assert cca.prototype is not None
+
     def test_amd64_mixed_int_fp_args_follow_library_prototype(self):
         # int and FP argument registers are separate sequences on SysV amd64; local functions named after libm
         # functions take their parameter order from the library prototype
@@ -991,6 +1113,73 @@ class TestCallingConventionAnalysis(unittest.TestCase):
             assert all(isinstance(loc, SimRegArg) for loc in locs)
             bases = [get_reg_offset_base(arch.registers[name][0], arch) for name in _reg_names(locs)]
             assert bases == [arch.registers[r][0] for r in regs], (func.name, locs)
+
+    def test_x86_unprototyped_syscall_takes_its_arguments_in_registers(self):
+        # mmap2 is i386 syscall 192 and linux_kernel.py carries no prototype for it, so the
+        # convention has to come from the architecture's syscall ABI rather than from a
+        # declaration. sub_417950 is the loader's mmap wrapper and `shr ebp, 0xc` right before
+        # the `int 0x80` is the page shift of mmap2's sixth argument: all six are in ebx-ebp.
+        binary_path = os.path.join(test_location, "i386", "ld-linux.so.2")
+        proj, cfg = load_project_with_scoped_cfg(binary_path, 0x417950)
+
+        syscall = proj.kb.functions[0x7000C0]
+        assert syscall.is_syscall
+        assert syscall.get_prototype(None) is None, "the point of the fixture is the missing prototype"
+        callee = proj.analyses.CallingConvention(syscall, cfg=cfg.model, analyze_callsites=True)
+        assert isinstance(callee.cc, SimCCSyscall), callee.cc
+
+        # The prototype the decompiler prints at a call site is recovered separately, and it is
+        # the half that decides which locations are read.
+        callsite = proj.analyses.CallingConvention(
+            None,
+            analyze_callsites=True,
+            caller_func_addr=0x417950,
+            callsite_block_addr=0x417979,
+            callsite_insn_addr=0x417981,
+        )
+        assert isinstance(callsite.cc, SimCCSyscall), callsite.cc
+        assert callsite.prototype is not None
+        locs = callsite.cc.arg_locs(callsite.prototype)
+        assert all(isinstance(loc, SimRegArg) for loc in locs), locs
+        assert _reg_names(locs) == ["ebx", "ecx", "edx", "esi", "edi", "ebp"], locs
+
+    @unittest.skipUnless(
+        os.path.exists(os.path.join(test_location, "i386", "freebsd-syscalls-i386")),
+        "needs the FreeBSD i386 fixture from angr/binaries",
+    )
+    def test_x86_freebsd_syscall_arguments_start_past_no_return_address(self):
+        # FreeBSD's i386 kernel reads its syscall arguments from tf_esp + sizeof(uint32_t), past
+        # the slot a call to a libc stub leaves the return address in, so a program issuing
+        # int 0x80 by hand pushes one word there first. getdents is FreeBSD syscall 272 and angr
+        # ships no SimProcedure for it, so this call site's argument list is recovered rather
+        # than declared. The trap pushes no return address, so the word already in that slot is
+        # not the first argument: the three the program pushed sit at [esp+4], [esp+8], [esp+c].
+        binary_path = os.path.join(test_location, "i386", "freebsd-syscalls-i386")
+        proj = angr.Project(binary_path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+
+        callsite = proj.analyses.CallingConvention(
+            None,
+            analyze_callsites=True,
+            caller_func_addr=0x8049000,
+            callsite_block_addr=0x804903D,
+            callsite_insn_addr=0x8049051,
+        )
+        assert isinstance(callsite.cc, SimCCX86FreeBSDSyscall), callsite.cc
+        assert callsite.prototype is not None
+        locs = callsite.cc.arg_locs(callsite.prototype)
+        assert locs == [SimStackArg(4, 4), SimStackArg(8, 4), SimStackArg(12, 4)], locs
+
+        # And what the decompiler prints: three arguments, the last one the buffer size.
+        decompilation = proj.analyses.Decompiler(cfg.functions[0x8049000], cfg=cfg.model)
+        assert decompilation.codegen is not None
+        text = decompilation.codegen.text
+        assert text is not None
+        call = re.search(r"getdents\(([^()]*)\)", text)
+        assert call is not None, text
+        args = [arg.strip() for arg in call.group(1).split(",")]
+        assert len(args) == 3, call.group(0)
+        assert args[-1] == "0x200", call.group(0)
 
 
 if __name__ == "__main__":
