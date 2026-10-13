@@ -10,6 +10,7 @@ import re
 import time
 import unittest
 from functools import wraps
+from unittest import mock
 
 import networkx
 
@@ -25,6 +26,7 @@ from angr.analyses import (
 )
 from angr.analyses.complete_calling_conventions import CallingConventionAnalysisMode
 from angr.analyses.decompiler import DECOMPILATION_PRESETS
+from angr.analyses.decompiler.clinic import Clinic
 from angr.analyses.decompiler.decompilation_options import PARAM_TO_OPTION, get_structurer_option
 from angr.analyses.decompiler.optimization_passes import (
     CONDENSING_OPTS,
@@ -196,6 +198,26 @@ class TestDecompiler(unittest.TestCase):
         dec = p.analyses[Decompiler].prep(fail_fast=True)(f, cfg=cfg.model, options=decompiler_options)
         assert dec.codegen is not None, f"Failed to decompile function {f!r}."
         print_decompilation_result(dec)
+
+    @structuring_algo("sailr")
+    def test_decompiling_switch_armel_ldrls_pc(self, decompiler_options=None):
+        # ARM-mode `ldrls pc, [pc, r3, lsl #2]`: the bounds check and the table load share one block
+        bin_path = os.path.join(test_location, "armel", "cfg_switches")
+        p = angr.Project(bin_path, auto_load_libs=False)
+
+        cfg = p.analyses[CFGFast].prep()(normalize=True, data_references=True)
+
+        f = cfg.functions["main"]
+        dec = p.analyses[Decompiler].prep(fail_fast=True)(f, cfg=cfg.model, options=decompiler_options)
+
+        assert dec.codegen is not None, f"Failed to decompile function {f!r}."
+        print_decompilation_result(dec)
+        code = dec.codegen.text
+        assert "switch (a0)" in code
+        assert "case 2:" in code
+        assert "case 44:" in code
+        assert "default:" in code
+        assert "goto" not in code
 
     @for_all_structuring_algos
     def test_decompiling_aes_armel(self, decompiler_options=None):
@@ -602,7 +624,7 @@ class TestDecompiler(unittest.TestCase):
         dec = p.analyses[Decompiler].prep(fail_fast=True)(0x403D10, cfg=cfg.model, options=decompiler_options)
         assert dec.codegen is not None and dec.codegen.text is not None
         print_decompilation_result(dec)
-        m = re.search(r"\bv\d+ = (idx->field_8);\s+idx->field_8 = v\d+ \+ 1;", dec.codegen.text)
+        m = re.search(r"\bv\d+ = (a4->field_8);\s+a4->field_8 = v\d+ \+ 1;", dec.codegen.text)
         assert m is not None, dec.codegen.text
 
     @broken
@@ -4622,6 +4644,8 @@ class TestDecompiler(unittest.TestCase):
         bin_path = os.path.join(test_location, "x86_64", "BitBlaster.exe")
 
         first = None
+        options = decompiler_options or []
+        options += [(PARAM_TO_OPTION["show_casts"], False)]
         for _ in range(5):
             # TODO: the following lines (CFG creation) are supposed to be deterministic as well, but are not.
             #  this should be fixed in another PR and moved out of the loop in this testcase.
@@ -4630,7 +4654,7 @@ class TestDecompiler(unittest.TestCase):
             function = cfg.functions[4203344]
             function.normalize()
             # re-create decompilation
-            decomp = proj.analyses.Decompiler(func=function, cfg=cfg, options=[(PARAM_TO_OPTION["show_casts"], False)])
+            decomp = proj.analyses.Decompiler(func=function, cfg=cfg, options=options)
             assert decomp.codegen is not None
             if first is None:
                 first = decomp.codegen.text
@@ -5070,6 +5094,30 @@ class TestDecompiler(unittest.TestCase):
         assert "if (!compare_floats(30, current_angle, prev_angle))" in d.codegen.text or re.search(
             r"(\w+) = compare_floats\(30, current_angle, prev_angle\);\s*if \(!\1\)", d.codegen.text
         )
+
+    def test_decompiling_cortexm_vfp_compare_flags(self, decompiler_options=None):
+        # gravityLight: vcmpe.f32 / vmrs APSR_nzcv, fpscr / ble and bpl. The NZCV bit arithmetic VEX derives from
+        # CmpF used to survive as huge FPSCR expressions (collapsed into "..." by the codegen).
+        bin_path = os.path.join(test_location, "armel", "decompiler", "cf2.elf")
+        proj = angr.Project(bin_path, auto_load_libs=False)
+        func_addr = 0x800B811
+        cfg = proj.analyses.CFGFast(
+            normalize=True,
+            regions=[(func_addr & ~1, (func_addr & ~1) + 0xDC)],
+            function_starts=[func_addr],
+            force_smart_scan=False,
+        )
+        f = proj.kb.functions[func_addr]
+        d = proj.analyses[Decompiler].prep(fail_fast=True)(f, cfg=cfg.model, options=decompiler_options)
+        assert d.codegen is not None and d.codegen.text is not None
+        print_decompilation_result(d)
+
+        text = d.codegen.text
+        assert "fpscr" not in text
+        assert "..." not in text
+        assert "isnan" not in text
+        assert re.search(r"if \(v\d+ (<=|>) 255\.0f?\)", text) is not None
+        assert re.search(r"if \(v\d+ (>=|<) 0\.0f?\)", text) is not None
 
     def test_decompiling_msvcrt_IsExceptionObjectToBeDestroyed(self, decompiler_options=None):
         bin_path = os.path.join(test_location, "x86_64", "decompiler", "vcruntime_test.exe")
@@ -6105,6 +6153,36 @@ class TestDecompiler(unittest.TestCase):
         assert "switch (g_24000e6b)" in dec.codegen.text
         for case_no in [0, 2, 3, 4, 5]:
             assert f"case {case_no}:" in dec.codegen.text
+
+    def test_decompiling_nuttx_nxsig_release_cortexm_msr(self, decompiler_options=None):
+        # mrs/msr basepri are lifted by pyvex's ARM gym lifter, not libVEX
+        bin_path = os.path.join(test_location, "armel", "nuttx_cortexm_stripped")
+
+        def _decompile():
+            proj = angr.Project(bin_path, auto_load_libs=False)
+            cfg = proj.analyses.CFGFast(normalize=True, regions=[(0x8003134, 0x80031B0)], function_starts=[0x8003135])
+            dec = proj.analyses.Decompiler(proj.kb.functions[0x8003135], cfg=cfg.model, options=decompiler_options)
+            assert dec.codegen is not None and dec.codegen.text is not None
+            print_decompilation_result(dec)
+            return dec.codegen.text
+
+        text = _decompile()
+        assert "NoDecode" not in text
+        assert "sub_8003b7d()" in text
+        assert "sub_8003219()" in text
+        assert "field_20c" in text
+
+        # with the raw libVEX lift, a dirty statement lands in a loop-condition comma expression; it must render
+        # without a statement terminator
+        orig_convert_vex = Clinic._convert_vex  # pylint: disable=protected-access
+
+        def _raw_convert_vex(self, block):
+            return self._convert_vex_fast(block) or orig_convert_vex(self, block)
+
+        with mock.patch.object(Clinic, "_convert_vex", _raw_convert_vex):
+            text = _decompile()
+        assert "__unsupported_jumpkind_Ijk_NoDecode(), " in text
+        assert "__unsupported_jumpkind_Ijk_NoDecode();\n," not in text
 
     def test_decompiling_assign_ite(self, decompiler_options=None):
         bin_path = os.path.join(test_location, "x86_64", "decompiler", "ite.o")

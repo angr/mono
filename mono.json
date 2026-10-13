@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "d1e9ec806cae8c49139cd96a738dcc0821a5023d",
-      "committed_at": "2026-10-10T09:02:05Z",
-      "subject": "Update version to 10.0.4.dev0 [ci skip]",
+      "commit": "b7e295af6fb73e6b279a74987ae0aca1c201be46",
+      "committed_at": "2026-10-13T01:58:32-07:00",
+      "subject": "CodeGen: Add flavor-independent marker bases for node classes. (#7537)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "466634a20f8779287da04bfc536ac968a9bc235e",
-      "committed_at": "2026-10-10T09:02:08Z",
-      "subject": "Update version to 10.0.4.dev0 [ci skip]",
+      "commit": "e72b7a1c184686eb2ddfc0982c5cf774640468df",
+      "committed_at": "2026-10-13T01:59:20-07:00",
+      "subject": "CodeView: Fix display and interaction of Rust and Go nodes. (#1746)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -48,25 +48,25 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "c251f433c93c7a220102eddf25be60e68fc28d44",
-      "committed_at": "2026-10-10T09:02:10Z",
-      "subject": "Update version to 10.0.4.dev0 [ci skip]",
+      "commit": "b710def2eb9e0282a3bb8c1de870a33412cf5171",
+      "committed_at": "2026-10-12T11:31:50-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#392)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "claripy": {
       "upstream": "https://github.com/angr/claripy",
-      "commit": "60e037e51ffcdb1f1034268bb9f0f9a6b42fc697",
-      "committed_at": "2026-10-07T19:14:39Z",
-      "subject": "Update version to 9.3.8.dev0 [ci skip]",
+      "commit": "db744e11e07886e2c9e37cde901025cded918075",
+      "committed_at": "2026-10-12T16:52:04-07:00",
+      "subject": "README: Add claripy rewrite notice (#750)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "201dd1b3464e42dc409da425ef985306e7d3e0c5",
-      "committed_at": "2026-10-10T09:02:15Z",
-      "subject": "Update version to 10.0.4.dev0 [ci skip]",
+      "commit": "ef1e7033ec741df01e08e04fd906c96dad076cf7",
+      "committed_at": "2026-10-12T23:23:57-07:00",
+      "subject": "PE: Preserve arbitrary export forwarder bytes (#857)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -83,31 +83,31 @@
     },
     "pypcode": {
       "upstream": "https://github.com/angr/pypcode",
-      "commit": "17751ddba848a9d920da09ecb65c8993cfde75a8",
-      "committed_at": "2026-10-06T18:07:35-07:00",
-      "subject": "v4.0.2.dev0",
+      "commit": "ce8f00dad05f157eba15b7f6cebe86f3bfff3133",
+      "committed_at": "2026-10-12T12:35:27-07:00",
+      "subject": "ci: bump actions/download-artifact from 8.0.1 to 8.0.2",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pysoot": {
       "upstream": "https://github.com/angr/pysoot",
-      "commit": "6ab9df57c3001eb5324571ffeac9554dfd9b11c1",
-      "committed_at": "2026-10-05T12:07:46-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#62)",
+      "commit": "16ab55db71a162efea3d44251fb93893140bbef2",
+      "committed_at": "2026-10-12T13:07:05-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#63)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "da4ce952c04f74ca3727cbcdf2d66bd3b13a839d",
-      "committed_at": "2026-10-12T05:06:02Z",
-      "subject": "Pin to bitstring<5.",
+      "commit": "d4372c5d2155d2417ed2cdcf297536175b8fe5c2",
+      "committed_at": "2026-10-13T00:35:14-07:00",
+      "subject": "Bump vex: reset EVEX decoder state at every instruction. (#596)",
       "excluded": [
         ".gitmodules"
       ],
       "sibling_sources_repointed_at_workspace": [],
       "vendored_submodules": {
-        "vex": "e3062871112afded52ae155757113a5873e9819c"
+        "vex": "fd41c675d50845b0aadd0b42ac7490038e2f3d82"
       }
     },
     "tracer": {
@@ -119,13 +119,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-12T18:11:57+00:00",
+  "imported_at": "2026-10-13T18:11:53+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "bf588a0bbd795117732096fe315bcbaf187e9f61",
-      "committed_at": "2026-10-10T09:02:13Z",
-      "subject": "Update version to 10.0.4.dev0 [ci skip]",
+      "commit": "9bea8f2777201c50b96a568d7a7ecab8e0fe6cab",
+      "committed_at": "2026-10-12T23:23:46-07:00",
+      "subject": "Add a PE with a non-UTF-8 export forwarder (#247)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }

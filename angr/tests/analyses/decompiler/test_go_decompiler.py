@@ -305,6 +305,21 @@ class TestEndlessLoopGo127(GoDecompilationTarget):
         assert "for 1" not in text, text
 
 
+class TestOneBlockRuntimeStubsGo127(GoDecompilationTarget):
+    """
+    ``runtime.panicBounds`` is one block calling ``runtime.panicBounds64`` and the ABI0 wrapper of
+    ``runtime.morestackc`` one block jumping to it: the check removers must not take a function's only block.
+    """
+
+    BINARY = go_binary("go1.27.1", "basics")
+    # runtime.morestackc is in the CFG so that the wrapper's jump reads as a call to it
+    FUNCS = ("runtime.panicBounds", "runtime.morestackc.abi0", "runtime.morestackc")
+
+    def test_entry_block_is_kept(self):
+        assert "runtime.panicBounds64(" in self.texts["runtime.panicBounds"]
+        assert "runtime.morestackc(" in self.texts["runtime.morestackc.abi0"]
+
+
 class TestLangdetectWindowsPE(GoDecompilationTarget):
     BINARY = os.path.join(test_location, "x86_64", "windows", "langdetect_go.exe")
     FUNCS = ("main.fibonacci", "main.main")
@@ -422,6 +437,21 @@ class TestRecvI386Go127(GoDecompilationTarget):
         for lit in ("all", "none", "crash", "single", "system"):
             assert re.search(rf' [!=]= "{lit}"', text), lit
         assert "1701736302" not in text and "1935766115" not in text
+
+
+class TestReceiverNamesI386Go127(GoDecompilationTarget):
+    """
+    A pointer receiver read at field offsets (``ts + 8``) keeps its signature name: array-index naming took it for the
+    index of a ``base + idx`` access and renamed it ``idx``.
+    """
+
+    BINARY = go_binary("go1.27.1", "strcat", arch="i386")
+    FUNCS = ("runtime.(*timers).siftDown", "sync.(*poolDequeue).pushHead", "internal/strconv.(*decimal).Assign")
+
+    def test_receiver_names(self):
+        assert "func (ts *runtime.timers) siftDown(" in self.texts["runtime.(*timers).siftDown"]
+        assert "func (d *sync.poolDequeue) pushHead(" in self.texts["sync.(*poolDequeue).pushHead"]
+        assert "func (a *internal/strconv.decimal) Assign(" in self.texts["internal/strconv.(*decimal).Assign"]
 
 
 class TestMapsArmGo127(GoDecompilationTarget):
@@ -677,6 +707,15 @@ class TestInferredSignatureRecords(unittest.TestCase):
         again = GoInferredSignature()
         again.merge(None, None, None, 0, json.loads(json.dumps(dict(rec)))["groups"])
         assert again.groups == {2: (2, None)}
+
+    def test_return_words_cap_the_guessed_count(self):
+        # a two-word guess pads a one-word result unless the function's own returns showed they write one register
+        rec = GoInferredSignature()
+        rec.merge(results={0: ("bool", 1)})
+        assert rec.result_types(2) == ["bool", "uintptr"]
+        assert rec.merge(return_words=1) and rec.result_types(2) == ["bool"]
+        # the smallest count wins
+        assert not rec.merge(return_words=2) and rec.return_words == 1
 
     def test_caller_header_over_callee_length_word(self):
         # bech32.Decode(string) (string, []byte, error): the callee typed only the length word of its string result

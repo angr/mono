@@ -10,6 +10,8 @@ import re
 import sys
 from typing import Any
 
+import archinfo
+import cle
 import networkx as nx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -38,7 +40,7 @@ from .serializers import (
     serialize_symbol,
     serialize_xref,
 )
-from .session import ProjectSession, get_session_manager
+from .session import AVAILABLE_FLAVORS, ProjectSession, build_main_opts, get_session_manager, parse_flavor
 
 l = logging.getLogger(__name__)
 
@@ -162,6 +164,10 @@ def _serialized(func):
 def load_binary(
     binary_path: str,
     auto_load_libs: bool = False,
+    arch: str | None = None,
+    backend: str | None = None,
+    base_address: str | None = None,
+    entry_point: str | None = None,
 ) -> dict[str, Any]:
     """
     Load a binary file as an angr Project for analysis.
@@ -169,31 +175,55 @@ def load_binary(
     This is typically the first tool to call. It creates a new analysis
     session and returns a project_id that must be used for subsequent operations.
 
+    Headered ELF, PE, and Mach-O files need no loader options. A universal (fat) Mach-O loads every
+    supported slice unless arch selects one. A headerless raw image needs backend "blob" plus arch,
+    and usually base_address and entry_point. 16-bit DOS executables are not supported.
+
     Args:
         binary_path: Absolute path to the binary file to analyze
         auto_load_libs: Whether to automatically load shared libraries (default: False)
+        arch: Architecture identifier (e.g. "x86_64", "aarch64", "armel", "mips32"). Selects the
+            matching slice of a universal Mach-O, or overrides the architecture of a headered file.
+        backend: Loader backend override; "blob" loads a headerless raw image (requires arch)
+        base_address: Load address for a raw image, as a hex string (e.g. "0x8000000")
+        entry_point: Entry point for a raw image, as a hex string
 
     Returns:
-        Project information including project_id, architecture, and entry point
+        Project information including project_id, the file's SHA-256, architecture, entry point, and,
+        for a universal Mach-O, the architectures its container offers
     """
     manager = get_session_manager()
+    main_opts = build_main_opts(arch=arch, backend=backend, base_address=base_address, entry_point=entry_point)
 
     session = manager.create_session(
         binary_path,
         auto_load_libs=auto_load_libs,
+        **({"main_opts": main_opts} if main_opts else {}),
     )
 
     proj = session.project
+    main_object = proj.loader.main_object
 
-    return {
+    result = {
         "project_id": session.project_id,
         "binary_path": session.binary_path,
+        "sha256": session.sha256,
         "arch": proj.arch.name,
         "bits": proj.arch.bits,
         "endianness": "little" if proj.arch.memory_endness == "Iend_LE" else "big",
         "entry_point": hex(proj.entry),
         "filename": proj.filename,
+        "backend": type(main_object).__name__.lower(),
+        "load_options": {
+            key: (value.name if isinstance(value, archinfo.Arch) else hex(value) if isinstance(value, int) else value)
+            for key, value in main_opts.items()
+        },
+        "flavor": session.flavor,
     }
+    if isinstance(main_object, cle.backends.Universal2):
+        result["available_arches"] = main_object.available_arches
+        result["loaded_slices"] = [child.arch.name for child in main_object.child_objects]
+    return result
 
 
 @mcp.tool()
@@ -383,15 +413,64 @@ def get_function_info(
 @mcp.tool()
 @_as_tool_error
 @_serialized
+def get_decompilation_flavor(project_id: str) -> dict[str, Any]:
+    """
+    Report the project-wide decompilation flavor and the language angr detected in the binary.
+
+    The flavor selects how decompile_function renders code: "pseudocode" (C-like, the default), "rust",
+    or "go". Decompilation caches, prototypes, and edits are kept per flavor. The detected language is a
+    hint for choosing a flavor; it does not change the setting.
+
+    Args:
+        project_id: The project ID
+
+    Returns:
+        The current flavor, the valid flavors, and the language detection result
+    """
+    session = _get_session(project_id)
+    detection = session.project.analyses.LanguageDetector()
+    return {
+        "project_id": project_id,
+        "flavor": session.flavor,
+        "available_flavors": list(AVAILABLE_FLAVORS),
+        "detected_language": detection.language,
+        "detected_compiler": detection.compiler,
+        "detection_confidence": detection.confidence.value,
+    }
+
+
+@mcp.tool()
+@_as_tool_error
+@_serialized
+def set_decompilation_flavor(project_id: str, flavor: str) -> dict[str, Any]:
+    """
+    Set the project-wide decompilation flavor used by decompile_function and the edit tools.
+
+    Args:
+        project_id: The project ID
+        flavor: "pseudocode", "rust", or "go"
+
+    Returns:
+        The previous and current flavor
+    """
+    session = _get_session(project_id)
+    previous = session.set_flavor(flavor)
+    return {"project_id": project_id, "previous_flavor": previous, "flavor": session.flavor}
+
+
+@mcp.tool()
+@_as_tool_error
+@_serialized
 def decompile_function(
     project_id: str,
     address: str | None = None,
     name: str | None = None,
     max_function_blocks: int | None = None,
     max_ail_statements: int | None = None,
+    flavor: str | None = None,
 ) -> dict[str, Any]:
     """
-    Decompile a function to C-like pseudocode.
+    Decompile a function to C-like pseudocode, or to Rust- or Go-flavored code.
 
     Specify either address (hex string) or function name.
 
@@ -409,15 +488,18 @@ def decompile_function(
             count as "num_blocks" and this default as "decompilation_block_limit".
         max_ail_statements: Refuse to decompile a function whose AIL graph has more statements than
             this (default: 1000000; 0 disables the check)
+        flavor: Decompilation flavor for this call only: "pseudocode", "rust", or "go". Defaults to the
+            project-wide flavor (see get_decompilation_flavor / set_decompilation_flavor).
 
     Returns:
-        Decompiled pseudocode and function metadata
+        Decompiled code, the flavor it was rendered in, and function metadata
     """
     session = _get_session(project_id)
     _require_cfg(session)
     proj = session.project
 
     func = _find_function(session, address=address, name=name)
+    flavor = session.flavor if flavor is None else parse_flavor(flavor)
 
     options = []
     if max_function_blocks is not None:
@@ -427,7 +509,7 @@ def decompile_function(
 
     # Decompile
     try:
-        dec = proj.analyses.Decompiler(func, options=options or None)
+        dec = proj.analyses.Decompiler(func, options=options or None, flavor=flavor)
     except AngrDecompilationComplexityError as e:
         raise _complexity_tool_error(e) from e
     except Exception as e:
@@ -443,6 +525,7 @@ def decompile_function(
         "project_id": project_id,
         "function_address": hex(func.addr),
         "function_name": func.name,
+        "flavor": flavor,
         "code": dec.codegen.text,
     }
 
