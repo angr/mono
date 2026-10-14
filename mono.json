@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "e6eac8c9224374cefbfc4d4b8ced7170dd7ed151",
-      "committed_at": "2026-10-13T13:38:20-07:00",
-      "subject": "Phoenix: Use the switch's out-successor as its end boundary. (#7541)",
+      "commit": "8b941522ff5d81330b4ef0a49ce0da4841cf7158",
+      "committed_at": "2026-10-13T17:31:48-07:00",
+      "subject": "Decompiler: Fold compiler-emitted NaN checks into float comparisons (#7546)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "e72b7a1c184686eb2ddfc0982c5cf774640468df",
-      "committed_at": "2026-10-13T01:59:20-07:00",
-      "subject": "CodeView: Fix display and interaction of Rust and Go nodes. (#1746)",
+      "commit": "e0009c8d12816b81865d9a0d12efb63b0177b16d",
+      "committed_at": "2026-10-13T17:30:49-07:00",
+      "subject": "Add a Go Globals Recovery job. (#1747)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -119,13 +119,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-13T20:54:14+00:00",
+  "imported_at": "2026-10-14T02:52:47+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "9bea8f2777201c50b96a568d7a7ecab8e0fe6cab",
-      "committed_at": "2026-10-12T23:23:46-07:00",
-      "subject": "Add a PE with a non-UTF-8 export forwarder (#247)",
+      "commit": "632bf945785637ff4ac4866a2cce4080bd473698",
+      "committed_at": "2026-10-14T00:45:51Z",
+      "subject": "Go corpus: floatret (float results in X0/X1 next to integer ones; STRIPPED_PROGS) with go1.27.1.",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
