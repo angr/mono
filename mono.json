@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "8b941522ff5d81330b4ef0a49ce0da4841cf7158",
-      "committed_at": "2026-10-13T17:31:48-07:00",
-      "subject": "Decompiler: Fold compiler-emitted NaN checks into float comparisons (#7546)",
+      "commit": "ae9f5786fd94410ca400063bf21719aa8b564d3e",
+      "committed_at": "2026-10-14T10:19:00-07:00",
+      "subject": "Decompiler: Defend against catastrophic structuring failures. (#7562)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "e0009c8d12816b81865d9a0d12efb63b0177b16d",
-      "committed_at": "2026-10-13T17:30:49-07:00",
-      "subject": "Add a Go Globals Recovery job. (#1747)",
+      "commit": "37cbfea2ac7a7aa60845e0a4ffe1e11d72c5994b",
+      "committed_at": "2026-10-14T12:12:30Z",
+      "subject": "Update version to 10.0.5.dev0 [ci skip]",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -48,9 +48,9 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "b710def2eb9e0282a3bb8c1de870a33412cf5171",
-      "committed_at": "2026-10-12T11:31:50-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#392)",
+      "commit": "db4531e5275954372967503cc778307304624ca1",
+      "committed_at": "2026-10-14T12:12:31Z",
+      "subject": "Update version to 10.0.5.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -64,9 +64,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "ef1e7033ec741df01e08e04fd906c96dad076cf7",
-      "committed_at": "2026-10-12T23:23:57-07:00",
-      "subject": "PE: Preserve arbitrary export forwarder bytes (#857)",
+      "commit": "a742800512776ee7ec1c07bfd2568ab4f22e7e34",
+      "committed_at": "2026-10-14T12:12:36Z",
+      "subject": "Update version to 10.0.5.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -99,9 +99,9 @@
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "d4372c5d2155d2417ed2cdcf297536175b8fe5c2",
-      "committed_at": "2026-10-13T00:35:14-07:00",
-      "subject": "Bump vex: reset EVEX decoder state at every instruction. (#596)",
+      "commit": "0a915d9e631f6b6eb70cf6963e729ae5d0a23003",
+      "committed_at": "2026-10-14T12:12:38Z",
+      "subject": "Update version to 10.0.5.dev0 [ci skip]",
       "excluded": [
         ".gitmodules"
       ],
@@ -119,13 +119,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-14T02:52:47+00:00",
+  "imported_at": "2026-10-15T02:51:50+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "632bf945785637ff4ac4866a2cce4080bd473698",
-      "committed_at": "2026-10-14T00:45:51Z",
-      "subject": "Go corpus: floatret (float results in X0/X1 next to integer ones; STRIPPED_PROGS) with go1.27.1.",
+      "commit": "ae51d542d1d0e08c01a203a2771df30d8648bbf9",
+      "committed_at": "2026-10-14T16:31:20Z",
+      "subject": "Add an x86 PE whose jump table only targets other functions.",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }

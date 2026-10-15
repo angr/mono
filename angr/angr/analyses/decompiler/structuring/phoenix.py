@@ -1537,8 +1537,12 @@ class PhoenixStructurer(StructurerBase):
         nodes = {(nn.addr, nn.idx if isinstance(nn, Block) else None): nn for nn in graph_raw.successors(node)}
         successors: set[int] = set()
         case_nodes: set[int] = set()
+        # cases targeting the region head or the switch head become gotos (see _switch_build_cases)
+        goto_case_addrs = {self._region.head.addr, node.addr}
         for _, _, case_target_addr, case_target_idx, _ in last_stmt.case_addrs:
             case_nodes.add(case_target_addr)
+            if case_target_addr in goto_case_addrs:
+                continue
             case_node = nodes.get((case_target_addr, case_target_idx))
             if case_node is None:
                 continue
@@ -2576,10 +2580,17 @@ class PhoenixStructurer(StructurerBase):
         # enclosing loop head) are represented as goto-cases inside scnode, but the head's direct edges to them
         # remain and would prevent the head+scnode chain from ever collapsing. shift those edges onto the switch
         # node, mirroring the out_dst_succ handling above.
+        # the same applies to a case that jumps back to the region head: it is a goto-case inside scnode too.
+        region_head = self._region.head
         for t in list(full_graph.successors(head)):
-            if t is scnode or t in graph or (node_a is not None and t is node_a):
+            if t is scnode or (node_a is not None and t is node_a):
                 continue
-            self._region.remove_edge_with_successors_only(head, t)
+            if t in graph:
+                if t is not region_head or head is region_head:
+                    continue
+                self._region.detach_edge(head, t)
+            else:
+                self._region.remove_edge_with_successors_only(head, t)
             if not full_graph.has_edge(scnode, t):
                 self._region.add_edge(scnode, t)
 
@@ -2622,7 +2633,10 @@ class PhoenixStructurer(StructurerBase):
             return set()
         switch_case_dispatch_nodes = set()
         for node in graph:
-            if node.addr in self.jump_tables:
+            # see if this node belongs to a jump table construct *and* whose successors have been resolved
+            # the latter is important because all switch handlers in Phoenix only handles properly resolved switch-case
+            # dispatch nodes.
+            if node.addr in self.jump_tables and self.jump_tables[node.addr].jumptable_entries:
                 # maybe it has been structured?
                 try:
                     last_stmts = self.cond_proc.get_last_statements(node)
@@ -2725,29 +2739,37 @@ class PhoenixStructurer(StructurerBase):
             full_graph.in_degree[end_node] == 1
             and not self._has_pending_back_edge(full_graph_raw, end_node)
             and not full_graph.has_edge(end_node, start_node)
-            and not self._is_switch_cases_address_loaded_from_memory_head_or_jumpnode(full_graph, start_node)
             and end_node not in self.dowhile_known_tail_nodes
         ):
-            new_seq = None
-            if not self._is_switch_cases_address_loaded_from_memory_head_or_jumpnode(full_graph, end_node):
-                # merge two blocks
-                new_seq = self._merge_nodes(start_node, end_node)
-            elif isinstance(end_node, IncompleteSwitchCaseNode):
-                if any(start_node.addr in (table.jumptable_entries or ()) for table in self.jump_tables.values()):
-                    # Absorption keeps the inner dispatch address, hiding this entry from an enclosing switch.
-                    return False
-                # a special case where there is a node between the actual switch-case head and the jump table
-                # head
-                # binary 7995a0325b446c462bdb6ae10b692eee2ecadd8e888e9d7729befe4412007afb, function 0x1400326C0
-                # keep the IncompleteSwitchCaseNode, and merge two blocks into the head of the IncompleteSwitchCaseNode.
-                new_seq = self._merge_nodes(start_node, end_node.head)
-                new_seq.addr = end_node.addr
-                end_node.head = new_seq
-                new_seq = end_node
+            # check if start_node is a switch-case head (in which case we need to wait for switch handlers to structure
+            # this node), or if end_node has no successors in the full graph (in which case we should structure
+            # start_node and end_node into a sequence node because no switch handlers will be able to handle this case).
+            if not self._is_switch_cases_address_loaded_from_memory_head_or_jumpnode(full_graph, start_node) or (
+                self._parent_region is None and full_graph.out_degree[end_node] == 0
+            ):
+                new_seq = None
+                if not self._is_switch_cases_address_loaded_from_memory_head_or_jumpnode(full_graph, end_node):
+                    # merge two blocks
+                    new_seq = self._merge_nodes(start_node, end_node)
+                elif isinstance(end_node, IncompleteSwitchCaseNode):
+                    if any(start_node.addr in (table.jumptable_entries or ()) for table in self.jump_tables.values()):
+                        # Absorption keeps the inner dispatch address, hiding this entry from an enclosing switch.
+                        return False
+                    # a special case where there is a node between the actual switch-case head and the jump table
+                    # head
+                    # binary 7995a0325b446c462bdb6ae10b692eee2ecadd8e888e9d7729befe4412007afb, function 0x1400326C0
+                    # keep the IncompleteSwitchCaseNode, and merge two blocks into the head of the IncompleteSwitchCaseNode.
+                    new_seq = self._merge_nodes(start_node, end_node.head)
+                    new_seq.addr = end_node.addr
+                    end_node.head = new_seq
+                    new_seq = end_node
+                elif self._parent_region is None and full_graph.out_degree[end_node] == 0:
+                    # no switch handler will match a dispatch node without successors
+                    new_seq = self._merge_nodes(start_node, end_node)
 
-            if new_seq is not None:
-                self.replace_nodes_both(start_node, new_seq, old_node_1=end_node)
-                return True
+                if new_seq is not None:
+                    self.replace_nodes_both(start_node, new_seq, old_node_1=end_node)
+                    return True
         return False
 
     def _match_acyclic_ite(self, graph_raw, full_graph_raw, start_node, graph_head) -> bool:
@@ -3485,23 +3507,25 @@ class PhoenixStructurer(StructurerBase):
             for i, nn in enumerate(unreachable_nodes):
                 node_seq[nn] = max_seq + i
 
+        def _pick_edge(edges: list) -> tuple[Any, Any]:
+            preferred = [edge for edge in edges if edge not in switch_head_edges]
+            edges = self._order_virtualizable_edges(full_graph, preferred or edges, node_seq)
+            # the in-degree test above misses back edges: dst may only stay reachable through a loop that is
+            # itself entered via dst, so prefer an edge whose removal keeps dst reachable from the head
+            for src, dst in edges:
+                if dst not in graph or self._reachable_without_edges(full_graph, head, dst, {(src, dst)}):
+                    return src, dst
+            return edges[0]
+
         if all_edges_wo_dominance:
-            preferred = [edge for edge in all_edges_wo_dominance if edge not in switch_head_edges]
-            all_edges_wo_dominance = self._order_virtualizable_edges(
-                full_graph, preferred or all_edges_wo_dominance, node_seq
-            )
-            # virtualize the first edge
-            src, dst = all_edges_wo_dominance[0]
+            src, dst = _pick_edge(all_edges_wo_dominance)
             if not self._virtualize_edge(src, dst):
                 return self._on_virtualize_edge_failure(src, dst)
             l.debug("last_resort: Removed edge %r -> %r (type 1)", src, dst)
             return True
 
         if secondary_edges:
-            preferred = [edge for edge in secondary_edges if edge not in switch_head_edges]
-            secondary_edges = self._order_virtualizable_edges(full_graph, preferred or secondary_edges, node_seq)
-            # virtualize the first edge
-            src, dst = secondary_edges[0]
+            src, dst = _pick_edge(secondary_edges)
             if not self._virtualize_edge(src, dst):
                 return self._on_virtualize_edge_failure(src, dst)
             l.debug("last_resort: Removed edge %r -> %r (type 2)", src, dst)
@@ -3636,6 +3660,11 @@ class PhoenixStructurer(StructurerBase):
             not isinstance(last_stmt.target, Const) or last_stmt.target.value == target_addr
         ):
             # the jump already goes to dst
+            pass
+        elif isinstance(last_stmt, IncompleteSwitchCaseHeadStatement) and any(
+            case_target_addr == target_addr for _, _, case_target_addr, _, _ in last_stmt.case_addrs
+        ):
+            # the switch head keeps the case; _switch_build_cases() emits a goto for the detached entry
             pass
         else:
             # get_last_statement() may return a jump nested in a one-armed ConditionNode; the fall-through path still

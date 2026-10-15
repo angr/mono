@@ -38,6 +38,7 @@ from angr.analyses.decompiler.structurer_nodes import (
 )
 from angr.analyses.decompiler.utils import structured_node_is_simple_return
 from angr.analyses.decompiler.variable_map import VariableMap
+from angr.analyses.decompiler.x87_fsw import const_is_nan
 from angr.enums import Flavors
 from angr.errors import UnsupportedNodeTypeError
 from angr.go.codegen_builtins import render_builtin_call
@@ -49,6 +50,7 @@ from angr.go.sim_type import (
     GoSimType,
     GoSimTypeBool,
     GoSimTypeChan,
+    GoSimTypeFloat,
     GoSimTypeFunc,
     GoSimTypeFunction,
     GoSimTypeInt,
@@ -63,6 +65,8 @@ from angr.go.utils.names import split_go_method_name
 from angr.go.utils.types import go_type_name_at, simtype_signed
 from angr.knowledge_plugins.cfg.memory_data import MemoryData, MemoryDataSort
 from angr.knowledge_plugins.functions import Function
+from angr.protos import codegen_pb2  # pylint:disable=no-name-in-module  # pyright: ignore[reportAttributeAccessIssue]
+from angr.serializable import Serializable
 from angr.sim_type import (
     NamedTypeMixin,
     SimCppClass,
@@ -119,6 +123,7 @@ from .base import (
     ExpressionNode,
     FunctionCallNode,
     FunctionNode,
+    FunctionRef,
     IdentType,
     IndexedVariableNode,
     InstructionMapping,
@@ -131,6 +136,8 @@ from .base import (
     VariableNode,
     register_display_name,
 )
+from .c import _float32_repr
+from .utils import first_stmt_addr
 
 if TYPE_CHECKING:
     import archinfo
@@ -341,6 +348,17 @@ def _is_go_builtin_struct(ty) -> bool:
     return isinstance(ty, (GoSimTypeString, GoSimTypeSlice, GoSimTypeInterface, GoSimTypeTuple))
 
 
+def _is_descriptor_named_struct(ty) -> bool:
+    """A struct the binary or a library defines (a qualified Go name from DWARF, the type descriptors or the stdlib
+    database). Readers know these; only type inference's own ``struct_N`` structs are declared."""
+    return (
+        isinstance(ty, GoSimStruct)
+        and ty.go_name is not None
+        and not ty.go_name.startswith("struct_")
+        and not _is_go_builtin_struct(ty)
+    )
+
+
 def _is_anonymous_struct_or_union(ty) -> bool:
     """
     Returns True if ``ty`` is an anonymous struct or union.
@@ -362,6 +380,9 @@ def go_type_str(ty: SimType | None, memo: set[int] | None = None) -> str:
         return "<missing-type>"
     if isinstance(ty, GoSimType):
         return ty.go_repr()
+    if isinstance(ty, SimTypeRef) and ty.name is not None:
+        # a reference to a named type, e.g. a library type in a prototype
+        return ty.name
     if isinstance(ty, SimTypeBottom):
         return "any"
     if isinstance(ty, SimTypePointer):
@@ -535,6 +556,9 @@ def _recursively_collect_referenced_structs(ty, out: dict[int, SimStruct], _seen
             # known to the reader, not worth a definition in every function
             return
         out[id(ty)] = ty
+        if _is_descriptor_named_struct(ty):
+            # declared by the binary or a library: never emitted, and nothing inferred hides inside it
+            return
         for ftype in ty.fields.values():
             _recursively_collect_referenced_structs(ftype, out, _seen=_seen)
     elif isinstance(ty, SimUnion):
@@ -977,6 +1001,8 @@ class GoFunction(GoConstruct, FunctionNode):  # pylint:disable=abstract-method
             for ty in local_types:
                 if isinstance(ty, SimStruct):
                     name_to_structtypes[ty.name] = ty
+                    if _is_descriptor_named_struct(ty):
+                        continue
                     for field in _iter_struct_union_member_types(ty):
                         if isinstance(field, SimTypePointer):
                             if isinstance(field.pts_to, (SimTypeArray, SimTypeFixedSizeArray)):
@@ -1013,6 +1039,7 @@ class GoFunction(GoConstruct, FunctionNode):  # pylint:disable=abstract-method
                     or _is_anonymous_struct_or_union(ty)
                     or not ty.fields
                     or _is_go_builtin_struct(ty)
+                    or _is_descriptor_named_struct(ty)
                     or ty.name not in referenced_struct_names
                 ):
                     continue
@@ -1055,6 +1082,8 @@ class GoFunction(GoConstruct, FunctionNode):  # pylint:disable=abstract-method
             # Discover all nested structs
             # we rely on the behavior that if you extend a list while it is iterating you will see those values
             for ty in extern_types:  # pylint:disable=modified-iterating-list
+                if _is_descriptor_named_struct(ty):
+                    continue
                 for field in ty.fields.values():
                     field = unpack_typeref(field)
                     while isinstance(field, (SimTypePointer, SimTypeArray, SimTypeFixedSizeArray)):
@@ -1069,7 +1098,12 @@ class GoFunction(GoConstruct, FunctionNode):  # pylint:disable=abstract-method
 
             # Emit in reverse order: nested structs first
             for ty in reversed(extern_types):
-                if ty.name in defined_struct_names or not ty.fields or _is_go_builtin_struct(ty):
+                if (
+                    ty.name in defined_struct_names
+                    or not ty.fields
+                    or _is_go_builtin_struct(ty)
+                    or _is_descriptor_named_struct(ty)
+                ):
                     continue
                 defined_struct_names.add(ty.name)
                 yield from type_to_go_repr_chunks(
@@ -1210,6 +1244,33 @@ class GoFunction(GoConstruct, FunctionNode):  # pylint:disable=abstract-method
         return reg_vars + stack_vars + mem_vars
 
 
+# AIL float unop -> (math function, extra constant args)
+_GO_MATH_UNOPS: dict[str, tuple[str, tuple[int, ...]]] = {
+    "IsNaN": ("math.IsNaN", ()),
+    "IsInf": ("math.IsInf", (0,)),
+    "SignBit": ("math.Signbit", ()),
+    "Sqrt": ("math.Sqrt", ()),
+    "Abs": ("math.Abs", ()),
+    "Floor": ("math.Floor", ()),
+    "Ceil": ("math.Ceil", ()),
+    "Trunc": ("math.Trunc", ()),
+    "RoundEven": ("math.RoundToEven", ()),
+    # Go code never leaves the default round-to-nearest-even mode
+    "Rint": ("math.RoundToEven", ()),
+    "RoundAway": ("math.Round", ()),
+}
+_GO_MATH_PREDICATES = frozenset({"IsNaN", "IsInf", "SignBit"})
+# VEX IRRoundingMode constants
+_GO_ROUND_UNOPS = {0: "RoundEven", 1: "Floor", 2: "Ceil", 3: "Trunc", 4: "RoundAway"}
+
+
+def _go_round_unop(rm: Expr.Expression) -> str | None:
+    """The math unop for AIL ``Round(rm, x)``; the dynamic mode is round-to-nearest-even in Go."""
+    if isinstance(rm, Expr.Const):
+        return _GO_ROUND_UNOPS.get(rm.value) if isinstance(rm.value, int) else None
+    return "Rint"
+
+
 _GO_CMP_SWAP = {
     "CmpEQ": "CmpEQ",
     "CmpNE": "CmpNE",
@@ -1338,7 +1399,8 @@ class GoStatements(GoStatement):
         super().__init__(**kwargs)
 
         self.statements = statements
-        self.addr = addr
+        # a list built by rewriting passes (not from a structurer node) takes its first statement's address
+        self.addr = addr if addr is not None else first_stmt_addr(statements)
 
     def c_repr_chunks(self, indent=0, asexpr=False):
         indent_str = self.indent_str(indent)
@@ -2050,8 +2112,9 @@ class GoFunctionCall(GoExpression, FunctionCallNode):
     """
 
     __slots__ = (
+        "_callee_func",
+        "_callee_func_addr",
         "args",
-        "callee_func",
         "callee_target",
         "show_demangled_name",
         "show_disambiguated_name",
@@ -2073,12 +2136,33 @@ class GoFunctionCall(GoExpression, FunctionCallNode):
         super().__init__(tags=tags, codegen=codegen, **kwargs)
 
         self.callee_target = callee_target
-        self.callee_func: Function | None = callee_func
+        self.callee_func = callee_func
         self.args = args if args is not None else []
         self.show_demangled_name = show_demangled_name
         self.show_disambiguated_name = show_disambiguated_name
         # the result type of the call-site prototype (builtins and rewritten runtime calls)
         self.site_returnty: SimType | None = None
+
+    @property
+    def callee_func(self) -> Function | None:
+        # a parsed call holds only its callee's address until the callee is needed, so that parsing a decompilation
+        # does not load (and evict) functions
+        if self._callee_func is None and self._callee_func_addr is not None and self.codegen is not None:
+            func = self.codegen.resolve_callee(self._callee_func_addr)
+            if func is not None:
+                self._callee_func = func
+                self._callee_func_addr = None
+        return self._callee_func
+
+    @callee_func.setter
+    def callee_func(self, func: Function | None):
+        self._callee_func = func
+        self._callee_func_addr = None
+
+    @property
+    def callee_func_addr(self) -> int | None:
+        """The callee's address, without loading the callee."""
+        return self._callee_func.addr if self._callee_func is not None else self._callee_func_addr
 
     @property
     def prettify_thiscall(self) -> bool:
@@ -3101,7 +3185,7 @@ class GoTypeCast(GoExpression):
 
 class GoConstant(GoExpression, ConstantNode):
     __slots__ = (
-        "reference_values",
+        "_reference_values",
         "string_data",
         "value",
     )
@@ -3114,6 +3198,35 @@ class GoConstant(GoExpression, ConstantNode):
         self.reference_values = reference_values
         # the exact Go string a constant data pointer starts, once its paired length is known
         self.string_data: str | None = None
+
+    @property
+    def reference_values(self) -> dict | None:
+        # a parsed constant carries a referenced function by address (FunctionRef) until the function is needed
+        refs = self._reference_values
+        if (
+            refs
+            and self.codegen is not None
+            and self.codegen.kb is not None
+            and any(isinstance(v, FunctionRef) for v in refs.values())
+        ):
+            resolved = {}
+            for ty, v in refs.items():
+                if isinstance(v, FunctionRef):
+                    v = self.codegen.resolve_callee(v.addr)
+                    if v is None:
+                        continue
+                resolved[ty] = v
+            self._reference_values = refs = resolved
+        return refs
+
+    @reference_values.setter
+    def reference_values(self, value: dict | None) -> None:
+        self._reference_values = value
+
+    @property
+    def raw_reference_values(self) -> dict | None:
+        """The reference values, without loading the functions a parsed constant refers to."""
+        return self._reference_values
 
     @property
     def _ident(self) -> IdentType:
@@ -3170,7 +3283,11 @@ class GoConstant(GoExpression, ConstantNode):
 
     @property
     def fmt_float(self):
-        return self.fmt.get("float", False)
+        result = self.fmt.get("float", None)
+        if result is None:
+            # an integer bit pattern of a float-typed constant is a float literal
+            result = isinstance(self.value, int) and _go_float_bits(self._type) == 32
+        return result
 
     @fmt_float.setter
     def fmt_float(self, v: bool):
@@ -3178,7 +3295,10 @@ class GoConstant(GoExpression, ConstantNode):
 
     @property
     def fmt_double(self):
-        return self.fmt.get("double", False)
+        result = self.fmt.get("double", None)
+        if result is None:
+            result = isinstance(self.value, int) and _go_float_bits(self._type) == 64
+        return result
 
     @fmt_double.setter
     def fmt_double(self, v: bool):
@@ -3320,7 +3440,7 @@ class GoConstant(GoExpression, ConstantNode):
         """
 
         if self.fmt_float and 0 < value <= 0xFFFF_FFFF:
-            return str(unpack("f", pack("I", value))[0])
+            return _float32_repr(unpack("f", pack("I", value))[0])
 
         if self.fmt_char:
             if value < 0:
@@ -3773,7 +3893,7 @@ class GoStructFieldNameDef:
         self.name = name
 
 
-class GoStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
+class GoStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializable):
     def __init__(
         self,
         func,
@@ -3902,7 +4022,8 @@ class GoStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
         self.map_pos_to_node = None
         self.map_pos_to_addr = None
         self.map_addr_to_pos = None
-        self.map_ast_to_pos: dict[SimVariable, set[PositionMappingElement]] | None = None
+        self.map_ast_to_pos = None
+        self._resolved_callees: dict[int, Function] = {}
         self.map_addr_to_label: dict[tuple[int, int | None], GoLabel] = {}
         self.cfunc: GoFunction | None = None
         self.cexterns: set[GoVariable] | None = None
@@ -5419,7 +5540,7 @@ class GoStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
         self,
         expr: Expr.Const,
         type_: SimType | None = None,
-        reference_values: dict[SimType | str, str | bytes | int | float | Function | GoExpression] | None = None,
+        reference_values: dict[SimType, str | bytes | int | float | Function | GoExpression] | None = None,
         variable=None,
         likely_signed=True,
         **kwargs,
@@ -5439,6 +5560,10 @@ class GoStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
             reference_values = {**expr_reference_values}
         if type_ is None and reference_values is not None and len(reference_values) == 1:  # type: ignore
             type_ = next(iter(reference_values))  # type: ignore
+
+        if isinstance(expr.value, float) and _go_float_bits(type_) is None:
+            # a float-valued constant cannot be rendered through an integer type
+            type_ = GoSimTypeFloat(expr.bits).with_arch(self.project.arch)
 
         if reference_values is None:
             reference_values = {}
@@ -5545,10 +5670,8 @@ class GoStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
             else:
                 var_access = self._access_constant_offset_reference(self._get_variable_reference(cvar), offset, None)
 
-        if var_access is not None:
-            if expr.value >= self.min_data_addr:
-                return var_access
-            reference_values["offset"] = var_access
+        if var_access is not None and expr.value >= self.min_data_addr:
+            return var_access
         return GoConstant(expr.value, type_, reference_values=reference_values, tags=expr.tags, codegen=self)
 
     def _handle_Expr_UnaryOp(self, expr, type_: SimType | None = None, **kwargs):
@@ -5558,6 +5681,12 @@ class GoStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
             ref = True
             if isinstance(type_, SimTypePointer) and not isinstance(type_.pts_to, SimTypeBottom):
                 data_type = type_.pts_to
+
+        if (expr.op in _GO_MATH_PREDICATES or expr.op == "IsFinite") or (
+            expr.op in _GO_MATH_UNOPS and expr.operand.bits in (32, 64)
+        ):
+            # vector operands are left alone
+            return self._math_unop(expr.op, expr.operand, expr.tags)
 
         operand = self._handle(expr.operand, lvalue=expr.op == "Reference", type_=data_type, ref=ref)
 
@@ -5571,6 +5700,50 @@ class GoStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
             codegen=self,
         )
 
+    def _math_call(self, op: str, operand: Expr.Expression, tags) -> GoExpression:
+        """``math.F(x)`` for a float unop; math works on float64, so a float32 operand is widened (and narrowed back)."""
+        fn, extra_args = _GO_MATH_UNOPS[op]
+        arch = self.project.arch
+        widened = (
+            isinstance(operand, Expr.Convert)
+            and operand.from_type == Expr.Convert.TYPE_FP
+            and operand.to_type == Expr.Convert.TYPE_FP
+            and operand.from_bits == 32
+            and operand.to_bits == 64
+        )
+        if widened:
+            # float64(x) of a float32 x; widened below
+            operand = operand.operand
+        single = operand.bits == 32
+        arg = self._handle(operand, type_=SimTypeFloat() if single else SimTypeDouble())
+        if single:
+            arg = GoTypeCast(None, SimTypeDouble(), arg, codegen=self)
+        args = [arg, *(GoConstant(v, SimTypeInt(), codegen=self) for v in extra_args)]
+        call = GoFunctionCall(fn, None, args, tags=tags, codegen=self)
+        predicate = op in _GO_MATH_PREDICATES
+        call.site_returnty = (GoSimTypeBool() if predicate else SimTypeDouble()).with_arch(arch)
+        if single and not predicate and not widened:
+            return GoTypeCast(None, SimTypeFloat(), call, codegen=self)
+        return call
+
+    def _math_unop(self, op: str, operand: Expr.Expression, tags) -> GoExpression:
+        if op == "IsFinite":
+            # no math.IsFinite
+            not_inf = GoUnaryOp("Not", self._math_call("IsInf", operand, tags), codegen=self)
+            not_nan = GoUnaryOp("Not", self._math_call("IsNaN", operand, tags), codegen=self)
+            return GoBinaryOp("LogicalAnd", not_inf, not_nan, tags=tags, codegen=self)
+        return self._math_call(op, operand, tags)
+
+    def _unordered(self, expr: BinaryOp) -> GoExpression:
+        """isunordered(a, b): math.IsNaN on each operand that can be NaN."""
+        a, b = expr.operands
+        terms = [a] if a.likes(b) else [a, b]
+        terms = [t for t in terms if not (isinstance(t, Expr.Const) and not const_is_nan(t))] or terms[:1]
+        r = self._math_call("IsNaN", terms[0], expr.tags)
+        if len(terms) == 2:
+            r = GoBinaryOp("LogicalOr", r, self._math_call("IsNaN", terms[1], expr.tags), tags=expr.tags, codegen=self)
+        return r
+
     def _handle_Expr_BinaryOp(self, expr: BinaryOp, **kwargs):
         expr_var = self._variable_map.variable(expr)
         if expr_var is not None:
@@ -5578,6 +5751,15 @@ class GoStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
             return self._access_constant_offset_reference(
                 self._get_variable_reference(cvar), self._variable_map.variable_offset(expr) or 0, None
             )
+
+        if expr.op == "CmpUN":
+            return self._unordered(expr)
+        if expr.floating_point and expr.op in {"CmpEQ", "CmpNE"} and expr.operands[0].likes(expr.operands[1]):
+            # the self-compare is the NaN test
+            isnan = self._math_call("IsNaN", expr.operands[0], expr.tags)
+            return isnan if expr.op == "CmpNE" else GoUnaryOp("Not", isnan, tags=expr.tags, codegen=self)
+        if expr.op == "Round" and (round_op := _go_round_unop(expr.operands[0])) is not None:
+            return self._math_call(round_op, expr.operands[1], expr.tags)
 
         lhs = self._handle(expr.operands[0])
         rhs = self._handle(expr.operands[1], likely_signed=expr.op not in {"And", "Or"})
@@ -5617,8 +5799,14 @@ class GoStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
     def _handle_Expr_Convert(self, expr: Expr.Convert, **kwargs):
         child = self._handle(expr.operand)
 
+        from_fp = expr.from_type == Expr.ConvertType.TYPE_FP
+        if expr.to_type == Expr.ConvertType.TYPE_FP and expr.to_bits in (32, 64):
+            # INT->FP or FP->FP
+            dst_fp = GoSimTypeFloat(expr.to_bits).with_arch(self.project.arch)
+            return GoTypeCast(None, dst_fp, child, tags=expr.tags, codegen=self)
+
         # Use a mask to represent non-standard size conversions
-        if expr.to_bits < expr.from_bits and expr.to_bits not in _CAST_TYPES_BY_BITS:
+        if not from_fp and expr.to_bits < expr.from_bits and expr.to_bits not in _CAST_TYPES_BY_BITS:
             const_type = child.type if child.type is not None else self.default_simtype_from_bits(expr.from_bits, False)
             mask = GoConstant((1 << expr.to_bits) - 1, const_type, codegen=self, tags=expr.tags)
             return GoBinaryOp("And", child, mask, codegen=self, tags=expr.tags)
@@ -5632,7 +5820,7 @@ class GoStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
         orig_child_signed = simtype_signed(child.type, False)
 
         # signedness of converted type is hard
-        if expr.to_bits < expr.from_bits:
+        if expr.to_bits < expr.from_bits and not from_fp:
             # very sketchy. basically a guess
             # can we even generate signed downcasts?
             dst_type.signed = orig_child_signed | expr.is_signed
@@ -5640,7 +5828,12 @@ class GoStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
             dst_type.signed = expr.is_signed
 
         # do we need an intermediate cast?
-        if orig_child_signed != expr.is_signed and expr.to_bits > expr.from_bits and child.type is not None:
+        if (
+            not from_fp
+            and orig_child_signed != expr.is_signed
+            and expr.to_bits > expr.from_bits
+            and child.type is not None
+        ):
             # this is a problem. sign-extension only happens when the SOURCE of the cast is signed
             child_ty = self.default_simtype_from_bits(child.type.size, expr.is_signed)
             child = GoTypeCast(None, child_ty, child, codegen=self)
@@ -5856,6 +6049,42 @@ class GoStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
     #
     # Serialization
     #
+
+    @property
+    def map_ast_to_pos(self) -> dict[Any, set[PositionMappingElement]] | None:
+        # a parsed generator builds this on first use: its keys include the callees of calls, which are only loaded
+        # when needed
+        if self._map_ast_to_pos is None and self._map_ast_to_pos_pending:
+            self._map_ast_to_pos_pending = False
+            self._map_ast_to_pos = _go_serialize.rebuild_ast_to_pos(self.map_pos_to_node)
+        return self._map_ast_to_pos
+
+    @map_ast_to_pos.setter
+    def map_ast_to_pos(self, value: dict[Any, set[PositionMappingElement]] | None) -> None:
+        self._map_ast_to_pos = value
+        self._map_ast_to_pos_pending = False
+
+    def resolve_callee(self, addr: int) -> Function | None:
+        """The function at ``addr`` for a parsed call, the same object for every call to it."""
+        if self.kb is None:
+            return None
+        func = self._resolved_callees.get(addr)
+        if func is None:
+            func = self.kb.functions.function(addr)
+            if func is not None:
+                self._resolved_callees[addr] = func
+        return func
+
+    @classmethod
+    def _get_cmsg(cls):
+        return codegen_pb2.Codegen()  # pylint:disable=no-member
+
+    def serialize_to_cmessage(self):
+        return _go_serialize.serialize_codegen(self)
+
+    @classmethod
+    def parse_from_cmessage(cls, cmsg, *, project=None, kb=None, func=None, **kwargs):
+        return _go_serialize.parse_codegen(cmsg, project=project, kb=kb, func=func)
 
 
 class GoStructuredCodeWalker:
@@ -6658,6 +6887,14 @@ def _go_is_word_group(ty) -> bool:
         and bool(ty.fields)
         and all(n == f"W{i}" for i, n in enumerate(ty.fields))
     )
+
+
+def _go_float_bits(ty) -> int | None:
+    """The width of a float32/float64 type (Go or C flavored), else None."""
+    ty = unpack_typeref(ty)
+    if isinstance(ty, SimTypeFloat) and ty.size in (32, 64):
+        return ty.size
+    return None
 
 
 def _go_is_int_type(ty) -> bool:
@@ -7840,8 +8077,10 @@ class ITEHoisting:
                 obj = super().handle_GoITE(obj)  # inner ITEs first
                 ty = obj.type if obj.type is not None else SimTypeLongLong()
                 tmp = hoister._fresh(ty)
-                then = GoStatements([GoAssignment(tmp, obj.iftrue, codegen=codegen)], codegen=codegen)
-                other = GoStatements([GoAssignment(tmp, obj.iffalse, codegen=codegen)], codegen=codegen)
+                # the branches hold fresh untagged assignments; they belong to the ITE's instruction
+                ite_addr = (obj.tags or {}).get("ins_addr")
+                then = GoStatements([GoAssignment(tmp, obj.iftrue, codegen=codegen)], addr=ite_addr, codegen=codegen)
+                other = GoStatements([GoAssignment(tmp, obj.iffalse, codegen=codegen)], addr=ite_addr, codegen=codegen)
                 prelude.append(GoIfElse([(obj.cond, then)], else_node=other, tags=obj.tags, codegen=codegen))
                 return tmp
 
@@ -11010,3 +11249,10 @@ class PointerArithmeticFixer(GoStructuredCodeWalker):
 
 # StructuredCodeGenerator = GoStructuredCodeGenerator
 register_analysis(GoStructuredCodeGenerator, "GoStructuredCodeGenerator")
+
+
+# Register protobuf serializer/parser pairs for every concrete GoConstruct subclass. Imported after all classes are
+# defined so that ``go_serialize.register_all`` can reference them by name.
+from . import go_serialize as _go_serialize  # pylint: disable=wrong-import-position
+
+_go_serialize.register_all()

@@ -125,6 +125,7 @@ from .sse_intrinsics import (
     vector_op_intrinsic,
     vector_op_kind,
 )
+from .utils import first_stmt_addr
 
 if TYPE_CHECKING:
     import archinfo
@@ -1273,7 +1274,8 @@ class CStatements(CStatement):
         super().__init__(**kwargs)
 
         self.statements = statements
-        self.addr = addr
+        # a list built by codegen passes (not from a structurer node) takes its first statement's address
+        self.addr = addr if addr is not None else first_stmt_addr(statements)
 
     def c_repr_chunks(self, indent=0, asexpr=False):
         indent_str = self.indent_str(indent)
@@ -6166,6 +6168,11 @@ class CStructuredCodeWalker:
         obj.cond = self.handle(obj.cond)
         obj.iftrue = self.handle(obj.iftrue)
         obj.iffalse = self.handle(obj.iffalse)
+        return obj
+
+    def handle_CMultiStatementExpression(self, obj):
+        obj.stmts = self.handle(obj.stmts)
+        obj.expr = self.handle(obj.expr)
         return obj
 
     def handle_CVectorConvert(self, obj):
