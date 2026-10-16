@@ -119,13 +119,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-15T02:51:50+00:00",
+  "imported_at": "2026-10-16T02:54:39+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "ae51d542d1d0e08c01a203a2771df30d8648bbf9",
-      "committed_at": "2026-10-14T16:31:20Z",
-      "subject": "Add an x86 PE whose jump table only targets other functions.",
+      "commit": "31c99e07000bea2b25b9ba39ceea7b5ddf05a1df",
+      "committed_at": "2026-10-15T15:54:54Z",
+      "subject": "Add Go (age) and Rust (grex) binaries for the angr.io decompilation showcase.",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
