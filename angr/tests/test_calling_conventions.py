@@ -14,6 +14,7 @@ from angr import Project, calling_conventions, load_shellcode, types
 from angr.calling_conventions import (
     SimArrayArg,
     SimCC,
+    SimCCAArch64,
     SimCCARM,
     SimCCARMHF,
     SimCCARMLinuxSyscall,
@@ -25,6 +26,8 @@ from angr.calling_conventions import (
     SimCCN32LinuxSyscall,
     SimCCN64,
     SimCCN64LinuxSyscall,
+    SimCCPowerPC,
+    SimCCPowerPC64,
     SimCCRISCV64,
     SimCCS390X,
     SimCCStdcall,
@@ -41,7 +44,7 @@ from angr.calling_conventions import (
     SimTypeInt,
     default_cc,
 )
-from angr.engines.pcode.cc import SimCCPARISC
+from angr.engines.pcode.cc import SimCCPARISC, SimCCSPARC
 from angr.errors import AngrTypeError
 from angr.procedures import SIM_LIBRARIES
 from angr.sim_type import (
@@ -52,6 +55,7 @@ from angr.sim_type import (
     SimTypeBottom,
     SimTypeChar,
     SimTypeDouble,
+    SimTypeInt128,
     SimTypeLongDouble,
     SimTypeLongLong,
     SimTypeNum,
@@ -412,6 +416,33 @@ class TestCallingConvention(TestCase):
             cc, [SimTypePointer(SimTypeChar()), TypeRef("int64_t", SimTypeLongLong()), SimTypeInt()]
         ) == [[SimStackArg(0x4, 4)], [SimStackArg(0x8, 4), SimStackArg(0xC, 4)], [SimStackArg(0x10, 4)]]
 
+    def test_opaque_cpp_class_argument_is_placed_like_an_integer(self):
+        # sim_type invents one of these for a class a demangled C++ name mentions and angr never
+        # saw the definition of: no members, and a size forced to one word.
+        def locs(cc, arch, arg_ty):
+            proto = SimTypeFunction([SimTypeInt(), arg_ty], SimTypeInt()).with_arch(arch)
+            return [loc.get_footprint() for loc in cc.arg_locs(proto)]
+
+        # conventions that inherit SimCC.next_arg rather than overriding it, so the placement
+        # below is the base method's and not an ABI override's
+        for arch, cc_cls in (
+            (archinfo.ArchPPC32(), SimCCPowerPC),
+            (archinfo.ArchPPC64(), SimCCPowerPC64),
+            (archinfo.ArchMIPS64(), SimCCN64),
+            (archinfo.ArchMIPSN32(), SimCCN32),
+            (archinfo.ArchPcode("sparc:BE:32:default"), SimCCSPARC),
+        ):
+            cc = cc_cls(arch)
+            opaque = SimCppClass(unique_name="Opaque", name="Opaque", members={}, size=32)
+            placed = locs(cc, arch, opaque)
+            assert placed == locs(cc, arch, SimTypeNum(32)), f"{arch.name}: {placed}"
+
+            # a class angr does have the members of is a real aggregate, and a convention that has
+            # not been taught how to lay one out still says so
+            pair = SimStruct({"a": SimTypeInt(), "b": SimTypeInt()}, name="Pair")
+            with self.assertRaises(TypeError):
+                locs(cc, arch, pair)
+
     def _mips_int_arg_locs(self, cc_cls, arch, arg_types):
         proto = SimTypeFunction(arg_types, SimTypeInt()).with_arch(arch)
         locs = []
@@ -544,6 +575,143 @@ class TestCallingConvention(TestCase):
         assert isinstance(return_val, SimRegArg)
         assert return_val.reg_name == "eax"
 
+    def _mips_arg_locs_text(self, cc_cls, arch, arg_types) -> list[str]:
+        """Where each argument goes, rendered: `a0+0:8`, `[sp+0x20]:8`, `combo(...)`, `{x=...}`."""
+        proto = SimTypeFunction(arg_types, SimTypeInt()).with_arch(arch)
+        return [self._mips_loc_text(loc) for loc in cc_cls(arch).arg_locs(proto)]
+
+    def _mips_loc_text(self, loc) -> str:
+        if isinstance(loc, SimRegArg):
+            return f"{loc.reg_name}+{loc.reg_offset}:{loc.size}"
+        if isinstance(loc, SimStackArg):
+            return f"[sp+{loc.stack_offset:#x}]:{loc.size}"
+        if isinstance(loc, SimComboArg):
+            return "combo(" + ", ".join(self._mips_loc_text(x) for x in loc.locations) + ")"
+        if isinstance(loc, SimStructArg):
+            return "{" + ", ".join(f"{k}={self._mips_loc_text(v)}" for k, v in loc.locs.items()) + "}"
+        return repr(loc)
+
+    def test_mips_n64_places_a_128_bit_scalar_in_an_even_register_pair(self):
+        # gcc 14.3.0 -mabi=64 passes a 128-bit scalar in two consecutive argument registers starting
+        # on an even-numbered slot, so f(u64 x 3, __int128) uses a4:a5 and leaves a3 unused.
+        for endness in (archinfo.Endness.BE, archinfo.Endness.LE):
+            arch = archinfo.ArchMIPS64(endness)
+            assert self._mips_arg_locs_text(SimCCN64, arch, [SimTypeInt128()]) == ["combo(a0+0:8, a1+0:8)"]
+            assert self._mips_arg_locs_text(SimCCN64, arch, [SimTypeLongLong(), SimTypeInt128()]) == [
+                "a0+0:8",
+                "combo(a2+0:8, a3+0:8)",
+            ]
+            assert self._mips_arg_locs_text(SimCCN64, arch, [SimTypeLongLong()] * 3 + [SimTypeInt128()]) == [
+                "a0+0:8",
+                "a1+0:8",
+                "a2+0:8",
+                "combo(a4+0:8, a5+0:8)",
+            ]
+
+    def test_mips_n64_straddles_the_last_register_into_the_stack(self):
+        # An aggregate aligns to one slot, so f(u64 x 6, struct {u64 x 3}) puts the struct in a6, a7
+        # and the first stack slot rather than moving all of it to the stack.
+        three_words = SimStruct(
+            {"x": SimTypeLongLong(), "y": SimTypeLongLong(), "z": SimTypeLongLong()}, name="three_words"
+        )
+        args = [SimTypeLongLong()] * 6 + [three_words]
+        for endness in (archinfo.Endness.BE, archinfo.Endness.LE):
+            locs = self._mips_arg_locs_text(SimCCN64, archinfo.ArchMIPS64(endness), args)
+            assert locs[5] == "a5+0:8"
+            # The stack offset is where this convention's STACKARG_SP_BUFF puts the first stack
+            # slot, which this change does not touch; what matters here is the straddle.
+            assert locs[6].startswith("{x=a6+0:8, y=a7+0:8, z=[sp+")
+
+    def test_mips_n64_pads_a_16_byte_aligned_argument_past_the_last_register(self):
+        # The even-slot rule applies to the stack slots too: after seven 64-bit arguments the next
+        # slot is a7, which is odd, so gcc leaves a7 unused and passes the whole 128-bit value in
+        # the first two stack slots.
+        args = [SimTypeLongLong()] * 7 + [SimTypeInt128()]
+        for endness in (archinfo.Endness.BE, archinfo.Endness.LE):
+            locs = self._mips_arg_locs_text(SimCCN64, archinfo.ArchMIPS64(endness), args)
+            assert locs[6] == "a6+0:8"
+            assert locs[7] == "combo([sp+0x20]:8, [sp+0x28]:8)"
+
+    def test_mips_n64_passes_an_aggregate_by_value_in_slots(self):
+        # Nothing is passed by reference on n64: a 16-byte struct arrives in a0:a1 and a 24-byte one
+        # after a u64 in a1:a2:a3, each field at its own offset inside those slots.
+        two_words = SimStruct({"x": SimTypeLongLong(), "y": SimTypeLongLong()}, name="two_words")
+        three_words = SimStruct(
+            {"x": SimTypeLongLong(), "y": SimTypeLongLong(), "z": SimTypeLongLong()}, name="three_words"
+        )
+        for endness in (archinfo.Endness.BE, archinfo.Endness.LE):
+            arch = archinfo.ArchMIPS64(endness)
+            assert self._mips_arg_locs_text(SimCCN64, arch, [two_words]) == ["{x=a0+0:8, y=a1+0:8}"]
+            assert self._mips_arg_locs_text(SimCCN64, arch, [SimTypeLongLong(), three_words]) == [
+                "a0+0:8",
+                "{x=a1+0:8, y=a2+0:8, z=a3+0:8}",
+            ]
+
+    def test_mips_n64_packs_a_sub_slot_struct_field_at_its_own_offset(self):
+        # A 12-byte struct of three ints arrives in a0 and the leading four bytes of a1, which on
+        # big-endian is where the struct's bytes 8-11 sit: clang reads the third field with
+        # `dsra32 $2, $5, 0`.
+        three_ints = SimStruct({"a": SimTypeInt(), "b": SimTypeInt(), "c": SimTypeInt()}, name="three_ints")
+        for endness in (archinfo.Endness.BE, archinfo.Endness.LE):
+            arch = archinfo.ArchMIPS64(endness)
+            assert self._mips_arg_locs_text(SimCCN64, arch, [three_ints]) == ["{a=a0+0:4, b=a0+4:4, c=a1+0:4}"]
+
+    def test_mips_n64_leaves_a_floating_point_member_to_the_base_class(self):
+        # A slot holding one double travels in f12-f19, which SimCCN64 does not declare, so placing
+        # it in a general register would be wrong: clang reads `struct {double a; u64 b;}` as f12
+        # and a1.
+        with_double = SimStruct({"a": SimTypeDouble(), "b": SimTypeLongLong()}, name="with_double")
+        arch = archinfo.ArchMIPS64(archinfo.Endness.BE)
+        self.assertRaises(TypeError, self._mips_arg_locs_text, SimCCN64, arch, [with_double])
+
+    def _mips_base_and_override(self, cc, ty) -> tuple[str, str]:
+        """What SimCC.next_arg and the convention's own next_arg each do with one type."""
+        out = []
+        for method in (SimCC.next_arg, type(cc).next_arg):
+            try:
+                out.append(self._mips_loc_text(method(cc, cc.ArgSession(cc), ty.with_arch(cc.arch))))
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                out.append(f"{type(exc).__name__}: {exc}")
+        return out[0], out[1]
+
+    def test_mips_n64_hands_an_aggregate_with_no_layout_back_to_the_base_class(self):
+        # An opaque class has a size and no members to place, and SimStruct.offsets silently drops a
+        # member with no size, so laying that struct out would raise KeyError out of
+        # refine_locs_with_struct_type. SimCCN64 declines both and lets the base class answer, so
+        # what this asserts is the delegation: whatever SimCC does with them, n64 does the same.
+        # Asserting the refusal itself would break whoever teaches the base class to place one.
+        cc = SimCCN64(archinfo.ArchMIPS64(archinfo.Endness.BE))
+        for ty in (
+            SimCppClass(unique_name="Opaque", name="Opaque", members={}, size=32),
+            SimStruct({"a": SimTypeLongLong(), "b": SimTypeBottom()}, name="unsized"),
+            SimStruct({"a": SimTypeDouble(), "b": SimTypeLongLong()}, name="with_double"),
+        ):
+            base, override = self._mips_base_and_override(cc, ty)
+            assert base == override, f"{ty}: base {base} != n64 {override}"
+
+    def test_mips_n64_declines_a_wide_argument_after_a_floating_point_one(self):
+        # FP_ARG_REGS is empty, so the base class spends a stack slot on a double while a0-a7 are
+        # still free. The slot sequence this convention walks no longer describes the session, so it
+        # declines rather than guessing: any slot it picked for the wide value would depend on where
+        # the double went, which this convention cannot say.
+        arch = archinfo.ArchMIPS64(archinfo.Endness.BE)
+        self.assertRaises(ValueError, self._mips_arg_locs_text, SimCCN64, arch, [SimTypeDouble(), SimTypeInt128()])
+
+    def test_mips_n32_places_a_wide_argument_like_n64(self):
+        # n32 uses the same 64-bit argument slots in a register file archinfo calls 32-bit, so the
+        # slots have to be split into words before a struct is laid out across them.
+        two_words = SimStruct({"x": SimTypeLongLong(), "y": SimTypeLongLong()}, name="two_words")
+        for endness in (archinfo.Endness.BE, archinfo.Endness.LE):
+            n32_arch = archinfo.ArchMIPSN32(endness)
+            n64_arch = archinfo.ArchMIPS64(endness)
+            assert self._mips_arg_locs_text(SimCCN32, n32_arch, [SimTypeInt128()]) == [
+                "combo(a0+0:4, a0+4:4, a1+0:4, a1+4:4)"
+            ]
+            assert self._mips_arg_locs_text(SimCCN32, n32_arch, [two_words]) == [
+                "{x=combo(a0+0:4, a0+4:4), y=combo(a1+0:4, a1+4:4)}"
+            ]
+            assert self._mips_arg_locs_text(SimCCN64, n64_arch, [two_words]) == ["{x=a0+0:8, y=a1+0:8}"]
+
     def test_x86_cdecl_array_and_union_return(self):
         arch = archinfo.arch_from_id("x86")
         conventions = (SimCCCdecl(arch), SimCCMicrosoftCdecl(arch), SimCCStdcall(arch))
@@ -633,6 +801,76 @@ class TestCallingConvention(TestCase):
             [SimRegArg("edx", 4)],
             [SimStackArg(0x4, 4)],
         ]
+
+    def test_return_too_wide_for_one_register_names_the_convention(self):
+        # A return type wider than RETURN_VAL used to hit `assert self.OVERFLOW_RETURN_VAL is not None`,
+        # so a convention that declares no second return register failed with an AssertionError carrying
+        # no message at all -- and under python -O, with the assert gone, with an AttributeError from
+        # SimComboArg.__init__ summing the size of a None.
+        arch = archinfo.arch_from_id("aarch64")
+        cc = SimCCAArch64(arch)
+        with self.assertRaises(AngrTypeError) as caught:
+            cc.return_val(SimTypeNum(128).with_arch(arch))
+        message = str(caught.exception)
+        assert "SimCCAArch64" in message
+        assert "OVERFLOW_RETURN_VAL" in message
+
+    def test_microsoft_amd64_array_return(self):
+        # Regression test: an array is an aggregate, and the Microsoft x64 convention returns one the
+        # way it returns a struct of the same size. Only return_val said otherwise, so a caller of a
+        # function whose recovered return type was an array decompiled to nothing. The sizes are the
+        # ones type inference produced on a real Windows x86-64 binary: unsigned int[2] and [4].
+        arch = archinfo.ArchAMD64()
+        cc = SimCCMicrosoftAMD64(arch)
+
+        small = SimTypeFixedSizeArray(SimTypeInt(), 2).with_arch(arch)
+        large = SimTypeFixedSizeArray(SimTypeInt(), 4).with_arch(arch)
+        small_struct = SimStruct({"a": SimTypeInt(), "b": SimTypeInt()}, name="two").with_arch(arch)
+        large_struct = SimStruct({f"f{i}": SimTypeInt() for i in range(4)}, name="four").with_arch(arch)
+
+        # Eight bytes come back in RAX, one element per half -- the same two locations a struct of
+        # the same layout gets. Compared as locations, not as footprints: SimStructArg.get_footprint
+        # coalesces a register's pieces into one span and SimArrayArg.get_footprint does not, so the
+        # footprints differ for identical placements.
+        small_ret = cc.return_val(small)
+        small_struct_ret = cc.return_val(small_struct)
+        assert isinstance(small_ret, SimArrayArg)
+        assert isinstance(small_struct_ret, SimStructArg)
+        assert small_ret.locs == [SimRegArg("rax", 4, 0), SimRegArg("rax", 4, 4)]
+        assert small_ret.locs == list(small_struct_ret.locs.values())
+        assert cc.return_in_implicit_outparam(small) is False
+
+        # Sixteen bytes do not fit, so the caller passes a hidden pointer in RCX and the callee
+        # returns it in RAX. Both are the struct's answer for the same size.
+        large_ret = cc.return_val(large)
+        returned = cc.return_val(large, perspective_returned=True)
+        large_struct_ret = cc.return_val(large_struct)
+        assert isinstance(large_ret, SimReferenceArgument)
+        assert isinstance(returned, SimReferenceArgument)
+        assert isinstance(large_struct_ret, SimReferenceArgument)
+        assert large_ret.ptr_loc == SimRegArg("rcx", 8)
+        assert returned.ptr_loc == SimRegArg("rax", 8)
+        assert set(large_ret.get_footprint()) == set(large_struct_ret.get_footprint())
+        assert cc.return_in_implicit_outparam(large) is True
+
+        # return_in_implicit_outparam already answered True for the array before this change, so
+        # arg_locs was shifting the declared arguments along for a return value return_val refused
+        # to place. The two now agree: the hidden pointer takes RCX and the arguments follow it.
+        proto = SimTypeFunction([SimTypeInt(), SimTypeInt()], large).with_arch(arch)
+        assert [list(loc.get_footprint()) for loc in cc.arg_locs(proto)] == [
+            [SimRegArg("rdx", 4)],
+            [SimRegArg("r8", 4)],
+        ]
+
+        # An array with no size has no layout to give, and the base class's refusal is the answer.
+        # SimTypeArray.size is 0 rather than None for a length-less array and that 0 propagates
+        # outwards, so a sized array holding an unsized one is refused as well.
+        unsized = SimTypeFixedSizeArray(SimTypeInt(), None).with_arch(arch)
+        nested = SimTypeFixedSizeArray(unsized, 2).with_arch(arch)
+        assert (unsized.size, nested.size) == (0, 0)
+        for ty in (unsized, nested):
+            with self.assertRaises(AngrTypeError):
+                cc.return_val(ty)
 
 
 if __name__ == "__main__":
