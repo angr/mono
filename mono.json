@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "37cbfea2ac7a7aa60845e0a4ffe1e11d72c5994b",
-      "committed_at": "2026-10-14T12:12:30Z",
-      "subject": "Update version to 10.0.5.dev0 [ci skip]",
+      "commit": "2708cb624984d7c9f94c7dda9d5a4954e570c75d",
+      "committed_at": "2026-10-16T23:54:03-07:00",
+      "subject": "Bump binsync to 5.15.4 (#1750)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -119,13 +119,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-16T02:54:39+00:00",
+  "imported_at": "2026-10-18T01:05:51+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "31c99e07000bea2b25b9ba39ceea7b5ddf05a1df",
-      "committed_at": "2026-10-15T15:54:54Z",
-      "subject": "Add Go (age) and Rust (grex) binaries for the angr.io decompilation showcase.",
+      "commit": "ccf4cfb9388960e12996b6dab664d958ecd205b9",
+      "committed_at": "2026-10-17T02:28:16-07:00",
+      "subject": "Add reproducible 2048 game fixtures for live GDB tests (#263)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
