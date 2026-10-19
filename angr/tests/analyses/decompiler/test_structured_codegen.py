@@ -22,6 +22,7 @@ from angr.analyses.decompiler.structured_codegen.c import (
     CConstant,
     CExpression,
     CGoto,
+    CIndexedVariable,
     CReturn,
     CStructField,
     CStructuredCodeGenerator,
@@ -42,6 +43,8 @@ from angr.sim_type import (
     SimTypeArray,
     SimTypeBottom,
     SimTypeChar,
+    SimTypeDouble,
+    SimTypeFixedSizeArray,
     SimTypeFloat,
     SimTypeFunction,
     SimTypeInt,
@@ -52,7 +55,7 @@ from angr.sim_type import (
     TypeRef,
     parse_cpp_file,
 )
-from angr.sim_variable import SimRegisterVariable
+from angr.sim_variable import SimMemoryVariable, SimRegisterVariable
 from tests.common import WORKER, bin_location, load_project_with_scoped_cfg, print_decompilation_result
 
 test_location = os.path.join(bin_location, "tests")
@@ -70,6 +73,57 @@ class _RenderedExpression(CExpression):
 
     def c_repr_chunks(self, indent=0, asexpr=False):
         yield self.text, self
+
+
+class TestIndexedVariableRendering(unittest.TestCase):
+    def test_array_brackets_select_the_indexed_expression(self):
+        project = angr.Project(os.path.join(test_location, "x86_64", "fauxware"), auto_load_libs=False)
+        cfg = project.analyses.CFGFast(normalize=True)
+        codegen = project.analyses.Decompiler(cfg.functions["main"], cfg=cfg).codegen
+        assert isinstance(codegen, CStructuredCodeGenerator)
+        variable = CVariable(
+            SimMemoryVariable(0x404000, 16, name="items"),
+            variable_type=SimTypeFixedSizeArray(SimTypeInt(), 4),
+            codegen=codegen,
+        )
+        index = CConstant(1, SimTypeInt(), codegen=codegen)
+        access = CIndexedVariable(variable, index, tags={"ins_addr": 0x401000}, codegen=codegen)
+        assert codegen.cfunc is not None
+        codegen.cfunc.statements = CReturn(access, codegen=codegen)
+        codegen.cfunc.omit_header = True
+        text, nodes, addresses, _, related = codegen.render_text(codegen.cfunc)
+        self.assertEqual(text, "return items[1];\n\n")
+        self.assertIs(nodes.get_node(7), variable)
+        self.assertIs(nodes.get_node(13), index)
+        self.assertEqual(related[access], {12, 14})
+        for position in (12, 14):
+            self.assertIs(nodes.get_node(position), access)
+            self.assertIs(addresses.get_node(position), access)
+
+    def test_decompiled_array_positions_survive_serialization(self):
+        project = angr.Project(os.path.join(test_location, "x86_64", "runtime_2048", "2048.pie"), auto_load_libs=False)
+        cfg = project.analyses.CFGFast(normalize=True)
+        function = cfg.functions["testSucceed"]
+        codegen = project.analyses.Decompiler(function, cfg=cfg).codegen
+        assert isinstance(codegen, CStructuredCodeGenerator)
+        assert codegen.map_pos_to_node is not None
+        assert codegen.text is not None
+        selections = {
+            position: element.obj.c_repr()
+            for position, element in codegen.map_pos_to_node.items()
+            if isinstance(element.obj, CIndexedVariable)
+        }
+        self.assertTrue(selections)
+        restored = CStructuredCodeGenerator.parse(codegen.serialize(), project=project, kb=project.kb, func=function)
+        assert restored.map_pos_to_node is not None
+        assert restored.map_ast_to_pos is not None
+        self.assertEqual(restored.text, codegen.text)
+        for position, expression in selections.items():
+            self.assertIn(codegen.text[position], "[]")
+            selected = restored.map_pos_to_node.get_node(position)
+            self.assertIsInstance(selected, CIndexedVariable)
+            self.assertEqual(selected.c_repr(), expression)
+            self.assertIn(position, restored.map_ast_to_pos[selected])
 
 
 class TestConvertRendering(unittest.TestCase):
@@ -586,6 +640,43 @@ class TestSimpleCastQualification(unittest.TestCase):
         assert not qualifies_for_simple_cast(longlong, sizeless)
 
 
+class TestCommonType(unittest.TestCase):
+    def test_a_floating_point_operand_makes_the_result_floating_point(self):
+        # C11 6.3.1.8. SimTypeFloat reports signed=True, so the integer rules alone would type (unsigned int, float)
+        # as unsigned int
+        arch = archinfo.ArchX86()
+        uint = SimTypeInt(signed=False).with_arch(arch)
+        sint = SimTypeInt().with_arch(arch)
+        ulonglong = SimTypeLongLong(signed=False).with_arch(arch)
+        flt = SimTypeFloat().with_arch(arch)
+        dbl = SimTypeDouble().with_arch(arch)
+        cases = [
+            (uint, flt, flt),
+            (flt, uint, flt),
+            (sint, flt, flt),
+            (flt, sint, flt),
+            (ulonglong, flt, flt),
+            (flt, dbl, dbl),
+            (dbl, flt, dbl),
+            (dbl, uint, dbl),
+        ]
+        for lhs, rhs, expected in cases:
+            common = CBinaryOp.compute_common_type("Mul", lhs, rhs)
+            assert common is expected, (lhs, rhs, common)
+        assert CBinaryOp.compute_common_type("Mul", uint, sint) is uint
+
+    def test_a_double_minus_an_integer_is_stored_as_a_double(self):
+        # restore_fx subtracts an operand typed unsigned long long from the double g_acc and stores the difference
+        # back; an integer type for the difference would write the store through *(unsigned long long *)&g_acc
+        proj = angr.Project(os.path.join(test_location, "decompiler_fp", "x87_env_amd64"), auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+        dec = proj.analyses.Decompiler(cfg.functions["restore_fx"], cfg=cfg.model)
+        assert dec.codegen is not None and dec.codegen.text is not None
+        text = dec.codegen.text
+        assert "\n    g_acc = g_acc - " in text, text
+        assert "*(unsigned long long *)&g_acc" not in text, text
+
+
 class TestTypeLayoutKey(unittest.TestCase):
     """
     type_layout_key() keys a type by its memory layout so that struct definitions are emitted in an order that is
@@ -727,3 +818,17 @@ class TestPointerStepInCommaExpression(unittest.TestCase):
         for dst, _, step in comma_steps:
             assert re.search(rf"unsigned int \*{dst};", text) is not None
             assert step == "1", f"{dst} stepped by {step} bytes inside the comma expression"
+
+
+class TestWideningKeepsCast(unittest.TestCase):
+    def test_int_sum_stored_to_long_long_is_sign_extended(self):
+        # known_patterns_stl4's main initializes a Pair's long long field from argc + 2 (lea eax, [r12 + 2]; cdqe).
+        # the decompiled code keeps argc in an unsigned int variable, so without its (int) cast the sum zero-extends.
+        bin_path = os.path.join(test_location, "x86_64", "decompiler", "known_patterns_stl4")
+        proj = angr.Project(bin_path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True, data_references=True)
+        proj.analyses.CompleteCallingConventions(cfg=cfg.model, recover_variables=True)
+        dec = proj.analyses[angr.analyses.Decompiler].prep(fail_fast=True)(cfg.functions["main"], cfg=cfg.model)
+        assert dec.codegen is not None and dec.codegen.text is not None
+        print_decompilation_result(dec)
+        assert re.search(r"= \(int\)\(\w+ \+ 2\);", dec.codegen.text) is not None
