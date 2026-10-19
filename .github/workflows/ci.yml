@@ -694,14 +694,21 @@ jobs:
       # keeps the bundle equal to upstream's without the tree carrying 200 MB.
       - name: Resource submodules
         working-directory: angr-management/angrmanagement/resources
-        # Pinned and retried. Unpinned, the frozen bundle's contents changed
-        # whenever either repository's default branch moved, so a build that
-        # passed on Monday was not the build that runs on Thursday; unretried,
-        # a slow GitHub failed the lane outright.
-        env:
-          FLIRT: eaf9234448ced5800497d8ec2c565b186c9f65e4
-          DOCS: d3ed48c58a871d7d2fdc8ea560209afb8718d72e
+        # Use the imported gitlinks, including changes assembled by a rollup.
+        # A missing pin stops the lane rather than fetching a default branch.
         run: |
+          pins=$("$VENV_PY" - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+          pins = json.loads(Path("../../../mono.json").read_text())["components"]["angr-management"]["excluded_submodules"]
+          commits = [pins["angrmanagement/resources/" + name] for name in ("flirt_signatures", "library_docs")]
+          if any(not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha) for sha in commits):
+              raise SystemExit("resource submodules need exact commits")
+          print(*commits)
+          PY
+          )
+          read -r FLIRT DOCS <<< "$pins"
           clone() {
               for attempt in 1 2 3; do
                   git clone --filter=blob:none "https://github.com/angr/$1" "$1" &&

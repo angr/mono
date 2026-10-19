@@ -104,20 +104,21 @@ SUBMODULES = {
     "pyvex": ["vex"],
 }
 
-# Extra per-component exclusions.
-EXCLUDES = {
-    # The submodule is vendored, so the file that declares it is not: git
-    # would read `vex` as a gitlink that this tree does not have.
-    "pyvex": [".gitmodules"],
-    # FLIRT signatures and library docs are submodules of angr-management,
-    # a couple of hundred megabytes between them and growing; they are
-    # runtime data, not code under test. The pyinstaller lane clones both at
-    # a pinned commit, so the frozen bundle still carries what upstream's
-    # does.
+# Runtime data fetched by the bundle lane at the imported gitlink commits,
+# recorded separately from submodules whose files are vendored in this tree.
+EXCLUDED_SUBMODULES = {
     "angr-management": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs",
     ],
+}
+
+# Extra per-component exclusions.
+EXCLUDES = {
+    **EXCLUDED_SUBMODULES,
+    # The submodule is vendored, so the file that declares it is not: git
+    # would read `vex` as a gitlink that this tree does not have.
+    "pyvex": [".gitmodules"],
 }
 
 BASE_URL = os.environ.get("ANGR_REPO_BASE_URL", "https://github.com/angr")
@@ -222,35 +223,35 @@ def snapshot(name: str, src: Path, dest: Path) -> None:
     shutil.copytree(src, dest, ignore=ignore, symlinks=True)
 
 
-def vendored_from_tree(name: str, entry: dict, source: Path) -> dict[str, str]:
-    """The submodule paths an assembled tree carries, and where they came from.
+def submodules_from_tree(
+    name: str, entry: dict, source: Path
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return vendored and excluded submodules with their recorded commits.
 
-    An ordinary import reads a gitlink out of the component's checkout. There
-    is no gitlink to read here: whoever assembled the tree resolved every
-    submodule to ordinary files before exporting it, which is the only form a
-    merge of several pull requests' VEX branches can take -- that commit lives
-    in the assembler's mirror and nowhere a monorepo can pin. So the tree's
-    own record of what it resolved them to is the provenance, and the paths
-    are checked against `SUBMODULES` so a tree that simply forgot to say
-    still gets its `vex` recorded.
-
-    Recording them is not bookkeeping. `ci/vendored.py` reads this key, and
-    everything that has to tell a vendored drop from code somebody wrote
-    reads `ci/vendored.py`: without it `ci/pre-commit.sh` hands pyvex's own
-    hooks the whole VEX tree, and the ratchets score it as new code that has
-    to be perfect.
+    Assembled trees contain files in place of gitlinks, so their manifest
+    supplies the commit IDs. Configured submodules are included even when
+    the manifest omits them; a missing vendored commit is an empty string.
+    Reject missing submodule directories and unpinned excluded resources.
     """
     recorded = entry.get("submodules", {})
     vendored = {}
-    for path in sorted(set(SUBMODULES.get(name, [])) | set(recorded)):
+    excluded = {}
+    omitted = set(EXCLUDED_SUBMODULES.get(name, []))
+    for path in sorted(set(SUBMODULES.get(name, [])) | omitted | set(recorded)):
         if not (source / path).is_dir():
             raise SystemExit(
                 f"{name}/{path} is a submodule of {name} and is not in the "
                 "assembled tree; the component would be imported without the "
-                "sources it compiles."
+                "submodule contents it declares."
             )
-        vendored[path] = recorded.get(path, "")
-    return vendored
+        sha = recorded.get(path, "")
+        if path in omitted:
+            if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+                raise SystemExit(f"{name}/{path}: excluded submodule needs an exact commit")
+            excluded[path] = sha
+        else:
+            vendored[path] = sha
+    return vendored, excluded
 
 
 def from_trees(
@@ -275,13 +276,13 @@ def from_trees(
         source = trees / name
         if not source.is_dir():
             continue
+        entry = applied.get("components", {}).get(name, {})
+        vendored, excluded = submodules_from_tree(name, entry, source)
         snapshot(name, source, ROOT / name)
         workspaced = use_workspace_sources(ROOT / name)
-        entry = applied.get("components", {}).get(name, {})
         prs = [p["number"] for p in entry.get("applied", [])]
         print(f"{name}: {len(prs)} pull request(s) merged onto {entry.get('base', '?')[:12]}",
               file=sys.stderr)
-        vendored = vendored_from_tree(name, entry, source)
         for path, sha in vendored.items():
             print(f"{name}/{path}: {(sha or '?')[:12]} (vendored)", file=sys.stderr)
         record = {
@@ -295,6 +296,8 @@ def from_trees(
         }
         if vendored:
             record["vendored_submodules"] = vendored
+        if excluded:
+            record["excluded_submodules"] = excluded
         bucket(manifest, name)[name] = record
 
     for key in ("components", "fixtures"):
@@ -341,6 +344,10 @@ def main() -> int:
         snapshot(name, src, ROOT / name)
         workspaced = use_workspace_sources(ROOT / name)
         vendored = {path: submodule_commit(src, path) for path in SUBMODULES.get(name, [])}
+        excluded = {
+            path: submodule_commit(src, path)
+            for path in EXCLUDED_SUBMODULES.get(name, [])
+        }
         for path, sha in vendored.items():
             print(f"{name}/{path}: {sha[:12]} (vendored)", file=sys.stderr)
         entry = {
@@ -353,6 +360,8 @@ def main() -> int:
         }
         if vendored:
             entry["vendored_submodules"] = vendored
+        if excluded:
+            entry["excluded_submodules"] = excluded
         bucket(manifest, name)[name] = entry
 
     for key in ("components", "fixtures"):
