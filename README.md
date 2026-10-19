@@ -125,6 +125,13 @@ the submodule out at the commit pyvex's gitlink names and vendors it like any
 other source, and `mono.json` records the commit under the component's
 `vendored_submodules`.
 
+The FLIRT signatures and library docs used by angr-management stay out of the
+snapshot. Their gitlink commits are recorded as `excluded_submodules`, and
+the bundle lane fetches those exact commits. Assembled rollups use the
+submodule commits in their manifest, so a resource update follows the
+component that requested it without adding the data to mono. These commits
+must be available from the resource repositories.
+
 One test is deselected, in `ci/suites.json`, with its reason beside it and
 printed on every run of that suite. Nothing else is. That includes the suites
 for angr's optional `llm` extra: `pydantic-ai`, `mcp` and `fastmcp` are

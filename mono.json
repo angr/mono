@@ -28,7 +28,11 @@
         "archinfo",
         "cle",
         "pyvex"
-      ]
+      ],
+      "excluded_submodules": {
+        "angrmanagement/resources/flirt_signatures": "4f71702ef127c1fc8bd8ac8c26cb2352621d2c22",
+        "angrmanagement/resources/library_docs": "d3ed48c58a871d7d2fdc8ea560209afb8718d72e"
+      }
     },
     "angr-platforms": {
       "upstream": "https://github.com/angr/angr-platforms",
