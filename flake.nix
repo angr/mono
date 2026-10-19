@@ -6,7 +6,7 @@
 
     # angr's function and type definitions: ~200 MB of generated JSON.
     angr-data = {
-      url = "github:angr/angr-data";
+      url = "github:angr/angr-data/3d9f983b25feeacc8e18f0f0f3ad8f443c5f61ce";
       flake = false;
     };
 
@@ -76,33 +76,36 @@
       # prebuilt wheel published only for x86_64 Linux, so the eighteen angr
       # tests it gates run on the system the Nix lane uses and report as
       # skips elsewhere -- which is what upstream does too.
-      testPackagesFor = pkgs: p: [
-        p.angr
-        p.unicorn
-        # angr's `llm` extra: tests/llm and tests/mcp are part of the suite,
-        # so the packages they import are part of the environment.
-        p.pydantic-ai
-        p.mcp
-        p.fastmcp
-        # Twenty-one of angr's tests are behind `skipUnless(pysoot)` and
-        # they skipped here while pysoot sat in the tree unpackaged, which
-        # is the failure mode importing it was meant to remove.
-        p.pysoot
-        # The dependents whose own suites run here. Upstream tests every
-        # transitive dependent of a changed component; without these, a
-        # claripy change is tried against angr and angr-management only.
-        p.angr-platforms
-        p.angrop
-        p.pytest
-        p.pytest-xdist
-        p.pytest-timeout
-        p.pytest-forked
-        p.pytest-split
-        p.keystone-engine
-        p.sqlalchemy
-        p.pydantic
-      ]
-      ++ lib.optionals (pkgs.stdenv.hostPlatform.system == "x86_64-linux") [ p.tracer ];
+      testPackagesFor =
+        pkgs: p:
+        [
+          p.angr
+          p.unicorn
+          # angr's `llm` extra: tests/llm and tests/mcp are part of the suite,
+          # so the packages they import are part of the environment.
+          p.pydantic-ai
+          p.mcp
+          p.fastmcp
+          # Twenty-one of angr's tests are behind `skipUnless(pysoot)` and
+          # they skipped here while pysoot sat in the tree unpackaged, which
+          # is the failure mode importing it was meant to remove.
+          p.pysoot
+          p.claripy
+          # The dependents whose own suites run here. Upstream tests every
+          # transitive dependent of a changed component; without these, a
+          # claripy change is tried against angr and angr-management only.
+          p.angr-platforms
+          p.angrop
+          p.pytest
+          p.pytest-xdist
+          p.pytest-timeout
+          p.pytest-forked
+          p.pytest-split
+          p.keystone-engine
+          p.sqlalchemy
+          p.pydantic
+        ]
+        ++ lib.optionals (pkgs.stdenv.hostPlatform.system == "x86_64-linux") [ p.tracer ];
 
       # angr-management and its suite. Apart again: pulling Qt into the core
       # test environment would grow the closure the other six suites carry for
@@ -153,6 +156,7 @@
         );
     in
     {
+      lib.mkPackages = import ./nix;
       overlays.default = overlay;
 
       # nix fmt
@@ -176,6 +180,14 @@
           archinfo-lib = ps.archinfo;
           pypcode-lib = ps.pypcode;
           angr-data-lib = ps.angr-data;
+          inherit (ps.monoNative)
+            pyvex-native
+            unicornlib
+            rustylib
+            pypcode-native
+            pypcode-sla
+            ;
+          inherit (ps.monoResources) flirt-signatures library-docs;
 
         }
         // lib.optionalAttrs (hasGui pkgs) {
@@ -284,6 +296,27 @@
             '';
         in
         {
+          pinned-dependencies =
+            assert import ./nix/checks/pins.nix { inherit lib; };
+            pkgs.runCommand "angr-pinned-dependencies" { } "touch $out";
+          pyvex-build-metadata =
+            pkgs.runCommand "pyvex-build-metadata"
+              {
+                nativeBuildInputs = [
+                  (pkgs.python312.withPackages (p: [
+                    p.tomlkit
+                    p.packaging
+                  ]))
+                ];
+              }
+              ''
+                mkdir -p ci/tests nix
+                cp ${./ci/tests/test_nix_pyvex_recipe.py} ci/tests/test_nix_pyvex_recipe.py
+                cp ${./nix/pyvex_build_system.py} nix/pyvex_build_system.py
+                python3 -P -c 'import tomlkit, packaging'
+                python3 -P -m unittest discover -v -s ci/tests -p test_nix_pyvex_recipe.py
+                touch $out
+              '';
           import-smoke =
             runPython "angr-import-smoke" ./nix/checks/import_smoke.py
               (pythonFor pkgs).pkgs.monoPinned.z3-solver.version;
@@ -299,6 +332,19 @@
                 path = ./binaries/tests/x86_64/fauxware;
                 name = "fauxware";
               }}";
+        }
+        // lib.optionalAttrs (hasGui pkgs) {
+          resource-runtime =
+            pkgs.runCommand "angr-management-resource-runtime"
+              {
+                nativeBuildInputs = [ (guiEnvFor pkgs) ];
+              }
+              ''
+                export HOME=$TMPDIR XDG_CONFIG_HOME=$TMPDIR XDG_CACHE_HOME=$TMPDIR XDG_DATA_HOME=$TMPDIR
+                export QT_QPA_PLATFORM=offscreen
+                python3 -P ${./nix/checks/resource_runtime.py} --work-dir "$TMPDIR/resource-check"
+                touch $out
+              '';
         }
       );
     };
