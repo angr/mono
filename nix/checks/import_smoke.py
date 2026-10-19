@@ -4,17 +4,17 @@ import sys
 
 import angr
 import archinfo
-import claripy
+from angr import claripy
 import cle
 import pypcode
 import pyvex
 import z3
 
 print("angr", angr.__version__)
-print("cle", cle.__version__, "claripy", claripy.__version__, "pyvex", pyvex.__version__)
+print("cle", cle.__version__, "pyvex", pyvex.__version__)
 print("archinfo", archinfo.__version__, "pypcode", pypcode.__version__)
 
-# The z3 version is the one nix/python-overlay.nix pins (passed by the flake).
+# The z3 version is the one nix/z3-solver.nix pins (passed by the flake).
 # z3.get_version_string() is "4.13.0" for PyPI release "4.13.0.0"; compare the
 # numeric tuple (major, minor, build, revision) instead.
 pinned_z3 = sys.argv[1]

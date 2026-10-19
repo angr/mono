@@ -3,16 +3,17 @@
     "angr-data": {
       "flake": false,
       "locked": {
-        "lastModified": 1782286086,
-        "narHash": "sha256-KkWW47+9mQW0Ox+p2lZokLpdayKHoMGVD4QYr39vw7w=",
+        "lastModified": 1791264727,
+        "narHash": "sha256-xnU3XWvYsQGaCFy2GEwkJvsVbZcg7pHqDXUEIftDRNg=",
         "owner": "angr",
         "repo": "angr-data",
-        "rev": "3ddad3c7aec776b9dcc068c43372fdd241685c69",
+        "rev": "3d9f983b25feeacc8e18f0f0f3ad8f443c5f61ce",
         "type": "github"
       },
       "original": {
         "owner": "angr",
         "repo": "angr-data",
+        "rev": "3d9f983b25feeacc8e18f0f0f3ad8f443c5f61ce",
         "type": "github"
       }
     },

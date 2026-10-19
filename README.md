@@ -46,6 +46,48 @@ Python package set:
 }
 ```
 
+## Reuse the package recipes
+
+`angr-mono.lib.mkPackages` and `import ./nix` expose the same factory. Pass
+`pkgs` and an attribute set of component source paths to build independent
+checkouts with mono's recipes:
+
+```nix
+family = angr-mono.lib.mkPackages {
+  inherit pkgs;
+  sources = {
+    inherit angr archinfo cle pyvex pypcode pysoot;
+    angr-management = managementSource;
+  };
+};
+python = family.python.withPackages (p: [ p.angr p.unicorn ]);
+```
+
+Each source can also be an attribute set with `outPath`, such as `fetchTree`
+returns. Sources are evaluated only when their packages are needed. Omit
+`sources` to use this monorepo. Older angr snapshots can supply `claripy`;
+when omitted, a fixed standalone claripy revision is available for snapshots
+that declare it. `angrDataSrc` selects the prototype data source, or defaults
+to `sources.angr-data` when present and the pinned PyPI release otherwise.
+
+The factory exposes the Python packages, `python`, and the native outputs
+`pyvex-native`, `unicornlib`, `rustylib`, `pypcode-native`, and `pypcode-sla`.
+Native source filters let unrelated Python edits reuse the C, C++ and Rust
+outputs. Version changes still affect native derivation identities.
+`natives-all` roots the four compiled libraries together, and
+`rustylib-check` builds the Rust tests. `python` can be selected explicitly;
+`packageOverrides` extends its package set after mono's recipes.
+
+`withPyxdia` defaults to `true`. Consumers that provide PDB support only in
+selected environments can set it to `false` and add `family.pyxdia` there.
+The factory also exposes `flirt-signatures` and `library-docs` as separate,
+content-addressed resources. External management snapshots use their embedded
+resource directories, or `sources.angr-management.resourceSources` when
+supplied. That attribute set accepts `flirt-signatures` and `library-docs`
+paths. Mono's adapter fetches the excluded submodule revisions in `mono.json`.
+The installed GUI links those outputs and uses them as its default resource
+locations, while saved user settings continue to take precedence.
+
 ## Develop in it
 
 ```shell
