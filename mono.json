@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "99867a1bf1d37bf8ba24cc0080059449922a112b",
-      "committed_at": "2026-10-19T10:47:35-07:00",
-      "subject": "rust: bump smallvec from 1.16.2 to 1.16.3 (#7574)",
+      "commit": "9424025591348d5a8786dd95e42722a0999c1716",
+      "committed_at": "2026-10-20T09:34:54-07:00",
+      "subject": "Rename state compare() to subsumes() (#7601)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "2708cb624984d7c9f94c7dda9d5a4954e570c75d",
-      "committed_at": "2026-10-16T23:54:03-07:00",
-      "subject": "Bump binsync to 5.15.4 (#1750)",
+      "commit": "4cb5c32953a11bc4c22e3d40386aa03f8cda7676",
+      "committed_at": "2026-10-19T23:47:06-07:00",
+      "subject": "ailment.Block.idx is non-nullable (#1755)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -52,9 +52,9 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "db4531e5275954372967503cc778307304624ca1",
-      "committed_at": "2026-10-14T12:12:31Z",
-      "subject": "Update version to 10.0.5.dev0 [ci skip]",
+      "commit": "a3e7acf3d3cb34f4bf5289a7606129cb44bfd8e8",
+      "committed_at": "2026-10-19T12:25:32-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#393)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -68,9 +68,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "a742800512776ee7ec1c07bfd2568ab4f22e7e34",
-      "committed_at": "2026-10-14T12:12:36Z",
-      "subject": "Update version to 10.0.5.dev0 [ci skip]",
+      "commit": "8d902867faeb69bffc7d98970dc7bb048d084226",
+      "committed_at": "2026-10-19T12:25:55-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#877)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -87,25 +87,25 @@
     },
     "pypcode": {
       "upstream": "https://github.com/angr/pypcode",
-      "commit": "ce8f00dad05f157eba15b7f6cebe86f3bfff3133",
-      "committed_at": "2026-10-12T12:35:27-07:00",
-      "subject": "ci: bump actions/download-artifact from 8.0.1 to 8.0.2",
+      "commit": "91fe7c2b49860845d38355084bd24d9895e73ac4",
+      "committed_at": "2026-10-19T13:46:00-07:00",
+      "subject": "ci: bump pypa/cibuildwheel from 4.3.0 to 4.3.1",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pysoot": {
       "upstream": "https://github.com/angr/pysoot",
-      "commit": "16ab55db71a162efea3d44251fb93893140bbef2",
-      "committed_at": "2026-10-12T13:07:05-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#63)",
+      "commit": "51abe8cc567746497ea8f58a8a87acea7ea74e7e",
+      "committed_at": "2026-10-19T12:38:30-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#64)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "0a915d9e631f6b6eb70cf6963e729ae5d0a23003",
-      "committed_at": "2026-10-14T12:12:38Z",
-      "subject": "Update version to 10.0.5.dev0 [ci skip]",
+      "commit": "36cc43a3d6467903e1b5fe9492ac2f428abc423d",
+      "committed_at": "2026-10-19T12:25:18-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#597)",
       "excluded": [
         ".gitmodules"
       ],
@@ -123,13 +123,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-19T18:11:48+00:00",
+  "imported_at": "2026-10-20T18:48:08+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "ccf4cfb9388960e12996b6dab664d958ecd205b9",
-      "committed_at": "2026-10-17T02:28:16-07:00",
-      "subject": "Add reproducible 2048 game fixtures for live GDB tests (#263)",
+      "commit": "7c257a842592b885be27acf5c836bcbb8ec84e08",
+      "committed_at": "2026-10-20T09:10:18Z",
+      "subject": "Add CADET_SAMPLE.",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }

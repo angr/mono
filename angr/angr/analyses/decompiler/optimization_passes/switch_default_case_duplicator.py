@@ -4,12 +4,14 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from itertools import count
+from typing import Any
 
 import networkx
 
 from angr.ailment.block import Block
 from angr.ailment.expression import Const
 from angr.ailment.statement import Jump
+from angr.analyses.decompiler.utils import update_jump_target_idx
 from angr.knowledge_plugins.cfg import IndirectJumpType
 
 from .optimization_pass import OptimizationPass, OptimizationPassStage
@@ -35,14 +37,16 @@ class SwitchDefaultCaseDuplicator(OptimizationPass):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.node_idx = count(start=self._scratch.get("node_idx", 0))
+        self.node_idx = count(start=self._scratch.get("node_idx", 1))
 
         self.analyze()
 
         self._scratch["node_idx"] = next(self.node_idx)
 
     def _check(self):
-        jumptables = self.kb.cfgs.get_most_accurate().jump_tables
+        cfg = self.kb.cfgs.get_most_accurate()
+        assert cfg is not None, "Must have built a CFG already"
+        jumptables = cfg.jump_tables
         switch_jump_block_addrs = {
             jumptable.addr
             for jumptable in jumptables.values()
@@ -53,7 +57,7 @@ class SwitchDefaultCaseDuplicator(OptimizationPass):
         if not jump_node_addrs:
             return False, None
 
-        default_case_node_addrs = set()
+        default_case_node_addrs: set[tuple[int, int, int]] = set()
         for node_addr in jump_node_addrs:
             node = self._func.get_node(node_addr)
             if self._func.graph.in_degree[node] == 1:
@@ -71,7 +75,9 @@ class SwitchDefaultCaseDuplicator(OptimizationPass):
         cache = {"default_case_node_addrs": default_case_node_addrs}
         return True, cache
 
-    def _analyze(self, cache=None):
+    def _analyze(self, cache: dict[str, Any] | None = None):
+        if cache is None:
+            cache = {}
         default_case_node_addrs = cache["default_case_node_addrs"]
 
         out_graph = None
@@ -85,6 +91,7 @@ class SwitchDefaultCaseDuplicator(OptimizationPass):
             if cnt > 1:
                 # rewrite all of them into gotos
                 default_node = self._get_block(default_addr)
+                assert default_node is not None, "We are about to write a switch to an address with no block"
                 for switch_head_addr in sorted((sa for sa, _, da in default_case_node_addrs if da == default_addr)):
                     # there is a case where the switch head node is broken into multiple nodes in clinic (e.g., at
                     # cmov). we may need to traverse down to find the actual node that jumps to the default case
@@ -92,7 +99,7 @@ class SwitchDefaultCaseDuplicator(OptimizationPass):
                     goto_stmt = Jump(
                         self.manager.next_atom(),
                         Const(self.manager.next_atom(), default_addr, self.project.arch.bits, ins_addr=default_addr),
-                        target_idx=None,  # I'm assuming the ID of the default node is None here
+                        target_idx=default_node.idx,
                         ins_addr=default_addr,
                     )
                     goto_node = Block(
@@ -122,6 +129,7 @@ class SwitchDefaultCaseDuplicator(OptimizationPass):
                     out_graph.remove_edge(switch_head_node, default_node)
                     out_graph.add_edge(switch_head_node, goto_node)
                     out_graph.add_edge(goto_node, default_node)
+                    update_jump_target_idx(switch_head_node, default_addr, default_node.idx, goto_node.idx)
 
                 goto_rewritten_default_addrs.add(default_addr)
 
@@ -186,5 +194,8 @@ class SwitchDefaultCaseDuplicator(OptimizationPass):
                         out_graph.remove_edge(unexpected_pred, default_case_block)
                         out_graph.add_edge(unexpected_pred, default_case_block_copy)
                         out_graph.add_edge(default_case_block_copy, default_case_succ_block)
+                        update_jump_target_idx(
+                            unexpected_pred, default_addr, default_case_block.idx, default_case_block_copy.idx
+                        )
 
         self.out_graph = out_graph

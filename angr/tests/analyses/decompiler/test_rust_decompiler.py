@@ -119,7 +119,9 @@ class RustDecompilationTarget(unittest.TestCase):
         for config in configs_needed:
             path = rust_binary_path(config, self.BINARY)
             assert os.path.isfile(path), f"{path} not found"
-            proj = angr.Project(path, auto_load_libs=False)
+            # The function and CFG-node spill caches cost ~20% of CFG recovery on these binaries and save no
+            # measurable memory at this size, so keep everything resident.
+            proj = angr.Project(path, auto_load_libs=False, cache_limits={"functions": None, "cfg_nodes": None})
             assert proj.is_rust_binary, f"{path} is not identified as a rust binary."
             func_addrs = {
                 addr for per_config_addrs in self.FUNC_ADDRS.values() if (addr := per_config_addrs.get(config))
@@ -334,6 +336,233 @@ class TestFlavorSwitch(unittest.TestCase):
         dec = proj.analyses.Decompiler(func, flavor="rust", fail_fast=True)
         assert dec.codegen is not None and dec.codegen.text is not None
         assert "user_named" in dec.codegen.text
+
+
+FMT_ARGUMENTS_BASE = os.path.join(bin_location, "tests", "x86_64", "rust", "fmt_arguments")
+
+
+class TestRustcVersionFromComment(unittest.TestCase):
+    """RustcVersionIdentification reads the rustc version from .comment without matching any signatures."""
+
+    def _detect(self, binary: str) -> str | None:
+        proj = angr.Project(os.path.join(FMT_ARGUMENTS_BASE, binary), auto_load_libs=False)
+        proj.analyses.RustcVersionIdentification()
+        return proj.rustc_version
+
+    def test_patch_release_maps_to_minor_release(self):
+        # "rustc version 1.93.1"
+        assert self._detect("fmtdemo-1.93.1") == "1.93.0"
+
+    def test_newer_than_known_signatures(self):
+        # "rustc version 1.98.1"; 1.93.0 is the newest version with signatures
+        newest = max(
+            tuple(int(x) for x in f.split("-O")[0].split("."))
+            for f in os.listdir(os.path.join(get_default_sig_dir(), "inline"))
+            if f.endswith("-O3.sig")
+        )
+        assert self._detect("fmtdemo-1.98.1") == ".".join(str(x) for x in newest)
+
+
+class TestPastel(unittest.TestCase):
+    """Regression tests on pastel 0.12.0 built with rustc 1.92.0 -O3."""
+
+    BINARY = os.path.join(bin_location, "tests", "x86_64", "rust", "pastel")
+
+    def _decompile(self, func_addr: int, depth: int = 0):
+        proj = angr.Project(self.BINARY, auto_load_libs=False)
+        recover_call_tree_cfg(proj, [func_addr], depth=depth)
+        proj.analyses.CompleteCallingConventions(prioritize_func_addrs=[func_addr], skip_other_funcs=True)
+        proj.rustc_version = "1.92.0"
+        proj.analyses.RustSymbolRecovery()
+        proj.analyses.TypeDBLoader()
+        dec = proj.analyses.Decompiler(proj.kb.functions[func_addr], flavor="rust", fail_fast=True)
+        assert dec.codegen is not None and dec.codegen.text is not None
+        return dec.codegen.text
+
+    def test_float_comparison_in_string_cmp_outliner(self):
+        # pastel::Color::to_rgb_hex_string: CmpEQ against a float constant
+        self._decompile(0x4E3CD0)
+
+    def test_rust_calling_convention_phi_with_undefined_source(self):
+        # pastel::commands::io::number_arg: a Phi source on the ret2arg0 path has no definition
+        with self.assertNoLogs("angr.rust.analyses.rust_calling_convention.rust_calling_convention", level="ERROR"):
+            self._decompile(0x47BD20)
+
+    def test_return_type_without_colon(self):
+        # pastel::Color::to_rgb_hex_string returns a struct; Rust types render as `name: type` and the name is empty
+        text = self._decompile(0x4E3CD0, depth=1)
+        assert " -> struct" in text and " -> :" not in text
+
+
+class TestRustFormatMacrosTemplateLayout(unittest.TestCase):
+    """rustc >= 1.93 passes fmt::Arguments as a {template, args} pair with a byte-encoded template."""
+
+    @staticmethod
+    def _decompile(binary: str, func_addrs: list[int], call_depth: int | None = None) -> dict[int, str]:
+        proj = angr.Project(os.path.join(FMT_ARGUMENTS_BASE, binary), auto_load_libs=False)
+        if call_depth is None:
+            proj.analyses.CFGFast(
+                normalize=True,
+                regions=executable_regions(proj),
+                start_at_entry=False,
+                function_starts=func_addrs,
+                force_smart_scan=False,
+            )
+        else:
+            recover_call_tree_cfg(proj, func_addrs, depth=call_depth)
+        callgraph = proj.kb.functions.callgraph
+        ccc_funcs = set(func_addrs)
+        for addr in func_addrs:
+            if call_depth is None:
+                ccc_funcs |= networkx.descendants(callgraph, addr)
+            else:
+                ccc_funcs |= set(networkx.single_source_shortest_path_length(callgraph, addr, cutoff=call_depth))
+        proj.analyses.CompleteCallingConventions(prioritize_func_addrs=ccc_funcs, skip_other_funcs=True)
+        proj.analyses.RustcVersionIdentification()
+        assert proj.rustc_version == "1.93.0"
+        proj.analyses.RustSymbolRecovery()
+        proj.analyses.TypeDBLoader()
+        out = {}
+        for addr in func_addrs:
+            dec = proj.analyses.Decompiler(proj.kb.functions[addr], flavor="rust", fail_fast=True)
+            assert dec.codegen is not None and dec.codegen.text is not None
+            out[addr] = dec.codegen.text
+        return out
+
+    def test_format_macros(self):
+        expected = {
+            0x411150: 'println!("value = {}", &v0);',  # print_one
+            0x411190: 'println!("name {} at {:?}!", &v1, &v0);',  # print_two
+            0x410520: 'println!("just a literal");',  # print_const: string-literal representation
+            0x4104C0: 'format!("{}-{}", &v0, &v1)',  # make_string
+            0x411100: 'format!("0x{:08x} {:>5}", &v0, &v0)',  # hex_width
+            0x4110B0: 'println!("{0} {1} {0}", &v1, &v0);',  # reorder: explicit argument indices
+            0x4111F0: 'writeln!(a0, "v: {}", &v0)',  # write_out
+            0x411230: 'write!(a0, "[{}]", &v1)',  # write_str
+        }
+        texts = self._decompile("fmtdemo-1.93.1", list(expected))
+        for addr, needle in expected.items():
+            with self.subTest(func=hex(addr)):
+                assert needle in texts[addr], texts[addr]
+                assert "_print(" not in texts[addr] and "format_inner(" not in texts[addr]
+
+    def test_lto_specialized_eprint(self):
+        # LTO specialized std::io::stdio::_eprint for its only caller and dropped the constant template argument
+        text = self._decompile("hexyl-0.17.0-1.93.1", [0x460400], call_depth=1)[0x460400]
+        assert 'eprintln!("Error: {:?}", &v0);' in text, text
+        assert "_eprint(" not in text
+
+
+class TestXsv(unittest.TestCase):
+    """Regression tests on xsv 0.13.0 built with rustc 1.92.0 -O3."""
+
+    BINARY = os.path.join(bin_location, "tests", "x86_64", "rust", "xsv")
+
+    def _decompile(self, func_addr: int, depth: int = 0):
+        proj = angr.Project(self.BINARY, auto_load_libs=False)
+        recover_call_tree_cfg(proj, [func_addr], depth=depth)
+        proj.analyses.CompleteCallingConventions(prioritize_func_addrs=[func_addr], skip_other_funcs=True)
+        proj.rustc_version = "1.92.0"
+        proj.analyses.RustSymbolRecovery()
+        proj.analyses.TypeDBLoader()
+        dec = proj.analyses.Decompiler(proj.kb.functions[func_addr], flavor="rust", fail_fast=True)
+        assert dec.codegen is not None and dec.codegen.text is not None
+        return dec.codegen.text
+
+    def test_function_like_macro_returnty(self):
+        # xsv::cmd::split::Args::new_writer: DerefCoercionSimplifier reads the return type of a format!() macro
+        text = self._decompile(0x576300, depth=1)
+        assert "format!(" in text
+
+
+def _rust_showcase_binary(name: str) -> str:
+    return os.path.join(bin_location, "tests", "x86_64", "rust", name)
+
+
+class TestHyperfineMain(unittest.TestCase):
+    """hyperfine::main calls hyperfine::run(), which returns Result<(), anyhow::Error> in rax."""
+
+    FUNC_ADDR = 0x471850
+    RUN_ADDR = 0x46D350
+
+    @classmethod
+    def _decompile(cls) -> str:
+        proj = angr.Project(_rust_showcase_binary("hyperfine"), auto_load_libs=False)
+        recover_call_tree_cfg(proj, [cls.FUNC_ADDR], depth=1)
+        proj.analyses.CompleteCallingConventions(
+            prioritize_func_addrs=[cls.FUNC_ADDR, cls.RUN_ADDR], skip_other_funcs=True
+        )
+        dec = proj.analyses.Decompiler(cls.FUNC_ADDR, fail_fast=True)
+        assert dec.codegen is not None and dec.codegen.text is not None
+        return dec.codegen.text
+
+    def test_main_has_no_arguments(self):
+        # callees of main should clobber caller-saved registers even without prototypes
+        assert "hyperfine::main(void)" in self._decompile()
+
+
+class TestJqlNicheDecodedSwitches(unittest.TestCase):
+    """jql_runner::array::get_array_index dispatches on niche-encoded serde_json::Value discriminants through two jump
+    tables without bounds checks: `idx = (d <s 0) ? d ^ 0x8000000000000000 : 5`."""
+
+    FUNC_ADDR = 0x4E63B0
+    ENTRY_CHECK = r"if v\d+ == 9223372036854775812 && a1 < \*\(\(a2 \+ 24\) as &i64\) \{"
+
+    @classmethod
+    def _project_and_cfg(cls, **cfg_kwargs):
+        proj = angr.Project(os.path.join(bin_location, "tests", "x86_64", "rust", "jql"), auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(
+            normalize=True, regions=[(cls.FUNC_ADDR, 0x4E6D80)], function_starts=[cls.FUNC_ADDR], **cfg_kwargs
+        )
+        return proj, cfg
+
+    def test_unresolved_jump_tables_keep_function_body(self):
+        # blocks ending in an unresolved indirect jump have unknown successors and must not be removed as redundant
+        proj, cfg = self._project_and_cfg(resolve_indirect_jumps=False)
+        dec = proj.analyses.Decompiler(self.FUNC_ADDR, cfg=cfg.model, flavor="rust", fail_fast=True)
+        assert dec.codegen is not None and dec.codegen.text is not None
+        assert "9223372036854775812" in dec.codegen.text
+        assert dec.codegen.text.count("goto ") == 2
+
+    def test_niche_decoded_switches(self):
+        proj, cfg = self._project_and_cfg()
+        for flavor, keyword in (("pseudocode", "switch ("), ("rust", "match (")):
+            with self.subTest(flavor=flavor):
+                dec = proj.analyses.Decompiler(self.FUNC_ADDR, cfg=cfg.model, flavor=flavor, fail_fast=True)
+                assert dec.codegen is not None and dec.codegen.text is not None
+                text = dec.codegen.text
+                assert text.count(keyword) == 2
+                assert "goto" not in text
+                assert "incomplete" not in text
+                assert text.count("<alloc::string::String as core::clone::Clone>::clone(") == 2
+                assert text.count("<indexmap::inner::Core<K,V> as core::clone::Clone>::clone(") == 2
+                if flavor == "rust":
+                    assert re.search(self.ENTRY_CHECK, text)
+                    assert "5 => {" in text
+
+
+class TestGrexMain(unittest.TestCase):
+    """grex::cli::handle_input returns an Option in rax:rdx."""
+
+    FUNC_ADDR = 0x50F250
+
+    def test_option_returned_in_two_registers(self):
+        proj = angr.Project(_rust_showcase_binary("grex"), auto_load_libs=False)
+        recover_call_tree_cfg(proj, [self.FUNC_ADDR], depth=2)
+        callgraph = proj.kb.functions.callgraph
+        ccc_funcs = set(networkx.single_source_shortest_path_length(callgraph, self.FUNC_ADDR, cutoff=2))
+        proj.analyses.CompleteCallingConventions(prioritize_func_addrs=ccc_funcs, skip_other_funcs=True)
+        proj.rustc_version = "1.92.0"
+        proj.analyses.RustSymbolRecovery()
+        proj.analyses.TypeDBLoader()
+        dec = proj.analyses.Decompiler(self.FUNC_ADDR, flavor="rust", fail_fast=True)
+        assert dec.codegen is not None and dec.codegen.text is not None
+        text = dec.codegen.text
+        assert "fn grex::main() {" in text
+        m = re.search(r"(v\d+) = grex::cli::handle_input\(&v\d+, &v\d+\);", text)
+        assert m is not None
+        # the low register of the returned Option carries its discriminant
+        assert f"if let Some(_) = {m.group(1)} {{" in text
 
 
 if __name__ == "__main__":

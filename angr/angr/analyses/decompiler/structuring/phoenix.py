@@ -180,7 +180,6 @@ class PhoenixStructurer(StructurerBase):
         self._assert_graph_ok(self._region.graph, "Incorrect region graph")
 
         has_cycle = self._has_cycle()
-
         # initialize the directed graph helper
         mgr = self._region.manager
         self._graph_helper = DirectedGraphHelper(
@@ -473,7 +472,7 @@ class PhoenixStructurer(StructurerBase):
                         cond_jump = Jump(
                             self.ail_manager.next_atom(),
                             Const(self.ail_manager.next_atom(), right.addr, self.project.arch.bits),
-                            None,
+                            0,
                             ins_addr=last_stmt.tags["ins_addr"],
                         )
                         jump_node = Block(last_stmt.tags["ins_addr"], None, statements=[cond_jump])
@@ -851,6 +850,14 @@ class PhoenixStructurer(StructurerBase):
             assert result_natural is not None
             continue_edges, outgoing_edges, successor = result_natural
 
+        # the default edge of an unstructured switch-case head is not a continue edge: rewriting it into a continue
+        # removes the head's conditional jump, after which the switch-case can never be structured
+        continue_edges = [
+            (src, dst)
+            for src, dst in continue_edges
+            if not self._is_switch_cases_address_loaded_from_memory_head_or_jumpnode(fullgraph, src)
+        ]
+
         if outgoing_edges:
             # if there is a single successor, we convert all but the first one out-going edges into breaks;
             # if there are multiple successors, and if the current region does not have a parent region, then we
@@ -972,6 +979,11 @@ class PhoenixStructurer(StructurerBase):
                         # it has probably been structured into BreakNode or ConditionalBreakNode
                         # just remove the edge
                         self._region.mark_edge(src, dst, cyclic_refinement_outgoing=True)
+                    elif isinstance(self.cond_proc.get_last_statement(src_block), IncompleteSwitchCaseHeadStatement):
+                        # the exit is a case of a lowered switch-case: the case stays in the head statement and
+                        # becomes a goto (then a break) once the switch-case is structured. appending a break here
+                        # would bury the head statement and the switch-case could never be matched
+                        self._region.mark_edge(src, dst, cyclic_refinement_outgoing=True)
                     else:
                         # create the "break" node. in fact, we create a jump or a conditional jump, which will be
                         # rewritten to break nodes after (if possible). directly creating break nodes may lead to
@@ -986,7 +998,7 @@ class PhoenixStructurer(StructurerBase):
                             break_stmt = Jump(
                                 self.ail_manager.next_atom(),
                                 Const(self.ail_manager.next_atom(), successor.addr, self.project.arch.bits),
-                                target_idx=successor.idx if isinstance(successor, Block) else None,
+                                target_idx=successor.idx if isinstance(successor, (Block, MultiNode)) else 0,
                                 ins_addr=last_src_stmt.tags["ins_addr"],
                             )
                             break_node = Block(last_src_stmt.tags["ins_addr"], None, statements=[break_stmt])
@@ -999,7 +1011,7 @@ class PhoenixStructurer(StructurerBase):
                                 break_stmt = Jump(
                                     self.ail_manager.next_atom(),
                                     Const(self.ail_manager.next_atom(), successor.addr, self.project.arch.bits),
-                                    target_idx=successor.idx if isinstance(successor, Block) else None,
+                                    target_idx=successor.idx if isinstance(successor, (Block, MultiNode)) else 0,
                                     ins_addr=last_src_stmt.tags["ins_addr"],
                                 )
                                 break_node_inner = Block(last_src_stmt.tags["ins_addr"], None, statements=[break_stmt])
@@ -1010,7 +1022,7 @@ class PhoenixStructurer(StructurerBase):
                                         fallthrough_node.addr,
                                         self.project.arch.bits,
                                     ),
-                                    target_idx=successor.idx if isinstance(successor, Block) else None,
+                                    target_idx=successor.idx if isinstance(successor, (Block, MultiNode)) else 0,
                                     ins_addr=last_src_stmt.tags["ins_addr"],
                                 )
                                 break_node_inner_fallthrough = Block(
@@ -1035,7 +1047,7 @@ class PhoenixStructurer(StructurerBase):
                                 break_stmt = Jump(
                                     self.ail_manager.next_atom(),
                                     Const(self.ail_manager.next_atom(), successor.addr, self.project.arch.bits),
-                                    target_idx=successor.idx if isinstance(successor, Block) else None,
+                                    target_idx=successor.idx if isinstance(successor, (MultiNode, Block)) else 0,
                                     ins_addr=exit_stmt.tags["ins_addr"],
                                 )
                                 break_node_inner = Block(exit_stmt.tags["ins_addr"], None, statements=[break_stmt])
@@ -1057,14 +1069,14 @@ class PhoenixStructurer(StructurerBase):
                                 break_stmt = Jump(
                                     self.ail_manager.next_atom(),
                                     Const(self.ail_manager.next_atom(), successor.addr, self.project.arch.bits),
-                                    target_idx=successor.idx if isinstance(successor, Block) else None,
+                                    target_idx=successor.idx if isinstance(successor, (Block, MultiNode)) else 0,
                                     ins_addr=last_src_stmt.tags["ins_addr"],
                                 )
                                 break_node_inner = Block(last_src_stmt.tags["ins_addr"], None, statements=[break_stmt])
                                 fallthrough_stmt = Jump(
                                     self.ail_manager.next_atom(),
                                     other_target,
-                                    target_idx=successor.idx if isinstance(successor, Block) else None,
+                                    target_idx=successor.idx if isinstance(successor, (Block, MultiNode)) else 0,
                                     ins_addr=last_src_stmt.tags["ins_addr"],
                                 )
                                 break_node_inner_fallthrough = Block(
@@ -1533,8 +1545,10 @@ class PhoenixStructurer(StructurerBase):
             return False
 
         # sanity check: all case nodes must have at most one common successor at this point
-        # note that we are ignoring AIL blocks with block ID != None
-        nodes = {(nn.addr, nn.idx if isinstance(nn, Block) else None): nn for nn in graph_raw.successors(node)}
+        # note that we are ignoring AIL blocks with block ID != 0
+        nodes = {
+            (nn.addr, nn.idx if isinstance(nn, (Block, MultiNode)) else 0): nn for nn in graph_raw.successors(node)
+        }
         successors: set[int] = set()
         case_nodes: set[int] = set()
         # cases targeting the region head or the switch head become gotos (see _switch_build_cases)
@@ -1552,8 +1566,8 @@ class PhoenixStructurer(StructurerBase):
 
         # make a fake jumptable
         node_default_addr = None
-        node_default_idx: int | EllipsisType | None = ...
-        case_entries: dict[int, int | tuple[int, int | None]] = {}
+        node_default_idx: int | EllipsisType = ...
+        case_entries: dict[int, int | tuple[int, int]] = {}
         for _, case_value, case_target_addr, case_target_idx, _ in last_stmt.case_addrs:
             if isinstance(case_value, str):
                 if case_value == "default":
@@ -1578,7 +1592,7 @@ class PhoenixStructurer(StructurerBase):
             jmp_to_default_node = Jump(
                 self.ail_manager.next_atom(),
                 Const(self.ail_manager.next_atom(), node_default_addr, self.project.arch.bits),
-                None,
+                node_default_idx if isinstance(node_default_idx, int) else 0,
                 ins_addr=SWITCH_MISSING_DEFAULT_NODE_ADDR,
             )
             node_default = Block(SWITCH_MISSING_DEFAULT_NODE_ADDR, 0, statements=[jmp_to_default_node])
@@ -1613,8 +1627,7 @@ class PhoenixStructurer(StructurerBase):
                 if o.addr == node_default.addr and o is not node_default:
                     self._region.remove_node(o, absorbed_into=node_default, absorb_out_edges=True)
 
-        if switch_end_addr is not None:
-            self._switch_handle_gotos(cases, node_default, switch_end_addr)
+        self._switch_finalize(node, cases, node_default, switch_end_addr)
         return True
 
     def _match_acyclic_switch_cases_address_loaded_from_memory(self, node, graph_raw, full_graph_raw) -> bool:
@@ -1757,10 +1770,13 @@ class PhoenixStructurer(StructurerBase):
             return False
 
         node_default = self._switch_find_default_node(graph, node, node_b_addr)
-        if node_default is not None:
-            # ensure we have successfully structured node_default
-            if full_graph.out_degree[node_default] > 1:
-                return False
+        if (
+            node_default is not None
+            and full_graph.out_degree[node_default] > 1
+            and not self._switch_default_node_needs_stub(graph, node, node_a, node_default)
+        ):
+            # node_default has not been structured yet. a shared default node is fine: it is replaced by a goto stub
+            return False
 
         # un-structure IncompleteSwitchCaseNode
         if isinstance(node_a, SequenceNode) and node_a.nodes and isinstance(node_a.nodes[0], IncompleteSwitchCaseNode):
@@ -1808,6 +1824,18 @@ class PhoenixStructurer(StructurerBase):
             node_b_addr,
             graph_raw,
         )
+
+        # special case: in degenerate cases where the jump table has exactly one entry, Clinic rewrites the
+        # indirect jump into a direct jump to the one block. then the switch-case header and the single case will be
+        # merged into a single node (MultiNode or a SequenceNode). as a result, we may not see the case node in the
+        # region graph at all. we handle this case gracefully here.
+        if len(set(case_and_entry_addrs.values())) == 1:
+            single_case_addr = next(iter(case_and_entry_addrs.values()))
+            if len(cases) == 1 and single_case_addr != next(iter(cases.values())).addr:
+                # the single case node is no longer in the graph! abort here so that we structure the switch-case as
+                # an if-else.
+                self.switch_case_known_heads.discard(node)
+                return False
 
         if isinstance(better_node_a, SwitchCaseNode) and better_node_a.default_node is None:
             # we found a different head for an otherwise complete edge case.
@@ -1876,8 +1904,7 @@ class PhoenixStructurer(StructurerBase):
         self.switch_case_known_heads.remove(node)
         if node_default is None:
             switch_end_addr = node_b_addr
-        if switch_end_addr is not None:
-            self._switch_handle_gotos(cases, node_default, switch_end_addr)
+        self._switch_finalize(node, cases, node_default, switch_end_addr)
 
         return True
 
@@ -1976,8 +2003,7 @@ class PhoenixStructurer(StructurerBase):
             return False
 
         # fully structured into a switch-case. remove node from switch_case_known_heads
-        if switch_end_addr is not None:
-            self._switch_handle_gotos(cases, None, switch_end_addr)
+        self._switch_finalize(node, cases, None, switch_end_addr)
 
         return True
 
@@ -2003,11 +2029,10 @@ class PhoenixStructurer(StructurerBase):
         if not index:
             return False
         index_expr, cmp_lb, cmp_ub = index  # pylint:disable=unused-variable
-        case_count = cmp_ub - cmp_lb + 1
 
-        # ensure we have the same number of cases
+        # ensure we have the same number of cases; an index without an upper bound is bounded by the table
         assert jump_table.jumptable_entries is not None
-        if case_count != len(jump_table.jumptable_entries):
+        if cmp_ub is not None and cmp_ub - cmp_lb + 1 != len(jump_table.jumptable_entries):
             return False
 
         # populate whitelist_edges
@@ -2064,8 +2089,7 @@ class PhoenixStructurer(StructurerBase):
 
         # fully structured into a switch-case. remove node from switch_case_known_heads
         self.switch_case_known_heads.remove(node)
-        if switch_end_addr is not None:
-            self._switch_handle_gotos(cases, node_default, switch_end_addr)
+        self._switch_finalize(node, cases, node_default, switch_end_addr)
 
         return True
 
@@ -2200,12 +2224,12 @@ class PhoenixStructurer(StructurerBase):
 
     def _switch_build_cases(
         self,
-        case_and_entryaddrs: dict[int, int | tuple[int, int | None]],
+        case_and_entryaddrs: dict[int, int | tuple[int, int]],
         head_node,
         node_a: BaseNode,
         node_b_addr: int | None,
         graph_raw: networkx.DiGraph,
-        node_b_idx: int | EllipsisType | None = ...,
+        node_b_idx: int | EllipsisType = ...,
     ) -> tuple[OrderedDict, Any, set[Any]]:
         cases: OrderedDict[int | tuple[int, ...], SequenceNode] = OrderedDict()
         to_remove = set()
@@ -2220,7 +2244,7 @@ class PhoenixStructurer(StructurerBase):
             if node_b_addr is not None
             else None
         )
-        if node_default is not None and self._switch_default_node_is_shared(graph, head_node, node_a, node_default):
+        if node_default is not None and self._switch_default_node_needs_stub(graph, head_node, node_a, node_default):
             node_default = self._switch_detach_shared_default_node(head_node, node_a, node_default)
         if node_default is not None and not isinstance(node_default, SequenceNode):
             # make the default node a SequenceNode so that we can insert Break and Continue nodes into it later
@@ -2228,8 +2252,8 @@ class PhoenixStructurer(StructurerBase):
             self.replace_nodes_both(node_default, new_node)
             node_default = new_node
 
-        converted_nodes: dict[tuple[int, int | None], Any] = {}
-        entry_addr_to_ids: defaultdict[tuple[int, int | None], set[int]] = defaultdict(set)
+        converted_nodes: dict[tuple[int, int], Any] = {}
+        entry_addr_to_ids: defaultdict[tuple[int, int], set[int]] = defaultdict(set)
 
         # the default node might get duplicated (e.g., by EagerReturns). we detect if a duplicate of the default node
         # (node b) is a successor node of node a. we only skip those entries going to the default node if no duplicate
@@ -2245,7 +2269,7 @@ class PhoenixStructurer(StructurerBase):
             if isinstance(entry_addr, tuple):
                 entry_addr, entry_idx = entry_addr
             else:
-                entry_idx = None
+                entry_idx = 0
 
             if not node_b_in_node_a_successors and entry_addr == node_b_addr:
                 # jump to default or end of the switch-case structure - ignore this case
@@ -2294,6 +2318,7 @@ class PhoenixStructurer(StructurerBase):
             else:
                 case_node = SequenceNode(entry_node.addr, nodes=[entry_node])
             to_remove.add(entry_node)
+            self._switch_make_fallthrough_explicit(case_node, entry_node, node_a_successors, graph)
 
             converted_nodes[(entry_addr, entry_idx)] = case_node
 
@@ -2319,6 +2344,62 @@ class PhoenixStructurer(StructurerBase):
             cases, default, switch_end_addr, rewrite_to_breaks and switch_end_addr != self._region.head.addr
         )
 
+    def _switch_finalize(self, head, cases: OrderedDict, node_default, switch_end_addr: int | None) -> None:
+        if switch_end_addr is not None:
+            self._switch_handle_gotos(cases, node_default, switch_end_addr)
+            if all(nn.addr != switch_end_addr for nn in self._region.graph):
+                # the gotos to the switch end became switch-level breaks, but the end lies outside the region (e.g.,
+                # the successor of the enclosing loop): control must still leave for it after the switch-case node,
+                # or the loop body would continue. the jump becomes a loop-level break or a goto later.
+                scnode = next(
+                    (succ for succ in self._region.graph.successors(head) if isinstance(succ, SwitchCaseNode)), None
+                )
+                if scnode is not None:
+                    jump = Jump(
+                        self.ail_manager.next_atom(),
+                        Const(self.ail_manager.next_atom(), switch_end_addr, self.project.arch.bits),
+                        0,
+                        ins_addr=scnode.addr,
+                    )
+                    new_node = SequenceNode(scnode.addr, nodes=[scnode, Block(scnode.addr, 0, statements=[jump])])
+                    self.replace_nodes_both(scnode, new_node)
+        self._switch_remove_fallthrough_jumps(cases, node_default)
+
+    def _switch_make_fallthrough_explicit(
+        self, case_node: SequenceNode, entry_node, case_entry_nodes: list, graph: networkx.DiGraph
+    ) -> None:
+        """
+        A case body that ends with a one-armed condition node falls through to its graph successor; the conditional
+        jump was consumed when the if-then was structured. When that successor is another case entry, the fallthrough
+        must become an explicit jump: case reordering and goto handling only see jump statements, and would otherwise
+        take the body as falling through to the end of the switch.
+        """
+        last = case_node.nodes[-1] if case_node.nodes else None
+        if not isinstance(last, ConditionNode) or (last.true_node is None) == (last.false_node is None):
+            return
+        fallthroughs = [
+            succ for succ in graph.successors(entry_node) if succ is not entry_node and succ in case_entry_nodes
+        ]
+        if len(fallthroughs) != 1:
+            return
+        target = fallthroughs[0]
+        jump = Jump(
+            self.ail_manager.next_atom(),
+            Const(self.ail_manager.next_atom(), target.addr, self.project.arch.bits),
+            target_idx=target.idx if isinstance(target, (Block, MultiNode)) else 0,
+            ins_addr=last.addr,
+        )
+        case_node.nodes.append(Block(last.addr, 0, statements=[jump]))
+
+    def _switch_default_node_needs_stub(self, graph: networkx.DiGraph, head_node, node_a, node_default) -> bool:
+        """
+        The region head (e.g., the head of the enclosing loop when the default case continues) must never be absorbed
+        into a switch-case node, nor may a default node that other nodes jump to.
+        """
+        return node_default is self._region.head or self._switch_default_node_is_shared(
+            graph, head_node, node_a, node_default
+        )
+
     @staticmethod
     def _switch_default_node_is_shared(graph: networkx.DiGraph, head_node, node_a, node_default) -> bool:
         """
@@ -2338,7 +2419,7 @@ class PhoenixStructurer(StructurerBase):
         becomes the default case. The default node stays in the graph for its other predecessors. The stub carries the
         default node's address so that re-matching the same switch head finds it as the default node.
         """
-        target_idx = node_default.idx if isinstance(node_default, (Block, MultiNode)) else None
+        target_idx = node_default.idx if isinstance(node_default, (Block, MultiNode)) else 0
         stub = Block(
             node_default.addr,
             0,
@@ -2387,6 +2468,8 @@ class PhoenixStructurer(StructurerBase):
         # remove all those entry nodes
         if node_default is not None:
             to_remove.add(node_default)
+        # successors of the switch-case node that must stay visible in this region's views
+        kept_succs: list = []
 
         if head in to_remove:
             # the switch head must never be absorbed into the switch-case node: it would be removed from the graph
@@ -2486,7 +2569,7 @@ class PhoenixStructurer(StructurerBase):
                     jump_stmt = Jump(
                         self.ail_manager.next_atom(),
                         Const(self.ail_manager.next_atom(), head.addr, self.project.arch.bits),
-                        None,
+                        0,
                         ins_addr=out_src.addr,
                     )
                     jump_node = Block(out_src.addr, 0, statements=[jump_stmt])
@@ -2543,10 +2626,12 @@ class PhoenixStructurer(StructurerBase):
                 switch_end_addr = end_node.addr
             if out_dst_succ is not None:
                 self._region.add_edge(scnode, out_dst_succ)
+                kept_succs.append(out_dst_succ)
                 if full_graph.has_edge(head, out_dst_succ):
                     self._region.remove_edge_with_successors_only(head, out_dst_succ)
             if out_dst_succ_fullgraph is not None:
                 self._region.add_edge(scnode, out_dst_succ_fullgraph)
+                kept_succs.append(out_dst_succ_fullgraph)
                 if full_graph.has_edge(head, out_dst_succ_fullgraph):
                     self._region.remove_edge_with_successors_only(head, out_dst_succ_fullgraph)
 
@@ -2573,6 +2658,10 @@ class PhoenixStructurer(StructurerBase):
         self._region.add_edge(head, scnode)
         for nn in to_remove:
             self._region.remove_node(nn, absorbed_into=scnode)
+        for succ in kept_succs:
+            # absorbing a case node rewires its exits onto scnode as hidden edges, which hides the successor edge
+            # added above again; re-adding it clears the mark
+            self._region.add_edge(scnode, succ)
 
         self._graph_helper.add_node_successor(head, scnode)
 
@@ -2601,15 +2690,16 @@ class PhoenixStructurer(StructurerBase):
             # remove the last statement in node_a
             remove_last_statements(node_a)
 
-        if switch_end_addr is None:
-            # no successor to go by
-            switch_end_addr = self._switch_find_switch_end_addr(cases, node_default, region_node_addrs)
+        if switch_end_addr is None or switch_end_addr == self._region.head.addr:
+            # no successor to go by, or only the back edge to the enclosing loop's head: jumps there are continues
+            # whatever the end is, so the virtualized loop exits in the cases decide the end by vote
+            voted = self._switch_find_switch_end_addr(cases, node_default, region_node_addrs)
+            if voted is not None:
+                switch_end_addr = voted
         return True, switch_end_addr
 
     @staticmethod
-    def _find_case_and_entry_addrs(
-        jump_head, graph, cmp_lb: int, jump_table
-    ) -> dict[int, int | tuple[int, int | None]]:
+    def _find_case_and_entry_addrs(jump_head, graph, cmp_lb: int, jump_table) -> dict[int, int | tuple[int, int]]:
         case_and_entry_addrs = {}
 
         addr_to_entry_nodes = defaultdict(list)
@@ -2644,8 +2734,8 @@ class PhoenixStructurer(StructurerBase):
                     continue
                 if (
                     len(last_stmts) == 1
-                    and isinstance(last_stmts[0], Jump)
-                    and not isinstance(last_stmts[0].target, Const)
+                    and isinstance((last := last_stmts[0]), Jump)
+                    and not isinstance(last.target, Const)
                 ):
                     switch_case_dispatch_nodes.add(node)
 
@@ -3083,8 +3173,8 @@ class PhoenixStructurer(StructurerBase):
                 cond,
                 Const(self.ail_manager.next_atom(), right.addr, self.project.arch.bits),
                 Const(self.ail_manager.next_atom(), succ.addr, self.project.arch.bits),
-                true_target_idx=right.idx if isinstance(right, (Block, MultiNode)) else None,
-                false_target_idx=succ.idx if isinstance(succ, (Block, MultiNode)) else None,
+                true_target_idx=right.idx if isinstance(right, (Block, MultiNode)) else 0,
+                false_target_idx=succ.idx if isinstance(succ, (Block, MultiNode)) else 0,
                 ins_addr=start_node.addr,
                 stmt_idx=0,
             )
@@ -3127,8 +3217,8 @@ class PhoenixStructurer(StructurerBase):
                 cond,
                 Const(self.ail_manager.next_atom(), left.addr, self.project.arch.bits, ins_addr=start_node.addr),
                 Const(self.ail_manager.next_atom(), else_node.addr, self.project.arch.bits, ins_addr=start_node.addr),
-                true_target_idx=left.idx if isinstance(left, (Block, MultiNode)) else None,
-                false_target_idx=else_node.idx if isinstance(else_node, (Block, MultiNode)) else None,
+                true_target_idx=left.idx if isinstance(left, (Block, MultiNode)) else 0,
+                false_target_idx=else_node.idx if isinstance(else_node, (Block, MultiNode)) else 0,
                 ins_addr=start_node.addr,
                 stmt_idx=0,
             )
@@ -3174,8 +3264,8 @@ class PhoenixStructurer(StructurerBase):
                 cond,
                 Const(self.ail_manager.next_atom(), right.addr, self.project.arch.bits),
                 Const(self.ail_manager.next_atom(), succ.addr, self.project.arch.bits),
-                true_target_idx=right.idx if isinstance(right, (Block, MultiNode)) else None,
-                false_target_idx=succ.idx if isinstance(succ, (Block, MultiNode)) else None,
+                true_target_idx=right.idx if isinstance(right, (Block, MultiNode)) else 0,
+                false_target_idx=succ.idx if isinstance(succ, (Block, MultiNode)) else 0,
                 ins_addr=start_node.addr,
                 stmt_idx=0,
             )
@@ -3217,8 +3307,8 @@ class PhoenixStructurer(StructurerBase):
                 cond,
                 Const(self.ail_manager.next_atom(), right.addr, self.project.arch.bits),
                 Const(self.ail_manager.next_atom(), else_node.addr, self.project.arch.bits),
-                true_target_idx=right.idx if isinstance(right, (Block, MultiNode)) else None,
-                false_target_idx=else_node.idx if isinstance(else_node, (Block, MultiNode)) else None,
+                true_target_idx=right.idx if isinstance(right, (Block, MultiNode)) else 0,
+                false_target_idx=else_node.idx if isinstance(else_node, (Block, MultiNode)) else 0,
                 ins_addr=start_node.addr,
                 stmt_idx=0,
             )
@@ -3501,7 +3591,7 @@ class PhoenixStructurer(StructurerBase):
             l.warning("Adding %d unreachable nodes to node_seq", len(acyclic_graph) - len(node_seq))
             unreachable_nodes = sorted(
                 (nn for nn in acyclic_graph if nn not in node_seq),
-                key=lambda n: (n.addr, (-1 if n.idx is None else n.idx) if hasattr(n, "idx") else 0),
+                key=lambda n: (n.addr, getattr(n, "idx", 0)),
             )
             max_seq = max(node_seq.values(), default=0)
             for i, nn in enumerate(unreachable_nodes):
@@ -3744,7 +3834,7 @@ class PhoenixStructurer(StructurerBase):
         """
 
         dst_addr = dst.addr
-        dst_idx = dst.idx if isinstance(dst, Block) else ...
+        dst_idx = dst.idx if isinstance(dst, (Block, MultiNode)) else ...
 
         class _Holder:
             """
@@ -3932,7 +4022,7 @@ class PhoenixStructurer(StructurerBase):
         stmt = block.statements[branches[0]]
         if not isinstance(stmt, ConditionalJump):
             return None
-        successor_idx = successor.idx if isinstance(successor, Block) else None
+        successor_idx = successor.idx if isinstance(successor, (Block, MultiNode)) else None
         for target, target_idx, other_target in (
             (stmt.true_target, stmt.true_target_idx, stmt.false_target),
             (stmt.false_target, stmt.false_target_idx, stmt.true_target),

@@ -2783,8 +2783,13 @@ class TestJumpTableResolver(unittest.TestCase):
     #
 
     def test_vtable_amd64_libc_ubuntu_2004(self):
+        # The assertion covers 213 vtable entries spanning most of .text, so the CFG cannot be scoped. This binary
+        # has 6499 functions against a file-size-derived cache limit of 1600, so the spill caches thrash without
+        # lowering peak RSS; keeping everything resident is ~17% faster.
         p = angr.Project(
-            os.path.join(test_location, "x86_64", "elf_with_static_libc_ubuntu_2004_stripped"), auto_load_libs=False
+            os.path.join(test_location, "x86_64", "elf_with_static_libc_ubuntu_2004_stripped"),
+            auto_load_libs=False,
+            cache_limits={"functions": None, "cfg_nodes": None},
         )
         cfg = p.analyses.CFGFast()
 
@@ -3056,7 +3061,21 @@ class TestJumpTableResolver(unittest.TestCase):
         # no comparison to derive their size from. Their size comes from the data instead: the next address that is
         # referenced by an instruction ends the table.
         p = angr.Project(os.path.join(test_location, "x86_64", "printenv-rust"), auto_load_libs=False)
-        cfg = p.analyses[CFGFast].prep()()
+        # CFG recovery is scoped to the functions that hold the five tables plus the functions that hold the
+        # instructions whose data references bound them: 0x4de400 references the end of 0x42fb90, 0x4f6f90 the end of
+        # 0x432af4, and 0x501d50 the end of 0x434134. The bounds for 0x4340c0 and 0x4340e0 come from inside 0x502470
+        # itself, so the ordering described below is still what makes them come out right.
+        cfg = p.analyses[CFGFast].prep()(
+            regions=[
+                (0x4DE3C0, 0x4DE440),
+                (0x4F5770, 0x4F67E0),
+                (0x4F6F90, 0x4F6FD0),
+                (0x501D50, 0x501D90),
+                (0x502470, 0x5025E0),
+            ],
+            function_starts=[0x4DE3C0, 0x4DE400, 0x4F5770, 0x4F6F90, 0x501D50, 0x502470, 0x502570],
+            start_at_entry=False,
+        )
 
         self._compare(
             cfg.model.jump_tables,
@@ -3090,7 +3109,7 @@ class TestJumpTableResolver(unittest.TestCase):
 
         # 0x4340c0 and 0x4340e0 are adjacent unbounded jump tables. 0x4340c0 can only be sized correctly once the
         # reference to 0x4340e0 has been collected, which happens after the block at 0x502470 is first analyzed;
-        # sizing it too early swallows the whole table at 0x4340e0. Checked on the same CFG: it takes minutes to build.
+        # sizing it too early swallows the whole table at 0x4340e0. Checked on the same CFG as the two above.
         self._compare(
             cfg.model.jump_tables,
             [
@@ -3125,6 +3144,23 @@ class TestJumpTableResolver(unittest.TestCase):
                 J(0x502570, 0x434134, [0x502583, 0x502589, 0x502583, 0x50259D, 0x502591, 0x5025B5, 0x5025C1, 0x5025A9]),
             ],
         )
+
+    def test_amd64_rust_niche_decoded_jumptables(self):
+        # jql_runner::array::get_array_index matches on a niche-encoded serde_json::Value discriminant:
+        # `idx = (d <s 0) ? d ^ 0x8000000000000000 : 5`. Nothing bounds the index, so the tables are sized from data.
+        p = angr.Project(os.path.join(test_location, "x86_64", "rust", "jql"), auto_load_libs=False)
+        cfg = p.analyses[CFGFast].prep()(normalize=True, regions=[(0x4E63B0, 0x4E6D80)], function_starts=[0x4E63B0])
+
+        self._compare(
+            cfg.model.jump_tables,
+            [
+                J(0x4E63D8, 0x41B5F0, [0x4E64D0, 0x4E6409, 0x4E6409, 0x4E64FB, 0x4E64AF, 0x4E6574]),
+                J(0x4E6439, 0x41B608, [0x4E64CA, 0x4E645B, 0x4E645B, 0x4E64D9, 0x4E648B, 0x4E6514]),
+            ],
+        )
+        # the two tables are adjacent; the first one must not run into the second one
+        assert len(cfg.model.jump_tables[0x4E63D8].jumptable_entries) == 6
+        assert len(cfg.model.jump_tables[0x4E6439].jumptable_entries) == 6
 
     def test_arm_thumb_jumptable_multi_variable_ranges(self):
         # Correctly resolving this indirect jump requires Balancer (in claripy) to handle the range of the addition of
