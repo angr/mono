@@ -213,7 +213,8 @@ class LoweredSwitchSimplifier(StructuringOptimizationPass):
 
     def _analyze_simplified_region(self, region, initial=False):
         super()._analyze_simplified_region(region, initial=initial)
-        finder = SwitchClusterFinder(region, variable_map_of(self.manager))
+        assert self._ri is not None
+        finder = SwitchClusterFinder(region, variable_map_of(self._ri.ail_manager))
         self._switches_present_in_code = len(finder.var2switches.values())
 
     def _check(self):
@@ -282,6 +283,21 @@ class LoweredSwitchSimplifier(StructuringOptimizationPass):
                         default_reachable_from_case = True
                         break
                 if default_reachable_from_case:
+                    continue
+
+                # RULE 5: every edge out of the comparison tree goes to a case target or the default.
+                # _find_cascading_switch_variable_comparisons can stop short of a subtree, or skip a comparison of
+                # another variable, without recording where that edge leads. the rewrite below removes every
+                # comparison node, so the code behind such an edge would lose its last predecessor and be deleted.
+                # targets are compared by address, as in that function's case filter, so a copy of the default
+                # block with another idx still counts as the default.
+                tree_nodes = {case.original_node for case in cases} | set(redundant_nodes) | {original_head}
+                target_addrs = {case.target for case in cases}
+                if any(
+                    succ not in tree_nodes and succ.addr not in target_addrs
+                    for node in tree_nodes
+                    for succ in self._graph.successors(node)
+                ):
                     continue
 
                 # the head is the root of the cascade and keeps its in-edges: the first case node when the
@@ -373,6 +389,10 @@ class LoweredSwitchSimplifier(StructuringOptimizationPass):
                 new_head.statements[-1] = switch_stmt
                 # update the block
                 self._update_block(original_head, new_head)
+                # A shared case can itself become a switch head later in this pass. Keep its recorded owners attached
+                # to the replacement block identity.
+                if original_head in node_to_heads:
+                    node_to_heads[new_head].update(node_to_heads.pop(original_head))
                 modified = True
 
                 # sanity check that no switch head points to either itself
@@ -435,7 +455,25 @@ class LoweredSwitchSimplifier(StructuringOptimizationPass):
                 next_id = succ_node.idx + 1
                 graph_copy.remove_node(succ_node)
                 for head in heads:
-                    node_copy = succ_node.deep_copy(self.manager)
+                    if succ_node.statements and isinstance(succ_node.statements[-1], IncompleteSwitchCaseHeadStatement):
+                        # This custom statement has no deep_copy(), but each duplicated switch head still needs its
+                        # own mutable case-address list.
+                        last_stmt = succ_node.statements[-1]
+                        last_stmt_copy = IncompleteSwitchCaseHeadStatement(
+                            last_stmt.idx,
+                            last_stmt.switch_variable.deep_copy(self.manager),
+                            list(last_stmt.case_addrs),
+                            peephole_optimized=last_stmt.peephole_optimized,
+                            **last_stmt.tags,
+                        )
+                        node_copy = succ_node.copy(
+                            statements=[
+                                *(stmt.deep_copy(self.manager) for stmt in succ_node.statements[:-1]),
+                                last_stmt_copy,
+                            ]
+                        )
+                    else:
+                        node_copy = succ_node.deep_copy(self.manager)
                     node_copy.idx = next_id
                     next_id += 1
 

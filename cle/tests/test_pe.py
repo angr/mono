@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import unittest
@@ -115,6 +116,19 @@ class TestPEBackend(unittest.TestCase):
             ]
         )
         assert ld.main_object.provides is None
+
+    def test_pe_header_after_large_dos_stub(self):
+        exe = os.path.join(TEST_BASE, "tests", "x86_64", "windows", "pe_large_dos_stub.exe")
+        with open(exe, "rb") as stream:
+            dos_header = stream.read(0x40)
+            pe_offset = struct.unpack_from("<I", dos_header, 0x3C)[0]
+            assert pe_offset >= 0x1000
+            stream.seek(pe_offset)
+            assert stream.read(4) == b"PE\0\0"
+
+        ld = cle.Loader(exe, auto_load_libs=False)
+        assert isinstance(ld.main_object, cle.PE)
+        assert ld.main_object.arch.name == "AMD64"
 
     def test_tls(self):
         exe = os.path.join(TEST_BASE, "tests", "x86", "windows", "TLS.exe")
@@ -401,6 +415,24 @@ class TestPEBackend(unittest.TestCase):
         assert obj.find_section_containing(obj.entry) is None
         assert [section.name for section in obj.sections] == [".rdata", ".rsrc"]
         assert not any(section.is_executable for section in obj.sections)
+
+    def test_image_without_dep_that_enters_a_section_gains_no_header_region(self):
+        # cle reports the mapped image headers as a region for an image that enters inside them,
+        # which is the shape a packer with its loader stub in the header slack has. Three facts
+        # decline this one, in the order the code reads them and any one of them enough: it is a
+        # 64-bit image, where Windows enforces no-execute whatever the DEP bit says; its entry
+        # lands in .text; and its AddressOfEntryPoint 0x1000 is above the 0x200 of headers the
+        # loader maps.
+        exe = os.path.join(TEST_BASE, "tests", "x86_64", "test_rol.exe")
+        ld = cle.Loader(exe, auto_load_libs=False)
+        obj = ld.main_object
+        assert isinstance(obj, cle.PE)
+
+        assert not obj.supports_nx
+        entry_section = obj.find_section_containing(obj.entry)
+        assert entry_section is not None
+        assert entry_section.name == ".text"
+        assert [sec.name for sec in obj.sections] == [".text"]
 
 
 # pylint: disable=no-self-use
