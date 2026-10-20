@@ -8,6 +8,7 @@ import os
 import unittest
 
 import angr
+from angr.analyses.decompiler import Decompiler
 from angr.analyses.decompiler.optimization_passes import LoweredSwitchSimplifier
 from angr.analyses.decompiler.presets import DECOMPILATION_PRESETS
 from tests.common import bin_location, load_project_with_scoped_cfg
@@ -55,6 +56,27 @@ SWITCH_TREE_CODE = bytes.fromhex(
 
 
 class TestLoweredSwitchSimplifier(unittest.TestCase):
+    def test_replaced_shared_case_head(self):
+        bin_path = os.path.join(test_location, "x86_64", "decompiler", "lowered_switch_shared_head.o")
+        project = angr.Project(bin_path, auto_load_libs=False)
+        cfg = project.analyses.CFGFast(normalize=True, data_references=True)
+        passes = DECOMPILATION_PRESETS["full"].get_optimization_passes(
+            "AMD64", "linux", additional_opts=[LoweredSwitchSimplifier]
+        )
+
+        decompilation = project.analyses[Decompiler].prep(fail_fast=True)(
+            cfg.functions["shared_switch"],
+            cfg=cfg.model,
+            optimization_passes=passes,
+        )
+
+        self.assertFalse(decompilation.errors)
+        self.assertIsNotNone(decompilation.codegen)
+        assert decompilation.codegen is not None
+        self.assertIsNotNone(decompilation.codegen.text)
+        assert decompilation.codegen.text is not None
+        self.assertEqual(decompilation.codegen.text.count("switch ("), 4)
+
     def test_comparison_chain_with_back_edges_terminates(self):
         proj = angr.load_shellcode(CHAR_SCAN_LOOP_CODE, "AMD64", load_address=0x4A7F32)
         cfg = proj.analyses.CFGFast(normalize=True)
@@ -101,9 +123,11 @@ class TestLoweredSwitchSimplifier(unittest.TestCase):
         assert dec.codegen is not None and dec.codegen.text is not None
         assert "switch (" in dec.codegen.text
 
-    def test_orphaned_chain_is_removed_entirely(self):
-        # the same shape at -O2, where the orphaned chain is long enough that stopping at the immediate
-        # successors leaves nodes unreachable from the function entry and the structurer gives up on them.
+    def test_branch_through_a_comparison_of_another_variable_is_kept(self):
+        # string_modifier_check() of file 5.45, inlined into parse(), switches on m->type. its comparison tree
+        # sends 18 and 19 (FILE_BESTRING16 and FILE_LESTRING16) to a test of m->str_flags rather than to a case
+        # body, and that branch warns "no modifiers allowed for 16-bit strings". a switch with no case for the
+        # branch must not replace the tree, or the warning is deleted along with the comparison nodes.
         proj, cfg = load_project_with_scoped_cfg(
             os.path.join(test_location, "x86_64", "file_gcc13.3.0_O2"), 0x4091D0, window=0x3000
         )
@@ -113,6 +137,7 @@ class TestLoweredSwitchSimplifier(unittest.TestCase):
         assert not dec.errors
         assert dec.codegen is not None and dec.codegen.text is not None
         assert "switch (" in dec.codegen.text
+        assert "no modifiers allowed for 16-bit strings" in dec.codegen.text
 
     def test_floating_point_comparisons_are_not_switch_cases(self):
         # each function tests one float against +inf and then -inf, with a distinct body per test. switch case

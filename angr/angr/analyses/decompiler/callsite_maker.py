@@ -49,6 +49,8 @@ if TYPE_CHECKING:
 
 l = logging.getLogger(name=__name__)
 
+_GETTEXT_MESSAGE_ARG_INDEX = {"gettext": 0, "dcgettext": 1}
+
 
 class CallSiteMaker:
     """
@@ -233,29 +235,14 @@ class CallSiteMaker:
                         ):
                             vvar_def_reg_offset = vvar_def.parameter_reg_offset
 
-                        if vvar_def_reg_offset is not None and offset > vvar_def_reg_offset:
-                            # we need to shift the value
-                            vvar_use = Expr.BinaryOp(
-                                self._ail_manager.next_atom(),
-                                "Shr",
-                                [
-                                    vvar_use,
-                                    Expr.Const(
-                                        self._ail_manager.next_atom(),
-                                        (offset - vvar_def_reg_offset) * 8,
-                                        8,
-                                    ),
-                                ],
-                                **vvar_use.tags,
-                            )
                         if vvar_def.size > arg_loc.size:
-                            # we need to narrow the value
-                            vvar_use = Expr.Convert(
+                            byte_offset = 0 if vvar_def_reg_offset is None else offset - vvar_def_reg_offset
+                            vvar_use = Expr.Extract(
                                 self._ail_manager.next_atom(),
-                                vvar_use.bits,
                                 arg_loc.size * self.project.arch.byte_width,
-                                False,
                                 vvar_use,
+                                Expr.Const(self._ail_manager.next_atom(), byte_offset, 64),
+                                self.project.arch.register_endness,
                                 **vvar_use.tags,
                             )
                         arg_expr = vvar_use
@@ -663,8 +650,37 @@ class CallSiteMaker:
 
         return s
 
+    def _find_format_string(self, value: Expr.Expression, resolved_vvars: set[int] | None = None) -> bytes | None:
+        if isinstance(value, Const) and isinstance(value.value, int):
+            return self._load_string(value.value) or None
+
+        if isinstance(value, Expr.VirtualVariable):
+            if self._reaching_definitions is None:
+                return None
+            if resolved_vvars is None:
+                resolved_vvars = set()
+            if value.varid in resolved_vvars:
+                return None
+            resolved_vvars.add(value.varid)
+            resolved = SRDAView(self._reaching_definitions).get_vvar_value(value)
+            if resolved is None or isinstance(resolved, Expr.Phi):
+                return None
+            return self._find_format_string(resolved, resolved_vvars)
+
+        if isinstance(value, Expr.Call) and value.args:
+            target = self._get_call_target(value)
+            if target is None or target not in self.kb.functions:
+                return None
+            callee = self.kb.functions[target]
+            message_arg_idx = _GETTEXT_MESSAGE_ARG_INDEX.get(callee.name)
+            if message_arg_idx is None or len(value.args) <= message_arg_idx:
+                return None
+            return self._find_format_string(value.args[message_arg_idx], resolved_vvars)
+
+        return None
+
     def _determine_variadic_arguments(self, func: Function, cc: SimCC, call_expr: Expr.Call) -> list[SimType]:
-        if "printf" in func.name or "scanf" in func.name:
+        if "printf" in func.name or "scanf" in func.name or func.name == "syslog":
             return self._determine_variadic_arguments_for_format_strings(func, cc, call_expr)
         return []
 
@@ -709,14 +725,12 @@ class CallSiteMaker:
                 l.warning("Unexpected type of argument type %s.", arg_loc.__class__)
                 continue
 
-            if not isinstance(value, Const) and call_expr.args is not None and len(call_expr.args) > fmt_arg_idx:
-                value = call_expr.args[fmt_arg_idx]
-            if isinstance(value, Const) and isinstance(value.value, int):
-                value = value.value
-            if isinstance(value, int):
-                fmt_str = self._load_string(value)
-                if fmt_str:
-                    break
+            if value is not None:
+                fmt_str = self._find_format_string(value)
+            if not fmt_str and call_expr.args is not None and len(call_expr.args) > fmt_arg_idx:
+                fmt_str = self._find_format_string(call_expr.args[fmt_arg_idx])
+            if fmt_str:
+                break
 
         if not fmt_str:
             return []
