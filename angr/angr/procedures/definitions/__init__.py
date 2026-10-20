@@ -27,6 +27,8 @@ from angr.sim_type import (
     mangled_long_double_as_double,
     parse_cpp_file,
     parse_file,
+    wchar_t_type,
+    with_wchar_t,
 )
 from angr.utils.json_utils import json_decode
 
@@ -331,7 +333,7 @@ class SimLibrary:
         if (proc.cc is None or proc.cc.arch != arch) and arch.name in self.fallback_cc:
             proc.cc = self.fallback_cc[arch.name]["Linux"](arch)
         if self.has_prototype(proc.display_name):
-            proc.prototype = self.get_prototype(proc.display_name, deref=True).with_arch(arch)  # type: ignore
+            proc.prototype = self.get_prototype(proc.display_name, arch=arch, deref=True)  # type: ignore
             proc.guessed_prototype = False
             if proc.prototype.arg_names is None:
                 # Use inspect to extract the parameters from the run python function
@@ -374,13 +376,17 @@ class SimLibrary:
         self._apply_metadata(proc, arch)
         return proc
 
-    def get_prototype(self, name: str, arch=None, deref: bool = False) -> SimTypeFunction | None:
+    def get_prototype(
+        self, name: str, arch=None, deref: bool = False, os_name: str | None = None
+    ) -> SimTypeFunction | None:
         """
         Get a prototype of the given function name, optionally specialize the prototype to a given architecture.
 
         :param name:    Name of the function.
         :param arch:    The architecture to specialize to.
         :param deref:   True if any SimTypeRefs in the prototype should be dereferenced using library information.
+        :param os_name: The name of the target's SimOS, which with arch decides the size of wchar_t (see
+                        wchar_t_type); None means a target other than Windows, UEFI or Xbox. Ignored when arch is None.
         :return:        Prototype of the function, or None if the prototype does not exist.
         """
         if name not in self.prototypes and name in self.prototypes_json:
@@ -409,7 +415,7 @@ class SimLibrary:
             proto = dereference_simtype_by_lib(proto, self.name)
             assert isinstance(proto, SimTypeFunction)
         if arch is not None:
-            return proto.with_arch(arch)
+            return with_wchar_t(proto, wchar_t_type(arch, os_name)).with_arch(arch)
         return proto
 
     def has_metadata(self, name):
@@ -467,17 +473,20 @@ class SimCppLibrary(SimLibrary):
         return ast or name
 
     @staticmethod
-    def _proto_from_demangled_name(name: str) -> SimTypeFunction | None:
+    def _proto_from_demangled_name(name: str, arch: archinfo.Arch) -> SimTypeFunction | None:
         """
         Attempt to extract arguments and calling convention information for a C++ function whose name was mangled
         according to the Itanium C++ ABI symbol mangling language.
 
         :param name:    The demangled function name.
+        :param arch:    The architecture of the target, which decides the size of wchar_t.
         :return:        A prototype or None if a prototype cannot be found.
         """
 
+        # libstdc++, the only library of this class, is never loaded for Windows, UEFI or Xbox
+        predefined_types = {"wchar_t": wchar_t_type(arch, None)}
         try:
-            parsed, _ = parse_cpp_file(name, with_param_names=False)
+            parsed, _ = parse_cpp_file(name, with_param_names=False, predefined_types=predefined_types)
         except ValueError:
             return None
         if not parsed:
@@ -514,7 +523,7 @@ class SimCppLibrary(SimLibrary):
         # try to determine a prototype from the function name if possible
         if demangled_name != name:
             # mangled function name
-            stub.prototype = self._proto_from_demangled_name(demangled_name)
+            stub.prototype = self._proto_from_demangled_name(demangled_name, arch)
             if stub.prototype is not None:
                 stub.prototype = mangled_long_double_as_double(stub.prototype, arch).with_arch(arch)
                 stub.guessed_prototype = False
@@ -522,7 +531,9 @@ class SimCppLibrary(SimLibrary):
                     stub.num_args = len(stub.prototype.args)
         return stub
 
-    def get_prototype(self, name: str, arch=None, deref: bool = False) -> SimTypeFunction | None:
+    def get_prototype(
+        self, name: str, arch=None, deref: bool = False, os_name: str | None = None
+    ) -> SimTypeFunction | None:
         """
         Get a prototype of the given function name, optionally specialize the prototype to a given architecture. The
         function name will be demangled first.
@@ -530,10 +541,12 @@ class SimCppLibrary(SimLibrary):
         :param name:    Name of the function.
         :param arch:    The architecture to specialize to.
         :param deref:   True if any SimTypeRefs in the prototype should be dereferenced using library information.
+        :param os_name: The name of the target's SimOS, which with arch decides the size of wchar_t (see
+                        wchar_t_type); None means a target other than Windows, UEFI or Xbox. Ignored when arch is None.
         :return:        Prototype of the function, or None if the prototype does not exist.
         """
         demangled_name = self._try_demangle(name)
-        return super().get_prototype(demangled_name, arch=arch, deref=deref)
+        return super().get_prototype(demangled_name, arch=arch, deref=deref, os_name=os_name)
 
     def has_metadata(self, name):
         """
@@ -584,6 +597,7 @@ class SimSyscallLibrary(SimLibrary):
         self.syscall_name_mapping: dict[str, dict[str, int]] = defaultdict(dict)  # keyed by abi
         self.default_cc_mapping: dict[str, type[SimCCSyscall]] = {}  # keyed by abi
         self.syscall_prototypes: dict[str, dict[str, SimTypeFunction]] = defaultdict(dict)  # keyed by abi
+        self.syscall_prototype_mapping: dict[str, dict[int, str]] = defaultdict(dict)  # keyed by abi
         self.fallback_proc = stub_syscall
 
     def copy(self):
@@ -596,6 +610,7 @@ class SimSyscallLibrary(SimLibrary):
         o.syscall_number_mapping = defaultdict(dict, self.syscall_number_mapping)  # {abi: {number: name}}
         o.syscall_name_mapping = defaultdict(dict, self.syscall_name_mapping)  # {abi: {name: number}}
         o.syscall_prototypes = defaultdict(dict, self.syscall_prototypes)  # as above
+        o.syscall_prototype_mapping = defaultdict(dict, self.syscall_prototype_mapping)  # {abi: {number: name}}
         o.default_cc_mapping = dict(self.default_cc_mapping)  # {abi: cc}
         return o
 
@@ -604,6 +619,7 @@ class SimSyscallLibrary(SimLibrary):
         if isinstance(other, SimSyscallLibrary):
             self.syscall_number_mapping.update(other.syscall_number_mapping)
             self.syscall_name_mapping.update(other.syscall_name_mapping)
+            self.syscall_prototype_mapping.update(other.syscall_prototype_mapping)
             self.default_cc_mapping.update(other.default_cc_mapping)
 
     def minimum_syscall_number(self, abi):
@@ -644,6 +660,16 @@ class SimSyscallLibrary(SimLibrary):
         """
         self.syscall_number_mapping[abi].update(mapping)
         self.syscall_name_mapping[abi].update({b: a for a, b in mapping.items()})
+
+    def add_number_prototype_mapping_from_dict(self, abi, mapping):
+        """
+        Associate syscall numbers with the names used by the ABI's prototype table. This is separate from the public
+        syscall name because some number tables reuse a userspace name for multiple generations of kernel entry point.
+
+        :param abi:     The ABI for which this mapping applies.
+        :param mapping: A dict mapping syscall numbers to prototype names.
+        """
+        self.syscall_prototype_mapping[abi].update(mapping)
 
     def set_abi_cc(self, abi, cc_cls):
         """
@@ -686,7 +712,7 @@ class SimSyscallLibrary(SimLibrary):
                 return mapping[number], arch, abi
         return f"sys_{number}", arch, None
 
-    def _apply_numerical_metadata(self, proc, number, arch, abi):
+    def _apply_numerical_metadata(self, proc, number, arch, abi: str | None):
         proc.syscall_number = number
         proc.abi = abi
         if abi in self.default_cc_mapping:
@@ -695,7 +721,11 @@ class SimSyscallLibrary(SimLibrary):
         elif arch.name in self.default_ccs:
             proc.cc = self.default_ccs[arch.name](arch)
         # a bit of a hack.
-        name = proc.display_name
+        if abi is None:
+            return
+        name = self.syscall_prototype_mapping[abi].get(number, proc.display_name)
+        if name is None:
+            return
         if self.has_prototype(abi, name):
             # The prototype tables store None for syscalls whose prototype was never parsed
             # (e.g. rt_sigtimedwait), so has_prototype() can be True while get_prototype()
@@ -802,8 +832,11 @@ class SimSyscallLibrary(SimLibrary):
         :return:            A bool of whether or not any implementation or metadata is known about the given syscall
         """
         name, _, abi = self._canonicalize(number, arch, abi_list)
+        prototype_name = self.syscall_prototype_mapping[abi].get(number, name) if abi is not None else name
         return (
-            name in self.procedures or name in self.non_returning or (abi is not None and self.has_prototype(abi, name))
+            name in self.procedures
+            or name in self.non_returning
+            or (abi is not None and self.has_prototype(abi, prototype_name))
         )
 
     def has_implementation(self, number, arch, abi_list=()):  # type: ignore
@@ -912,6 +945,7 @@ def _load_definitions(
     py_base_dir: str | None = None,
     only: set[str] | None = None,
     skip: set[str] | None = None,
+    library_renames: dict[str, str] | None = None,
 ):
     """
     Load SimLibrary definitions.
@@ -921,6 +955,7 @@ def _load_definitions(
     (which for angr's own definitions is the ``angr.procedures.definitions`` package directory).
     When ``py_base_dir`` is not given (e.g. for user-supplied external definition directories)
     it defaults to ``json_dir``, preserving the previous single-directory behavior.
+    ``library_renames`` maps a library name in the JSON definitions to the name it is registered under.
     """
     if skip is None:
         skip = set()
@@ -941,6 +976,8 @@ def _load_definitions(
                         l.warning("Invalid SimLibrary JSON file: %s", f)
                         continue
                     try:
+                        if library_renames:
+                            d["library_names"] = [library_renames.get(name, name) for name in d["library_names"]]
                         SimLibrary.from_json(d)
                     except (TypeError, KeyError):
                         l.warning("Failed to load SimLibrary from %s", f, exc_info=True)
@@ -1046,12 +1083,14 @@ def _update_glibc(libc: SimLibrary):
 def load_win32api_definitions():
     load_win32_type_collections()
     if once("load_win32api_definitions"):
-        api_base_dirs = ["win32", "wdk"]
-        for api_base_dir in api_base_dirs:
+        # The Windows metadata attributes the kernel-mode WFP management functions (fwpmk.h) to fwpuclnt.dll, the
+        # user-mode library. Kernel drivers import them from fwpkclnt.sys.
+        api_base_dirs = {"win32": None, "wdk": {"fwpuclnt.dll": "fwpkclnt.sys"}}
+        for api_base_dir, library_renames in api_base_dirs.items():
             base_dir = os.path.join(_DATA_DEFINITIONS_DIR, api_base_dir)
             if not os.path.isdir(base_dir):
                 continue
-            _load_definitions(base_dir)
+            _load_definitions(base_dir, library_renames=library_renames)
 
         if "kernel32.dll" in SIM_LIBRARIES:
             _update_libkernel32(SIM_LIBRARIES["kernel32.dll"][0])
