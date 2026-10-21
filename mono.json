@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "9424025591348d5a8786dd95e42722a0999c1716",
-      "committed_at": "2026-10-20T09:34:54-07:00",
-      "subject": "Rename state compare() to subsumes() (#7601)",
+      "commit": "1ddccb10e6d06a3e23af6eda03c5e9a25e74d775",
+      "committed_at": "2026-10-20T16:52:45-07:00",
+      "subject": "Fix SMT-LIB significand widths in floating-point conversions (#7603)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,13 +123,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-20T18:48:08+00:00",
+  "imported_at": "2026-10-21T00:05:31+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "7c257a842592b885be27acf5c836bcbb8ec84e08",
-      "committed_at": "2026-10-20T09:10:18Z",
-      "subject": "Add CADET_SAMPLE.",
+      "commit": "31db399578c6967f12c73b6fc7e8b15a1e2b6a8b",
+      "committed_at": "2026-10-20T16:06:06-07:00",
+      "subject": "add dwdiff",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
