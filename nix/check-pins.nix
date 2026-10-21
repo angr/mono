@@ -1,12 +1,16 @@
 # Check the dependencies whose versions affect native ABI or loader behavior.
 lib:
 let
-  # These historical requirements use the supplied 5.1 solver. Keep the supplied
-  # version in each entry so a future upgrade requires another compatibility check.
+  # Keep each compatible version explicit so an upgrade requires another check.
   compatible = {
-    angr.z3-solver."5.0.0.0" = "5.1.0.0";
-    claripy.z3-solver."4.13.0.0" = "5.1.0.0";
+    angr.z3-solver."5.0.0.0" = [ "5.1.0.0" ];
+    claripy.z3-solver."4.13.0.0" = [
+      "5.1.0.0"
+      "5.3.1.0"
+    ];
   };
+  requirementsOf =
+    project: (project.project.dependencies or [ ]) ++ (project.build-system.requires or [ ]);
   normalize = name: lib.toLower (builtins.replaceStrings [ "_" "." ] [ "-" "-" ] name);
   check =
     {
@@ -32,10 +36,10 @@ let
             version = builtins.match "[[:space:]]*(==|>=)[[:space:]]*([0-9][0-9.]*)[[:space:]]*" constraint;
             operator = builtins.elemAt version 0;
             required = builtins.elemAt version 1;
-            legacy = compatible.${component}.${name}.${required} or null;
+            legacy = compatible.${component}.${name}.${required} or [ ];
             accepted =
               if operator == "==" then
-                actual == required || actual == legacy
+                actual == required || builtins.elem actual legacy
               else
                 lib.versionAtLeast actual required;
           in
@@ -53,6 +57,28 @@ let
 in
 {
   inherit check;
+  select =
+    {
+      component,
+      project,
+      dependency,
+      versions,
+    }:
+    let
+      accepts =
+        version:
+        check {
+          inherit component;
+          requirements = requirementsOf project;
+          provided.${dependency} = version;
+        };
+      selected = lib.findFirst (
+        version: (builtins.tryEval (accepts version)).success
+      ) (builtins.head versions) versions;
+    in
+    # Re-run the failed check to retain its requirement-specific diagnostic.
+    assert accepts selected;
+    selected;
   source =
     component: source: provided:
     let
@@ -60,6 +86,6 @@ in
     in
     check {
       inherit component provided;
-      requirements = (project.project.dependencies or [ ]) ++ (project.build-system.requires or [ ]);
+      requirements = requirementsOf project;
     };
 }
