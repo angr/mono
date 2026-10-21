@@ -1278,15 +1278,37 @@ class CStatements(CStatement):
         self.addr = addr if addr is not None else first_stmt_addr(statements)
 
     def c_repr_chunks(self, indent=0, asexpr=False):
+        return self._c_repr_chunks(indent=indent, asexpr=asexpr, terminate_trailing_label=True)
+
+    def _c_repr_chunks(self, indent=0, asexpr=False, *, terminate_trailing_label):
         indent_str = self.indent_str(indent)
         if self.codegen.display_block_addrs:
             yield indent_str, None
             yield f"/* Block {hex(self.addr) if self.addr is not None else 'unknown'} */", None
             yield "\n", None
         for stmt in self.statements:
-            yield from stmt.c_repr_chunks(indent=indent, asexpr=asexpr)
+            if isinstance(stmt, CStatements):
+                # CStatements may be a transparent sequence nested inside another sequence. A label at the end of
+                # the inner sequence still labels the next statement in the outer sequence.
+                yield from stmt._c_repr_chunks(indent=indent, asexpr=asexpr, terminate_trailing_label=False)
+            else:
+                yield from stmt.c_repr_chunks(indent=indent, asexpr=asexpr)
             if asexpr:
                 yield ", ", None
+        if not asexpr and terminate_trailing_label and isinstance(self._last_nonempty_statement(), CLabel):
+            # A C label prefixes a statement; it is not a complete statement itself. Finish it only at the boundary
+            # of the enclosing sequence, after looking through transparent nested sequences.
+            yield indent_str, None
+            yield ";\n", None
+
+    def _last_nonempty_statement(self) -> CStatement | None:
+        for stmt in reversed(self.statements):
+            if isinstance(stmt, CStatements):
+                stmt = stmt._last_nonempty_statement()
+                if stmt is None:
+                    continue
+            return stmt
+        return None
 
 
 class CAILBlock(CStatement):
@@ -2275,15 +2297,14 @@ class CIndexedVariable(CExpression, IndexedVariableNode):
             yield "...", self
             return
 
-        bracket = CClosingObject("[")
         if not isinstance(self.variable, (CVariable, CVariableField)):
             yield "(", None
         yield from self.variable.c_repr_chunks()
         if not isinstance(self.variable, (CVariable, CVariableField)):
             yield ")", None
-        yield "[", bracket
+        yield "[", self
         yield from CExpression._try_c_repr_chunks(self.index)
-        yield "]", bracket
+        yield "]", self
 
 
 class CVariableField(CExpression, VariableFieldNode):
@@ -2561,6 +2582,15 @@ class CBinaryOp(CExpression, BinaryOpNode):
         if lhs_ptr or rhs_ptr:
             # uh oh!
             return SimTypeLength().with_arch(rhs_ty._arch)
+
+        # a floating-point operand makes the result floating point (the wider one if both are); the integer rules
+        # below would treat a float as a signed integer and could return the integer type
+        lhs_fp = isinstance(unpack_typeref(lhs_ty), SimTypeFloat)
+        rhs_fp = isinstance(unpack_typeref(rhs_ty), SimTypeFloat)
+        if lhs_fp and (not rhs_fp or lhs_ty.size >= rhs_ty.size):  # type: ignore[operator]
+            return lhs_ty
+        if rhs_fp:
+            return rhs_ty
 
         if lhs_ty == rhs_ty:
             return lhs_ty
