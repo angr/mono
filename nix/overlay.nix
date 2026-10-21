@@ -7,7 +7,10 @@
   withPyxdia ? true,
 }:
 let
-  z3-solver = pkgs.callPackage ./z3-solver.nix { inherit python; };
+  z3-solver = pkgs.callPackage ./z3-solver.nix {
+    inherit python;
+    angrSource = sources.angr;
+  };
   natives = import ./native.nix {
     inherit
       pkgs
