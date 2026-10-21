@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "1ddccb10e6d06a3e23af6eda03c5e9a25e74d775",
-      "committed_at": "2026-10-20T16:52:45-07:00",
-      "subject": "Fix SMT-LIB significand widths in floating-point conversions (#7603)",
+      "commit": "7ed34c4a0e77f30e2b6503710741d216cc999b49",
+      "committed_at": "2026-10-20T17:54:55-07:00",
+      "subject": "RedundantLabelRemover & ReturnDuplicatorLow: Fix block edit leaks. (#7605)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,7 +123,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-21T00:05:31+00:00",
+  "imported_at": "2026-10-21T04:23:17+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
