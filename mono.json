@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "59f9c6eeacf51cdb14e97e6431a0f312bebaf931",
-      "committed_at": "2026-10-21T16:37:59-07:00",
-      "subject": "libc: Add vprintf, vfprintf, vsprintf and their _chk variants (#7623)",
+      "commit": "59be4da7f6d9714dacbd119d8674dbeba3de3bc7",
+      "committed_at": "2026-10-22T01:32:41-07:00",
+      "subject": "Decompiler: decompile x87 functions that float narrowing broke with a BV size mismatch (#7495)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,13 +123,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-22T04:25:00+00:00",
+  "imported_at": "2026-10-22T10:22:47+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "68e06fe2161af64aa3838ede93dd8185a747ee3f",
-      "committed_at": "2026-10-21T09:59:36Z",
-      "subject": "Add DecBench coreutils stat at -O0 for the lowered switch simplifier tests.",
+      "commit": "b194240d964c0a665727426b7ea7c1b8a01379aa",
+      "committed_at": "2026-10-22T01:32:17-07:00",
+      "subject": "Add an x87 fixture where float arithmetic is narrowed inside double expressions (#256)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
