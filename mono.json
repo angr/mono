@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "1ddccb10e6d06a3e23af6eda03c5e9a25e74d775",
-      "committed_at": "2026-10-20T16:52:45-07:00",
-      "subject": "Fix SMT-LIB significand widths in floating-point conversions (#7603)",
+      "commit": "59f9c6eeacf51cdb14e97e6431a0f312bebaf931",
+      "committed_at": "2026-10-21T16:37:59-07:00",
+      "subject": "libc: Add vprintf, vfprintf, vsprintf and their _chk variants (#7623)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,13 +123,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-21T00:05:31+00:00",
+  "imported_at": "2026-10-22T04:25:00+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "31db399578c6967f12c73b6fc7e8b15a1e2b6a8b",
-      "committed_at": "2026-10-20T16:06:06-07:00",
-      "subject": "add dwdiff",
+      "commit": "68e06fe2161af64aa3838ede93dd8185a747ee3f",
+      "committed_at": "2026-10-21T09:59:36Z",
+      "subject": "Add DecBench coreutils stat at -O0 for the lowered switch simplifier tests.",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }

@@ -7,7 +7,7 @@
 //!   * `convert(irsb, manager)` -- fallback that walks a cached pyvex Python
 //!     `IRSB` object via PyO3 attribute access.
 //!
-//! Both share one conversion core ([`Conv`]) over the [`IrReader`] trait;
+//! Both share one conversion core (`Conv`) over the `IrReader` trait;
 //! only the IR-reading layer differs.
 
 use std::collections::{HashMap, HashSet};
@@ -925,6 +925,7 @@ impl<'py, 'r, R: IrReader> Conv<'py, 'r, R> {
                 | Some("CmpLT")
                 | Some("CmpGE")
                 | Some("CmpGT")
+                | Some("CmpORD")
                 | Some("Div")
                 | Some("DivMod")
                 | Some("Mod")
