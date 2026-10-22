@@ -248,6 +248,24 @@ def is_sign_fixing_cast(cast: CTypeCast) -> bool:
     return sign is not None and sign != d[1]
 
 
+def widening_needs_cast(cast: CTypeCast, consumer_type: SimType) -> bool:
+    """
+    Whether an integer cast changes the value its consumer reads after converting it to the wider consumer_type,
+    e.g. (unsigned int)x for int x assigned to an unsigned long: the cast zero-extends where x alone sign-extends.
+    False for a cast between types that print the same, such as signed and unsigned char: a reader could not see it.
+    """
+    s = int_width_and_signedness(cast.src_type)
+    d = int_width_and_signedness(cast.dst_type)
+    c = int_width_and_signedness(consumer_type)
+    if s is None or d is None or c is None or c[0] <= d[0]:
+        return False
+    if cast.src_type.c_repr() == cast.dst_type.c_repr():
+        return False
+    # dropping the cast is safe only if it keeps every value of its operand; an unsigned operand fits any wider type
+    keeps_every_value = s[0] <= d[0] and (s[1] == d[1] or (s[0] < d[0] and not s[1]))
+    return not keeps_every_value
+
+
 def qualifies_for_implicit_cast(ty1, ty2):
     # converting ty1 to ty2 - can this happen without a cast?
     # used to decide whether to omit typecasts from output during promotion
@@ -1278,15 +1296,37 @@ class CStatements(CStatement):
         self.addr = addr if addr is not None else first_stmt_addr(statements)
 
     def c_repr_chunks(self, indent=0, asexpr=False):
+        return self._c_repr_chunks(indent=indent, asexpr=asexpr, terminate_trailing_label=True)
+
+    def _c_repr_chunks(self, indent=0, asexpr=False, *, terminate_trailing_label):
         indent_str = self.indent_str(indent)
         if self.codegen.display_block_addrs:
             yield indent_str, None
             yield f"/* Block {hex(self.addr) if self.addr is not None else 'unknown'} */", None
             yield "\n", None
         for stmt in self.statements:
-            yield from stmt.c_repr_chunks(indent=indent, asexpr=asexpr)
+            if isinstance(stmt, CStatements):
+                # CStatements may be a transparent sequence nested inside another sequence. A label at the end of
+                # the inner sequence still labels the next statement in the outer sequence.
+                yield from stmt._c_repr_chunks(indent=indent, asexpr=asexpr, terminate_trailing_label=False)
+            else:
+                yield from stmt.c_repr_chunks(indent=indent, asexpr=asexpr)
             if asexpr:
                 yield ", ", None
+        if not asexpr and terminate_trailing_label and isinstance(self._last_nonempty_statement(), CLabel):
+            # A C label prefixes a statement; it is not a complete statement itself. Finish it only at the boundary
+            # of the enclosing sequence, after looking through transparent nested sequences.
+            yield indent_str, None
+            yield ";\n", None
+
+    def _last_nonempty_statement(self) -> CStatement | None:
+        for stmt in reversed(self.statements):
+            if isinstance(stmt, CStatements):
+                stmt = stmt._last_nonempty_statement()
+                if stmt is None:
+                    continue
+            return stmt
+        return None
 
 
 class CAILBlock(CStatement):
@@ -2561,6 +2601,15 @@ class CBinaryOp(CExpression, BinaryOpNode):
         if lhs_ptr or rhs_ptr:
             # uh oh!
             return SimTypeLength().with_arch(rhs_ty._arch)
+
+        # a floating-point operand makes the result floating point (the wider one if both are); the integer rules
+        # below would treat a float as a signed integer and could return the integer type
+        lhs_fp = isinstance(unpack_typeref(lhs_ty), SimTypeFloat)
+        rhs_fp = isinstance(unpack_typeref(rhs_ty), SimTypeFloat)
+        if lhs_fp and (not rhs_fp or lhs_ty.size >= rhs_ty.size):  # type: ignore[operator]
+            return lhs_ty
+        if rhs_fp:
+            return rhs_ty
 
         if lhs_ty == rhs_ty:
             return lhs_ty
@@ -6237,19 +6286,30 @@ class MakeTypecastsImplicit(CStructuredCodeWalker):
         return result
 
     def handle_CAssignment(self, obj):
-        obj.rhs = self.collapse(obj.lhs.type, obj.rhs)
-        return super().handle_CAssignment(obj)
+        obj.lhs = self.handle(obj.lhs)
+        obj.rhs = self._handle_converted(obj.rhs, obj.lhs.type)
+        return obj
 
     def handle_CFunctionCall(self, obj: CFunctionCall):
         prototype_args = [] if obj.prototype is None else obj.prototype.args
-        for i, (c_arg, arg_ty) in enumerate(zip(obj.args, prototype_args)):
-            obj.args[i] = self.collapse(arg_ty, c_arg)
-        return super().handle_CFunctionCall(obj)
+        obj.callee_target = self.handle(obj.callee_target)
+        obj.args = [
+            self._handle_converted(arg, prototype_args[i]) if i < len(prototype_args) else self.handle(arg)
+            for i, arg in enumerate(obj.args)
+        ]
+        return obj
 
     def handle_CReturn(self, obj: CReturn):
         assert obj.codegen._func.prototype is not None
-        obj.retval = self.collapse(obj.codegen._func.prototype.returnty, obj.retval)
-        return super().handle_CReturn(obj)
+        obj.retval = self._handle_converted(obj.retval, obj.codegen._func.prototype.returnty)
+        return obj
+
+    def _handle_converted(self, expr: CExpression, consumer_type: SimType) -> CExpression:
+        """Handle an expression whose value is converted to consumer_type, as an assigned, passed or returned value is."""
+        expr = self.collapse(consumer_type, expr)
+        if isinstance(expr, CTypeCast):
+            return self._collapse_cast(expr, under_fp_cast=False, consumer_type=consumer_type)
+        return self.handle(expr)
 
     @staticmethod
     def _is_compare_sign_cast(obj: CBinaryOp, operand: CExpression) -> bool:
@@ -6302,7 +6362,7 @@ class MakeTypecastsImplicit(CStructuredCodeWalker):
         # note that the expression that this method returns may no longer be a CTypeCast
         return self._collapse_cast(obj, under_fp_cast=False)
 
-    def _collapse_cast(self, obj: CTypeCast, under_fp_cast: bool) -> CExpression:
+    def _collapse_cast(self, obj: CTypeCast, under_fp_cast: bool, consumer_type: SimType | None = None) -> CExpression:
         if isinstance(obj.dst_type, SimTypeFloat) and isinstance(obj.expr, CTypeCast):
             obj.expr = self._collapse_cast(obj.expr, under_fp_cast=True)
         else:
@@ -6314,6 +6374,8 @@ class MakeTypecastsImplicit(CStructuredCodeWalker):
             obj.expr = inner
         if under_fp_cast and is_sign_fixing_cast(obj):
             # the int->FP conversion reads its operand with this signedness; the cast is not implicit
+            return obj
+        if consumer_type is not None and widening_needs_cast(obj, consumer_type):
             return obj
         if obj.src_type == obj.dst_type or qualifies_for_implicit_cast(obj.src_type, obj.dst_type):
             return obj.expr
