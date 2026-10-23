@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "4efdbc57386c4d46ef6fda5c5093c74ff1175afd",
-      "committed_at": "2026-10-22T19:13:46Z",
-      "subject": "Update version to 10.0.6.dev0 [ci skip]",
+      "commit": "4f8708becb56078c0249d2d7a7a3fe69bcf3fdca",
+      "committed_at": "2026-10-23T11:04:19-07:00",
+      "subject": "Build the Windows libz3 import library from the z3-solver wheel (#7649)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "a78cc22a9a709e4115abbcc45dd914567058bb45",
-      "committed_at": "2026-10-22T19:13:48Z",
-      "subject": "Update version to 10.0.6.dev0 [ci skip]",
+      "commit": "a177590e218181e1b9bba7924a5b99ebc37f45b4",
+      "committed_at": "2026-10-23T12:39:29-07:00",
+      "subject": "Format the invalid URL error in download_url() (#1756)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -123,7 +123,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-23T11:45:22+00:00",
+  "imported_at": "2026-10-23T21:05:11+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
