@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import networkx
 
 from angr.ailment import AILBlockViewer, Block
+from angr.ailment.block_walker import _ExprContinue, _ExprHandled
 from angr.ailment.expression import BinaryOp, Const, Expression, Load, VirtualVariable
 from angr.ailment.statement import Assignment, ConditionalJump, Jump, Label
 from angr.analyses.decompiler.region_simplifiers.switch_cluster_simplifier import SwitchClusterFinder
@@ -114,12 +115,12 @@ class StableVarExprHasher(AILBlockViewer):
         self.walk_expression(expr)
         self.hash = hash(tuple(self._hash_lst))
 
-    def _handle_expr(self, expr_idx: int, expr: Expression, stmt_idx: int, stmt, block: Block | None):
+    def _enter_expr(self, expr_idx: int, expr: Expression, stmt_idx: int, stmt, block: Block | None):
         expr_var = self._variable_map.variable(expr)
         if expr_var is not None:
             self._hash_lst.append(expr_var)
-        else:
-            super()._handle_expr(expr_idx, expr, stmt_idx, stmt, block)
+            return _ExprHandled(None)
+        return _ExprContinue(expr)
 
     def _handle_Load(self, expr_idx: int, expr: Load, stmt_idx: int, stmt, block: Block | None):
         self._hash_lst.append("Load")
@@ -215,7 +216,8 @@ class LoweredSwitchSimplifier(StructuringOptimizationPass):
 
     def _analyze_simplified_region(self, region, initial=False):
         super()._analyze_simplified_region(region, initial=initial)
-        finder = SwitchClusterFinder(region, variable_map_of(self.manager))
+        assert self._ri is not None
+        finder = SwitchClusterFinder(region, variable_map_of(self._ri.ail_manager))
         self._switches_present_in_code = len(finder.var2switches.values())
 
     def _check(self):
@@ -285,6 +287,21 @@ class LoweredSwitchSimplifier(StructuringOptimizationPass):
                         default_reachable_from_case = True
                         break
                 if default_reachable_from_case:
+                    continue
+
+                # RULE 5: every edge out of the comparison tree goes to a case target or the default.
+                # _find_cascading_switch_variable_comparisons can stop short of a subtree, or skip a comparison of
+                # another variable, without recording where that edge leads. the rewrite below removes every
+                # comparison node, so the code behind such an edge would lose its last predecessor and be deleted.
+                # targets are compared by address, as in that function's case filter, so a copy of the default
+                # block with another idx still counts as the default.
+                tree_nodes = {case.original_node for case in cases} | set(redundant_nodes) | {original_head}
+                target_addrs = {case.target for case in cases}
+                if any(
+                    succ not in tree_nodes and succ.addr not in target_addrs
+                    for node in tree_nodes
+                    for succ in self._graph.successors(node)
+                ):
                     continue
 
                 # the head is the root of the cascade and keeps its in-edges: the first case node when the
