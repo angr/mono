@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "59be4da7f6d9714dacbd119d8674dbeba3de3bc7",
-      "committed_at": "2026-10-22T01:32:41-07:00",
-      "subject": "Decompiler: decompile x87 functions that float narrowing broke with a BV size mismatch (#7495)",
+      "commit": "4efdbc57386c4d46ef6fda5c5093c74ff1175afd",
+      "committed_at": "2026-10-22T19:13:46Z",
+      "subject": "Update version to 10.0.6.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "4cb5c32953a11bc4c22e3d40386aa03f8cda7676",
-      "committed_at": "2026-10-19T23:47:06-07:00",
-      "subject": "ailment.Block.idx is non-nullable (#1755)",
+      "commit": "a78cc22a9a709e4115abbcc45dd914567058bb45",
+      "committed_at": "2026-10-22T19:13:48Z",
+      "subject": "Update version to 10.0.6.dev0 [ci skip]",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -52,9 +52,9 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "a3e7acf3d3cb34f4bf5289a7606129cb44bfd8e8",
-      "committed_at": "2026-10-19T12:25:32-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#393)",
+      "commit": "77f457372957ae53b8a4d1e828ebfcbe2edea361",
+      "committed_at": "2026-10-22T19:13:49Z",
+      "subject": "Update version to 10.0.6.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -68,9 +68,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "8d902867faeb69bffc7d98970dc7bb048d084226",
-      "committed_at": "2026-10-19T12:25:55-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#877)",
+      "commit": "ec3c2df651f55105b0376cf7239d3e3c9d0cf677",
+      "committed_at": "2026-10-22T19:13:52Z",
+      "subject": "Update version to 10.0.6.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -103,9 +103,9 @@
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "36cc43a3d6467903e1b5fe9492ac2f428abc423d",
-      "committed_at": "2026-10-19T12:25:18-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#597)",
+      "commit": "693d4922f8e84a2e03f3084a7e5be6ced4804982",
+      "committed_at": "2026-10-22T19:13:53Z",
+      "subject": "Update version to 10.0.6.dev0 [ci skip]",
       "excluded": [
         ".gitmodules"
       ],
@@ -123,13 +123,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-22T10:22:47+00:00",
+  "imported_at": "2026-10-23T11:45:22+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "b194240d964c0a665727426b7ea7c1b8a01379aa",
-      "committed_at": "2026-10-22T01:32:17-07:00",
-      "subject": "Add an x87 fixture where float arithmetic is narrowed inside double expressions (#256)",
+      "commit": "0ed2ecf5b9655a2c8cad26aa0524e14ae54975cb",
+      "committed_at": "2026-10-22T19:13:51Z",
+      "subject": "Update version to 10.0.6.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
