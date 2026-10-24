@@ -19,6 +19,17 @@ let
         "5.3.1.0"
       ];
     };
+  selectPython =
+    project:
+    checker.selectPython {
+      component = "angr";
+      inherit project;
+      dependency = "pycparser";
+      versions = [
+        "3.0.0"
+        "3.11.0"
+      ];
+    };
   reject = value: !(builtins.tryEval value).success;
 in
 assert check "angr" [ "z3-solver==5.1.0.0" ] z3;
@@ -63,5 +74,27 @@ assert reject (select {
 assert reject (select {
   project.dependencies = [ "z3-solver==5.3.1.0" ];
   build-system.requires = [ "z3-solver==5.1.0.0" ];
+});
+assert selectPython { } == "3.0.0";
+assert selectPython { project.dependencies = [ "pycparser" ]; } == "3.0.0";
+assert selectPython { project.dependencies = [ "pycparser>=2.18" ]; } == "3.0.0";
+assert selectPython { project.dependencies = [ "pycparser>=3.0" ]; } == "3.0.0";
+assert selectPython { project.dependencies = [ "pycparser<=3.0" ]; } == "3.0.0";
+assert selectPython { project.dependencies = [ "pycparser>3.0" ]; } == "3.11.0";
+assert selectPython { project.dependencies = [ "pycparser~=3.0" ]; } == "3.0.0";
+assert selectPython { project.dependencies = [ "pycparser~=3.11.0" ]; } == "3.11.0";
+assert selectPython { project.dependencies = [ "pycparser>=3.11,<3.12" ]; } == "3.11.0";
+assert selectPython { build-system.requires = [ "PyCParser == 3.11" ]; } == "3.11.0";
+assert reject (selectPython {
+  project.dependencies = [ "pycparser<3.0" ];
+});
+assert reject (selectPython {
+  project.dependencies = [ "pycparser~=3.12" ];
+});
+assert reject (selectPython {
+  project.dependencies = [ "pycparser!=3.12" ];
+});
+assert reject (selectPython {
+  project.dependencies = [ "pycparser~=3.11.0; python_version >= '3.12'" ];
 });
 true
