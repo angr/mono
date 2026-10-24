@@ -20,6 +20,19 @@ l = logging.getLogger(__name__)
 
 
 class TestNarrowingExpressions(unittest.TestCase):
+    def test_effective_size_extractor_handles_deep_binary_expressions(self):
+        vvar = VirtualVariable(0, 44, 64, VirtualVariableCategory.REGISTER, oident=16)
+        expr = vvar
+        for idx in range(1, 1501):
+            expr = BinaryOp(idx, "Add", [expr, Const(-idx, 0, 64)], False, bits=64)
+        expr = BinaryOp(1501, "And", [expr, Const(-1501, 0xFF, 64)], False, bits=64)
+        dst = VirtualVariable(1502, 45, 64, VirtualVariableCategory.REGISTER, oident=24)
+
+        walker = EffectiveSizeExtractor()
+        walker.walk_statement(Assignment(1503, dst, expr))
+
+        assert walker.vvar_effective_bits[44][vvar.idx] == (0, 8)
+
     def test_insert_base_is_a_full_width_use(self):
         # the base of an Insert is consumed at full width: every byte outside the inserted range is
         # preserved into the result. EffectiveSizeExtractor used to skip the base entirely, so a vvar
@@ -44,6 +57,17 @@ class TestNarrowingExpressions(unittest.TestCase):
         assert occurrences[ah_vvar.idx] == (8, 16)
         assert 44 in walker.vvars_used_as_insert_base
 
+    def test_insert_over_the_top_bytes_reads_only_the_bytes_below(self):
+        # i386 movsd into xmm0 writes a zero into the upper 8 bytes: v1 = Insert(v0, 8, 0<64>). Only the low 8
+        # bytes of v0 survive into v1, so this use must not keep a 16-byte phi web from being narrowed to 8 bytes
+        base = VirtualVariable(1, 44, 128, VirtualVariableCategory.REGISTER, oident=160)
+        dst = VirtualVariable(3, 48, 128, VirtualVariableCategory.REGISTER, oident=160)
+        stmt = Assignment(5, dst, Insert(4, base, Const(2, 8, 64), Const(6, 0, 64), "Iend_LE"))
+
+        walker = EffectiveSizeExtractor()
+        walker.walk_statement(stmt)
+        assert walker.vvar_effective_bits[44] == {base.idx: (0, 64)}
+
     def test_shared_node_keeps_widest_use(self):
         # v + Conv(8->32, Conv(32->8, v)) where both occurrences of v are the same AIL node (same idx): the
         # narrow use must not hide the full-width one
@@ -54,6 +78,20 @@ class TestNarrowingExpressions(unittest.TestCase):
 
         walker = EffectiveSizeExtractor()
         walker.walk_statement(stmt)
+        assert walker.vvar_effective_bits[44] == {v.idx: (0, 32)}
+
+    def test_deep_shared_node_keeps_widest_use(self):
+        v = VirtualVariable(0, 44, 32, VirtualVariableCategory.REGISTER, oident=16)
+        narrow_use = v
+        for idx in range(1, 1501):
+            narrow_use = BinaryOp(idx, "Add", [narrow_use, Const(-idx, 0, 32)], False, bits=32)
+        narrow_use = BinaryOp(1501, "And", [narrow_use, Const(-1501, 0xFF, 32)], False, bits=32)
+        dst = VirtualVariable(1502, 48, 32, VirtualVariableCategory.REGISTER, oident=16)
+        stmt = Assignment(1503, dst, BinaryOp(1504, "Add", [narrow_use, v], False, bits=32))
+
+        walker = EffectiveSizeExtractor()
+        walker.walk_statement(stmt)
+
         assert walker.vvar_effective_bits[44] == {v.idx: (0, 32)}
 
     def test_narrowing_expressions_after_making_callsite_only(self):
