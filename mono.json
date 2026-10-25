@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "4f8708becb56078c0249d2d7a7a3fe69bcf3fdca",
-      "committed_at": "2026-10-23T11:04:19-07:00",
-      "subject": "Build the Windows libz3 import library from the z3-solver wheel (#7649)",
+      "commit": "25a13b2c953efb46f8fdaeddd547f9e6d4584e3f",
+      "committed_at": "2026-10-24T00:26:10-07:00",
+      "subject": "RustTypeTranslator: Translate signed/unsigned integer and float type constants (#7644)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,13 +123,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-23T21:05:11+00:00",
+  "imported_at": "2026-10-25T09:57:13+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "0ed2ecf5b9655a2c8cad26aa0524e14ae54975cb",
-      "committed_at": "2026-10-22T19:13:51Z",
-      "subject": "Update version to 10.0.6.dev0 [ci skip]",
+      "commit": "7d36e67939c5ecdb0224a974ba18b0447be36523",
+      "committed_at": "2026-10-25T07:26:24Z",
+      "subject": "Add the stripped DecBench cleanflight DALRCF405 O0 binary.",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
