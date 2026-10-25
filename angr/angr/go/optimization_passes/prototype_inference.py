@@ -401,12 +401,12 @@ class GoPrototypeInference(OptimizationPass):
                 expr = src
         if isinstance(expr, Const) and expr.is_int:
             return self._classify_const(leaves, i, expr.value_int)
-        if self._narrowed:
-            # cut to fewer values, a return holds the comparison or the call itself where it held a variable
-            if isinstance(expr, Convert) and expr.from_bits == 1:
-                return "bool", 1
-            if isinstance(expr, Call):
-                return self._single_result(expr, leaves, i)
+        if isinstance(expr, Convert) and expr.from_bits == 1:
+            # a comparison returned directly, rather than through a variable as above
+            return "bool", 1
+        if self._narrowed and isinstance(expr, Call):
+            # cut to fewer values, a return holds the call itself where it held a variable
+            return self._single_result(expr, leaves, i)
         if isinstance(expr, (Convert, BinaryOp)):
             # a narrow field widened to its register
             stripped = self._strip_widening(expr)
@@ -1186,7 +1186,9 @@ class _ResultEvidence(AILBlockViewer):
         self._note_span(expr)
         super()._handle_Struct(expr_idx, expr, stmt_idx, stmt, block)
 
-    def _handle_BinaryOp(self, expr_idx, expr, stmt_idx, stmt, block):
+    def _enter_expr(self, expr_idx, expr, stmt_idx, stmt, block):
+        if not isinstance(expr, BinaryOp):
+            return super()._enter_expr(expr_idx, expr, stmt_idx, stmt, block)
         a, b = expr.operands
         if expr.op in ("CmpEQ", "CmpNE"):
             for x, y in ((a, b), (b, a)):
@@ -1206,7 +1208,7 @@ class _ResultEvidence(AILBlockViewer):
                 w = self._piece(x, 1)
                 if w is not None:
                     self.flags[w].add("len")
-        super()._handle_BinaryOp(expr_idx, expr, stmt_idx, stmt, block)
+        return super()._enter_expr(expr_idx, expr, stmt_idx, stmt, block)
 
     def _type_load(self, expr) -> tuple[int, int] | None:
         """The word ``w`` when ``expr`` is ``Load(w + ws)`` (an itab's type descriptor)."""
