@@ -1,6 +1,7 @@
 # pylint:disable=missing-class-docstring
 from __future__ import annotations
 
+import copy
 from collections import OrderedDict
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -26,9 +27,9 @@ class MultiNode:
         "nodes",
     )
 
-    def __init__(self, nodes: Iterable[Block], addr: int | None = None, idx: int | None = None):
+    def __init__(self, nodes: Iterable[Block | BaseNode | MultiNode], addr: int | None = None, idx: int | None = None):
         # delayed import
-        self.nodes: list[Block] = []
+        self.nodes: list[Block | BaseNode] = []
 
         for node in nodes:
             if isinstance(node, (MultiNode, angr.analyses.decompiler.RegionOverlay)):
@@ -37,7 +38,8 @@ class MultiNode:
                 self.nodes.append(node)
 
         self.addr = addr if addr is not None else self.nodes[0].addr
-        self.idx = idx if idx is not None else self.nodes[0].idx
+        # structurer nodes such as ConditionNode have no block index; fall back to 0, the default index of an AIL block
+        self.idx = idx if idx is not None else self.nodes[0].idx if isinstance(self.nodes[0], Block) else 0
         self._hash = None
 
     def copy(self) -> MultiNode:
@@ -455,6 +457,18 @@ class IncompleteSwitchCaseHeadStatement(_IncompleteSwitchCaseHeadStatementBase):
 
     def _hash_core(self):
         return stable_hash((IncompleteSwitchCaseHeadStatement, self.idx, self.switch_variable, self._case_addrs_str))
+
+    def deep_copy(self, manager):
+        new_idx = manager.next_atom()
+        if manager.variable_map is not None:
+            manager.variable_map.transfer(self, new_idx)
+        return IncompleteSwitchCaseHeadStatement(
+            new_idx,
+            self.switch_variable.deep_copy(manager),
+            list(self.case_addrs),
+            peephole_optimized=self.peephole_optimized,
+            **copy.deepcopy(self.tags),
+        )
 
     def replace(self, old_expr, new_expr):  # pylint:disable=unused-argument
         return self

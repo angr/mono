@@ -6,7 +6,7 @@ import copy
 import logging
 from collections import defaultdict
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import archinfo
 import capstone
@@ -20,8 +20,10 @@ from angr.analyses.analysis import Analysis, register_analysis
 from angr.analyses.reaching_definitions import ReachingDefinitionsAnalysis, get_all_definitions
 from angr.calling_conventions import (
     SimCC,
+    SimCCAArch64,
     SimCCMicrosoftThiscall,
     SimCCS390X,
+    SimCCSyscall,
     SimFunctionArgument,
     SimRegArg,
     SimStackArg,
@@ -59,6 +61,7 @@ from angr.sim_type import (
     SimTypeShort,
     mangled_long_double_as_double,
     parse_cpp_file,
+    wchar_t_type,
 )
 from angr.sim_variable import SimRegisterVariable, SimStackVariable
 from angr.utils.constants import DEFAULT_STATEMENT
@@ -271,7 +274,7 @@ class CallingConventionAnalysis(Analysis):
                         max_analyzing_callsites=1,
                         include_callsite_preds=include_callsite_preds,
                     )
-                    cc_cls = default_cc_for_project(self.project)
+                    cc_cls = default_cc_for_project(self.project, syscall=self._function.is_syscall)
                     cc = cc_cls(self.project.arch) if cc_cls is not None else None
                     prototype = None
                     if callsite_facts:
@@ -379,23 +382,35 @@ class CallingConventionAnalysis(Analysis):
         )
         return SimTypeFunction(args, ret, variadic=machine_proto.variadic)
 
+    def _callsite_target_is_syscall(self) -> bool:
+        """Does the call at this call site target a syscall?"""
+        assert self.caller_func_addr is not None
+        try:
+            caller = self.kb.functions.get_by_addr(self.caller_func_addr)
+        except KeyError:
+            return False
+        target = caller.get_call_target(self.callsite_block_addr)
+        return target is not None and self.project.simos.is_syscall_addr(target)
+
     def _analyze_callsite_only(self):
         assert self.caller_func_addr is not None
         assert self.callsite_block_addr is not None
         assert self.callsite_insn_addr is not None
         cc, prototype = None, None
 
+        callee_is_syscall = self._callsite_target_is_syscall()
         for include_callsite_preds in [False, True]:
             fact = self._analyze_callsite(
                 self.caller_func_addr,
                 self.callsite_block_addr,
                 self.callsite_insn_addr,
                 include_preds=include_callsite_preds,
+                callee_is_syscall=callee_is_syscall,
             )
             if fact is None:
                 continue
             callsite_facts = [fact]
-            cc_cls = default_cc_for_project(self.project)
+            cc_cls = default_cc_for_project(self.project, syscall=callee_is_syscall)
             cc = cc_cls(self.project.arch) if cc_cls is not None else None
             prototype = SimTypeFunction([], None)
             prototype = self._adjust_prototype(
@@ -415,25 +430,40 @@ class CallingConventionAnalysis(Analysis):
         """
         assert self._function is not None
 
-        if len(self._function.jumpout_sites) != 1:
+        jumpout_sites = self._function.jumpout_sites
+        if len(jumpout_sites) > 1:
             l.warning(
                 "%r has more than one jumpout sites. It does not look like a PLT stub. Please report to GitHub.",
                 self._function,
             )
             return None
 
-        jo_site = self._function.jumpout_sites[0]
+        if jumpout_sites:
+            jo_site = jumpout_sites[0]
 
-        successors = list(self._function.transition_graph.successors(jo_site))
-        if len(successors) != 1:
-            l.warning(
-                "%r has more than one successors. It does not look like a PLT stub. Please report to GitHub.",
-                self._function,
-            )
-            return None
+            successors = list(self._function.transition_graph.successors(jo_site))
+            if len(successors) != 1:
+                l.warning(
+                    "%r does not have exactly one successor. It does not look like a PLT stub. Please report to "
+                    "GitHub.",
+                    self._function,
+                )
+                return None
+            target_addr = successors[0].addr
+        else:
+            plt_name = self.project.loader.find_plt_stub_name(self._function.addr)
+            real_symbol = self.project.loader.find_symbol(plt_name) if plt_name is not None else None
+            if real_symbol is None:
+                l.warning(
+                    "%r has no jumpout site or resolvable loader target. It does not look like a PLT stub. Please "
+                    "report to GitHub.",
+                    self._function,
+                )
+                return None
+            target_addr = real_symbol.rebased_addr
 
         try:
-            real_func = self.kb.functions.get_by_addr(successors[0].addr)
+            real_func = self.kb.functions.get_by_addr(target_addr)
         except KeyError:
             # the real function does not exist for some reason
             real_func = None
@@ -455,12 +485,34 @@ class CallingConventionAnalysis(Analysis):
                         # we only take the prototype from the SimProcedure if
                         # - the SimProcedure is a function
                         # - the prototype of the SimProcedure is not guessed
-                        return cc, hooker.prototype, hooker.library_name, False
+                        return (
+                            cc,
+                            cast(SimTypeFunction | None, hooker.prototype),
+                            cast(str | None, hooker.library_name),
+                            hooker.prototype is None,
+                        )
                 real_proto = real_func.get_prototype(self._flavor)
                 if real_proto is not None:
                     return cc, real_proto, real_func.prototype_libname, False
             else:
-                return cc, real_func.get_prototype(self._flavor), real_func.prototype_libname, False
+                real_proto = real_func.get_prototype(self._flavor)
+                return cc, real_proto, real_func.prototype_libname, real_proto is None
+
+        if self.project.is_hooked(target_addr):
+            hooker = self.project.hooked_by(target_addr)
+            if hooker is not None and hooker.is_function and not hooker.guessed_prototype:
+                cc = hooker.cc
+                if cc is None:
+                    cc_cls = default_cc_for_project(self.project)
+                    if cc_cls is None:
+                        return None
+                    cc = cc_cls(self.project.arch)
+                return (
+                    cc,
+                    cast(SimTypeFunction | None, hooker.prototype),
+                    cast(str | None, hooker.library_name),
+                    hooker.prototype is None,
+                )
 
         if self.analyze_callsites:
             # determine the calling convention by analyzing its callsites
@@ -485,7 +537,8 @@ class CallingConventionAnalysis(Analysis):
         :param name:    The demangled name of the function.
         :return:        A tuple of the calling convention, the function type, and the library name if available.
         """
-        parsed, _ = parse_cpp_file(name)
+        os_name = self.project.simos.name if self.project.simos is not None else None
+        parsed, _ = parse_cpp_file(name, predefined_types={"wchar_t": wchar_t_type(self.project.arch, os_name)})
         if not parsed or len(parsed) != 1:
             return None
         proto = mangled_long_double_as_double(next(iter(parsed.values())), self.project.arch)
@@ -657,6 +710,7 @@ class CallingConventionAnalysis(Analysis):
         caller_block_addr: int,
         call_insn_addr: int,
         include_preds: bool = False,
+        callee_is_syscall: bool = False,
     ) -> CallSiteFact | None:
         func = self.kb.functions[caller_addr]
         subgraph = self._generate_callsite_subgraph(func, caller_block_addr, include_preds=include_preds)
@@ -679,7 +733,7 @@ class CallingConventionAnalysis(Analysis):
             flavor=self._flavor,
         )
         # rda_model: Optional[ReachingDefinitionsModel] = self.kb.defs.get_model(caller.addr)
-        return self._collect_callsite_fact(caller_block, call_insn_addr, rda.model)
+        return self._collect_callsite_fact(caller_block, call_insn_addr, rda.model, callee_is_syscall=callee_is_syscall)
 
     def _extract_and_analyze_callsites(
         self,
@@ -812,12 +866,16 @@ class CallingConventionAnalysis(Analysis):
         caller_block,
         call_insn_addr: int,
         rda: ReachingDefinitionsModel,
+        callee_is_syscall: bool = False,
     ) -> CallSiteFact:
         fact = CallSiteFact(
             True,  # by default we treat all return values as used
         )
 
-        default_cc_cls = default_cc_for_project(self.project)
+        # Whose convention describes these argument slots: the syscall convention when this call
+        # site targets a syscall, or when the function being analyzed is itself one.
+        syscall = callee_is_syscall or (self._function is not None and self._function.is_syscall)
+        default_cc_cls = default_cc_for_project(self.project, syscall=syscall)
         if default_cc_cls is not None:
             cc: SimCC = default_cc_cls(self.project.arch)
             self._analyze_callsite_return_value_uses(cc, caller_block.addr, rda, fact)
@@ -947,7 +1005,15 @@ class CallingConventionAnalysis(Analysis):
         temp_args: list[SimFunctionArgument | None] = []
         expected_args: list[SimFunctionArgument] = []
         for _ in range(30):  # at most 30 arguments
-            arg_loc = cc.next_arg(arg_session, default_type_cls().with_arch(self.project.arch))
+            try:
+                arg_loc = cc.next_arg(arg_session, default_type_cls().with_arch(self.project.arch))
+            except (TypeError, ValueError):
+                if not isinstance(cc, SimCCSyscall):
+                    raise
+                # SimCCX86LinuxSyscall and SimCCARMLinuxSyscall declare a fixed set of
+                # argument registers and refuse once those are spent instead of spilling,
+                # so for them out of locations means out of arguments.
+                break
             expected_args.append(arg_loc)
             if isinstance(arg_loc, SimRegArg):
                 reg_offset = self.project.arch.registers[arg_loc.reg_name][0]
@@ -1191,8 +1257,10 @@ class CallingConventionAnalysis(Analysis):
         self, input_args: set[SimRegArg | SimStackArg], for_matching: bool = True
     ) -> set[SimRegArg | SimStackArg]:
         """
-        Normalize FP sub-registers (``xmm0lq`` -> ``xmm0``, ``s0`` -> ``d0``) so they match FP_ARG_REGS, and on
-        AMD64/X86 expand GPR sub-registers (``edi`` -> ``rdi``).
+        Normalize FP sub-registers (``xmm0lq`` -> ``xmm0``, ``s0`` -> ``d0``) so they match FP_ARG_REGS, on
+        AMD64/X86 expand GPR sub-registers (``edi`` -> ``rdi``), and on AArch64 name a GPR sub-register by its full
+        register (``w1`` -> a 32-bit ``x1``) when the argument registers from the lowest one read up to it were all
+        read.
 
         On S390X with ``for_matching``, also expand GPR sub-registers (``r2_32`` -> ``r2``) and move stack args that
         sit in the low half of a big-endian 8-byte slot (``[0xa4]``) to the slot (``[0xa0]``), which is what
@@ -1204,6 +1272,7 @@ class CallingConventionAnalysis(Analysis):
 
         if self.project.arch.name in {"AMD64", "X86", "AARCH64"}:
             new_input_args = set()
+            narrowed: dict[str, SimRegArg] = {}  # AArch64: full register name -> the sub-register read it replaced
             for a in input_args:
                 if not isinstance(a, SimRegArg):
                     new_input_args.add(a)
@@ -1216,19 +1285,53 @@ class CallingConventionAnalysis(Analysis):
                         if arg not in new_input_args:
                             new_input_args.add(arg)
                         continue
-                elif a.size < self.project.arch.bytes and self.project.arch.name != "AARCH64":
+                elif a.size < self.project.arch.bytes:
                     full_reg_offset, full_reg_size = get_reg_offset_base_and_size(
                         reg_offset, self.project.arch, size=reg_size
                     )
                     full_reg_name = self.project.arch.translate_register_name(full_reg_offset, size=full_reg_size)
-                    arg = SimRegArg(full_reg_name, full_reg_size)
+                    # an AArch64 argument keeps the width it was read with (w1 is x1 read as 32 bits), as SimCCAArch64
+                    # places a 32-bit argument
+                    arg = SimRegArg(full_reg_name, a.size if self.project.arch.name == "AARCH64" else full_reg_size)
+                    if self.project.arch.name == "AARCH64" and a.reg_name != full_reg_name:
+                        narrowed[full_reg_name] = a
                     if arg not in new_input_args:
                         new_input_args.add(arg)
                     continue
                 new_input_args.add(a)
+            if narrowed:
+                self._drop_detached_aarch64_reads(new_input_args, narrowed)
             return new_input_args
 
         return set(input_args)
+
+    @staticmethod
+    def _drop_detached_aarch64_reads(input_args: set[SimRegArg | SimStackArg], narrowed: dict[str, SimRegArg]) -> None:
+        """
+        On AArch64, undo the renaming of a w register read to its x register when an argument register between the
+        lowest one the function reads and this one is not read, so that SimCC._match drops the read as it does any w
+        register. A callee prototype with one argument too many produces such a read: the demangled name of a static
+        C++ member function gives it a ``this``, so a call that sets x0-x3 for its four arguments seems to pass w4 as
+        well, and the caller, which never set w4, would take it as an argument of its own.
+
+        :param input_args:  The consolidated input arguments, updated in place.
+        :param narrowed:    Each full register name that replaced a w register read, mapped to that read.
+        """
+        regs = SimCCAArch64.ARG_REGS
+        read = {a.reg_name for a in input_args if isinstance(a, SimRegArg)}
+        for i, reg in enumerate(regs):
+            if reg not in narrowed or reg not in read:
+                continue
+            lowest = next(j for j, r in enumerate(regs) if r in read)
+            if all(r in read for r in regs[lowest:i]):
+                continue
+            w_read = narrowed[reg]
+            for a in [a for a in input_args if isinstance(a, SimRegArg) and a.reg_name == reg]:
+                if a.size == w_read.size:
+                    input_args.discard(a)
+            input_args.add(w_read)
+            if not any(isinstance(a, SimRegArg) and a.reg_name == reg for a in input_args):
+                read.discard(reg)
 
     def _consolidate_input_args_s390x(
         self, input_args: set[SimRegArg | SimStackArg], for_matching: bool
@@ -1584,9 +1687,10 @@ class CallingConventionAnalysis(Analysis):
                     if id(lib) not in seen and not isinstance(lib, SimSyscallLibrary):
                         seen.add(id(lib))
                         libs.append(lib)
+        os_name = self.project.simos.name if self.project.simos is not None else None
         for lib in libs:
             if lib.has_prototype(name):
-                proto = lib.get_prototype(name, arch=self.project.arch)
+                proto = lib.get_prototype(name, arch=self.project.arch, os_name=os_name)
                 if proto is not None:
                     return proto
         return None
@@ -2009,9 +2113,13 @@ class CallingConventionAnalysis(Analysis):
                 # This handles cases like fp_recursive where the FP return value is
                 # written in a predecessor block and the return block only does
                 # stack cleanup + ret.  We check both x87 PutI and vector register Put.
-                if not fpretval_updated:
+                # normalize() moves a split block's return-site flag onto the block that shares its
+                # end address, which may belong to another function, so a ret site is not always a
+                # node of the local transition graph.
+                local_graph = self._function.graph
+                if not fpretval_updated and ret_block in local_graph:
                     # First pass: direct predecessors (most common case + callee call detection)
-                    for pred in self._function.graph.predecessors(ret_block):
+                    for pred in local_graph.predecessors(ret_block):
                         try:
                             pred_irsb = self.project.factory.block(pred.addr, size=pred.size).vex
                         except SimTranslationError:

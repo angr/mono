@@ -8,7 +8,14 @@ import unittest
 
 from angr import ailment
 from angr.analyses.decompiler.empty_node_remover import EmptyNodeRemover
-from angr.analyses.decompiler.structurer_nodes import BreakNode, CodeNode, LoopNode, MultiNode, SequenceNode
+from angr.analyses.decompiler.structurer_nodes import (
+    BreakNode,
+    CodeNode,
+    ContinueNode,
+    LoopNode,
+    MultiNode,
+    SequenceNode,
+)
 from angr.utils.hashing import stable_hash
 
 
@@ -33,6 +40,18 @@ class TestStructurerNodeAddresses(unittest.TestCase):
         assert isinstance(result, SequenceNode)
         assert result.nodes == []
         assert result.addr == 0x400000
+
+    def test_empty_node_remover_rebuilds_multinode_led_by_structurer_node(self):
+        # removing the empty block leaves a BreakNode first, and a BreakNode has no block index
+        brk = BreakNode(0x400004, 0x400100)
+        cont = ContinueNode(0x400008, 0x400000)
+        root = SequenceNode(0x400000, nodes=[MultiNode([ailment.Block(0x400000, 0), brk, cont])])
+        result = EmptyNodeRemover(root, ailment.Manager()).result
+        assert len(result.nodes) == 1
+        multinode = result.nodes[0]
+        assert isinstance(multinode, MultiNode)
+        assert multinode.nodes == [brk, cont]
+        assert (multinode.addr, multinode.idx) == (0x400004, 0)
 
     def test_loopnode_addr_is_fixed_at_construction(self):
         loop = LoopNode("while", None, SequenceNode(0x400000, nodes=[]))
