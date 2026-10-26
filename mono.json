@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "4f8708becb56078c0249d2d7a7a3fe69bcf3fdca",
-      "committed_at": "2026-10-23T11:04:19-07:00",
-      "subject": "Build the Windows libz3 import library from the z3-solver wheel (#7649)",
+      "commit": "c1101f3083ba0c917de76077ea6b99c5182f4e16",
+      "committed_at": "2026-10-26T02:03:41-07:00",
+      "subject": "Phoenix: Multiple switch-case-related or inspired fixes. (#7658)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,13 +123,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-23T21:05:11+00:00",
+  "imported_at": "2026-10-26T09:57:42+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "0ed2ecf5b9655a2c8cad26aa0524e14ae54975cb",
-      "committed_at": "2026-10-22T19:13:51Z",
-      "subject": "Update version to 10.0.6.dev0 [ci skip]",
+      "commit": "6661d8542e3c5da26135cbbdda1ec74202d0b9f8",
+      "committed_at": "2026-10-26T09:49:35Z",
+      "subject": "Add stripped openssh sftp-server (O2, no inlining): main tail-jumps to the non-returning sftp_server_main.",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
