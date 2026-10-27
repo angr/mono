@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "c1101f3083ba0c917de76077ea6b99c5182f4e16",
-      "committed_at": "2026-10-26T02:03:41-07:00",
-      "subject": "Phoenix: Multiple switch-case-related or inspired fixes. (#7658)",
+      "commit": "aaf96e6c28b1856bbc483db30275e1a4db6e1352",
+      "committed_at": "2026-10-26T23:41:12-07:00",
+      "subject": "EagerEval: Assign a new idx for the constant from x + x => x * 2 (#7678)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "a177590e218181e1b9bba7924a5b99ebc37f45b4",
-      "committed_at": "2026-10-23T12:39:29-07:00",
-      "subject": "Format the invalid URL error in download_url() (#1756)",
+      "commit": "ec800ec5c45b7766e51921168ffe8b98fadf24e0",
+      "committed_at": "2026-10-26T11:22:01-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#1758)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -52,25 +52,25 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "77f457372957ae53b8a4d1e828ebfcbe2edea361",
-      "committed_at": "2026-10-22T19:13:49Z",
-      "subject": "Update version to 10.0.6.dev0 [ci skip]",
+      "commit": "cb5e2e5cba2514c6bdd9b50013b60854392458ab",
+      "committed_at": "2026-10-26T11:22:35-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#394)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "claripy": {
       "upstream": "https://github.com/angr/claripy",
-      "commit": "db744e11e07886e2c9e37cde901025cded918075",
-      "committed_at": "2026-10-12T16:52:04-07:00",
-      "subject": "README: Add claripy rewrite notice (#750)",
+      "commit": "6aad5d40ab7b2a800bda2ad7a5e53cbe10afb199",
+      "committed_at": "2026-10-26T08:58:32-07:00",
+      "subject": "Bump certifi from 2025.11.12 to 2026.10.19 (#751)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "ec3c2df651f55105b0376cf7239d3e3c9d0cf677",
-      "committed_at": "2026-10-22T19:13:52Z",
-      "subject": "Update version to 10.0.6.dev0 [ci skip]",
+      "commit": "ac7bab8766473290d1a5c164525c2ea021f78a03",
+      "committed_at": "2026-10-26T11:22:55-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#880)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -87,25 +87,25 @@
     },
     "pypcode": {
       "upstream": "https://github.com/angr/pypcode",
-      "commit": "91fe7c2b49860845d38355084bd24d9895e73ac4",
-      "committed_at": "2026-10-19T13:46:00-07:00",
-      "subject": "ci: bump pypa/cibuildwheel from 4.3.0 to 4.3.1",
+      "commit": "934ccb10ba48e5c33734176675572d84e5116446",
+      "committed_at": "2026-10-26T13:24:04-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pysoot": {
       "upstream": "https://github.com/angr/pysoot",
-      "commit": "51abe8cc567746497ea8f58a8a87acea7ea74e7e",
-      "committed_at": "2026-10-19T12:38:30-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#64)",
+      "commit": "923ec64577978b177610415578dd83044cdb4cb9",
+      "committed_at": "2026-10-26T11:23:41-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#65)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "693d4922f8e84a2e03f3084a7e5be6ced4804982",
-      "committed_at": "2026-10-22T19:13:53Z",
-      "subject": "Update version to 10.0.6.dev0 [ci skip]",
+      "commit": "8c19aac98dc3bd931732a96b4c04cc1970e31dfb",
+      "committed_at": "2026-10-26T11:23:34-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#601)",
       "excluded": [
         ".gitmodules"
       ],
@@ -123,13 +123,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-26T09:57:42+00:00",
+  "imported_at": "2026-10-27T09:57:45+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "6661d8542e3c5da26135cbbdda1ec74202d0b9f8",
-      "committed_at": "2026-10-26T09:49:35Z",
-      "subject": "Add stripped openssh sftp-server (O2, no inlining): main tail-jumps to the non-returning sftp_server_main.",
+      "commit": "76ad9e296dde8f82b8ede93ce06a578cd1933639",
+      "committed_at": "2026-10-26T17:24:36Z",
+      "subject": "Add stripped zlib minigzip (O0) for the Phoenix switch-default-is-loop-latch structuring test (gz_decomp).",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }

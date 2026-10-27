@@ -1696,7 +1696,15 @@ class PhoenixStructurer(StructurerBase):
             node_default = self._switch_find_default_node(graph, node, node_default_addr, node_default_idx)
             if node_default is not None and not self._switch_default_node_needs_stub(graph, node, node, node_default):
                 full_graph = full_graph_raw.filtered()
-                if full_graph.out_degree[node_default] > 1 or any(
+                # check if there is a back edge that goes from the default node to the switch head. obviously it
+                # cannot be structured away.
+                unresolved_succs = [
+                    succ
+                    for succ in full_graph.successors(node_default)
+                    if succ is not node
+                    and not full_graph.edge_marked(node_default, succ, mark_name="cyclic_refinement_outgoing")
+                ]
+                if len(unresolved_succs) > 1 or any(
                     pred is not node and pred not in nodes.values() for pred in graph.predecessors(node_default)
                 ):
                     # the default node must be structured first
@@ -3947,6 +3955,9 @@ class PhoenixStructurer(StructurerBase):
         ):
             # the switch head keeps the case; _switch_build_cases() emits a goto for the detached entry
             pass
+        elif self._all_paths_transfer_control(block):
+            # get_last_statement() only saw one arm; no path falls through, so a trailing goto would be unreachable
+            pass
         else:
             # get_last_statement() may return a jump nested in a one-armed ConditionNode; the fall-through path still
             # needs its own goto
@@ -3983,6 +3994,18 @@ class PhoenixStructurer(StructurerBase):
             remove_last_statements(block)
         final_src = src if owner is not None else (new_src if new_src is not None else block)
         return not self._region.view_with_successors().has_edge(final_src, dst)
+
+    def _all_paths_transfer_control(self, node) -> bool:
+        """Whether every exit path of node ends with a return, an unconditional jump, a break, or a continue."""
+        try:
+            last_stmts = self.cond_proc.get_last_statements(node)
+        except EmptyBlockNotice:
+            return False
+        return bool(last_stmts) and all(
+            isinstance(stmt, (Return, BreakNode, ContinueNode))
+            or (isinstance(stmt, Jump) and isinstance(stmt.target, Const))
+            for stmt in last_stmts
+        )
 
     def _should_use_multistmtexprs(self, node: Block | BaseNode) -> bool:
         """
