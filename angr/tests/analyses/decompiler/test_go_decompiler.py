@@ -453,6 +453,59 @@ class TestReceiverNamesI386Go127(GoDecompilationTarget):
         assert "func (a *internal/strconv.decimal) Assign(" in self.texts["internal/strconv.(*decimal).Assign"]
 
 
+class TestFloatPhiI386Go127(GoDecompilationTarget):
+    """
+    386 loads a float64 into xmm with movsd, which VEX lifts as two 8-byte writes, the upper one a zero. Where such a
+    load meets a full-width write of the register, the merged value must still get its phi.
+    """
+
+    BINARY = go_binary("go1.27.1", "strcat", arch="i386")
+    FUNCS = ("runtime.(*gcControllerState).endCycle",)
+
+    def test_utilization_merges_both_paths(self):
+        # utilization := gcBackgroundUtilization
+        # if assistDuration > 0 { utilization += float64(c.assistTime.Load()) / float64(assistDuration*int64(procs)) }
+        text = self.texts["runtime.(*gcControllerState).endCycle"]
+        m = re.search(r"^\s*(\w+) = \S+ \+ \w+ / \w+$", text, re.MULTILINE)
+        assert m, text
+        # c.consMark = ... / ((1 - utilization) * ...) reads the merged value
+        assert re.search(rf"\(\S+ - {m.group(1)}\) \* ", text), text
+
+
+class TestFloatNegI386Go127(GoDecompilationTarget):
+    """
+    386 negates a float64 by XORing its xmm register with a sign-mask constant. Once the register is narrowed to the 8
+    bytes the value occupies, the XOR is 64 bits wide, which no 386 general-purpose register op produces, so it is still
+    a negation when its operand is a float64 passed on the stack.
+    """
+
+    BINARY = go_binary("go1.27.1", "strcat", arch="i386")
+    FUNCS = ("runtime.modf", "runtime.ceil")
+
+    def test_negated_stack_arguments_are_named(self):
+        # if f < 0 { int, frac = modf(-f); ... } (src/runtime/float.go)
+        text = self.texts["runtime.modf"]
+        assert "runtime.modf(fneg(f))" in text, text
+        assert "f ^ 0x8000000000000000" not in text, text
+        # return -floor(-x)
+        text = self.texts["runtime.ceil"]
+        assert "runtime.floor(fneg(x))" in text, text
+        assert "x ^ 0x8000000000000000" not in text, text
+
+
+class TestUnnamedParamsGo127(GoDecompilationTarget):
+    """Go signatures name unnamed and blank parameters ``~pN``, which is not a Go identifier."""
+
+    BINARY = go_binary("go1.27.1", "basics_stripped")
+    FUNCS = ("runtime.(*PanicNilError).Error", "internal/sync.throw")
+
+    def test_unnamed_params(self):
+        error, throw = self.texts["runtime.(*PanicNilError).Error"], self.texts["internal/sync.throw"]
+        assert "func (a0 *runtime.PanicNilError) Error() string {" in error, error
+        assert "func internal/sync.throw(a0 string) {" in throw and "runtime.throw(a0)" in throw, throw
+        assert "~p" not in error + throw
+
+
 class TestMapsArmGo127(GoDecompilationTarget):
     """
     A map read on 32-bit arm folds to m[k]: the fold labels the result words with arm's r0/r1 (it raised KeyError for
@@ -554,6 +607,38 @@ class TestBasicsGo127Stripped(GoDecompilationTarget):
         assert {a: str(v) for a, v in plugin.variables.items()} == {a: str(v) for a, v in before.items()}
         assert progress[0] == 0.0 and progress[-1] == 100.0 and progress == sorted(progress)
         assert len(progress) > 3
+
+
+class ClosurePrototypes(TargetChecks):
+    """
+    In a stripped binary no signature source names a closure; the parameter its func value is passed as types it.
+    ``exitsyscall.func3`` (a stack funcval) goes to ``systemstack(fn func())`` and returns nothing, although the first
+    result register holds a value at every return; ``printCgoTraceback.func1`` (a static funcval) goes to
+    ``printOneCgoTraceback`` as a ``func() (bool, bool)``. Each is decompiled before its parent.
+    """
+
+    FUNCS = (
+        "runtime.exitsyscall.func3",
+        "runtime.printCgoTraceback.func1",
+        "runtime.exitsyscall",
+        "runtime.printCgoTraceback",
+    )
+
+    def test_closure_prototypes_from_their_uses(self):
+        text = self.texts["runtime.exitsyscall.func3"]
+        assert self.header(text).endswith(") {"), text
+        returns = [line.strip() for line in text.splitlines() if line.strip().startswith("return")]
+        assert returns and all(line == "return" for line in returns), text
+        text = self.texts["runtime.printCgoTraceback.func1"]
+        assert self.header(text).endswith(" (bool, bool) {"), text
+
+
+class TestClosurePrototypesGo127Stripped(ClosurePrototypes, GoDecompilationTarget):
+    BINARY = go_binary("go1.27.1", "basics_stripped")
+
+
+class TestClosurePrototypesGo127AArch64Stripped(ClosurePrototypes, GoDecompilationTarget):
+    BINARY = go_binary("go1.27.1", "basics_stripped", arch="aarch64")
 
 
 class TestIfaceGo127Stripped(GoDecompilationTarget):
