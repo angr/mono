@@ -11,7 +11,11 @@ from unittest import mock
 from angr.ailment.expression import UnaryOp, VirtualVariable
 from angr.ailment.expression import VirtualVariableCategory as VVC
 from angr.ailment.statement import Assignment
+from angr.analyses import Decompiler
+from angr.enums import Flavors
 from angr.go.optimization_passes.runtime_rewriter import GoRuntimeRewriter
+from angr.knowledge_plugins.functions.function import PrototypeSource
+from angr.sim_type import SimTypeBottom, SimTypeFunction, SimTypeLongLong
 from tests.analyses.decompiler.test_go_decompiler import GoDecompilationTarget, go_binary, go_func_addrs
 from tests.common import load_project_with_scoped_cfg
 
@@ -108,6 +112,25 @@ class TestClosuresStrippedGo127(GoDecompilationTarget):
         assert "*ctx.X0 = " in self.texts["main.counter.func1"]
 
 
+class TestClosureReturnedWithoutGuessedResult(unittest.TestCase):
+    def test_returned_closure_makes_the_result(self):
+        # decompiled alone, main.scaler gets a guessed result word; the guess can also have none, as set here, and the
+        # closure the function returns must still become its result
+        path = go_binary("go1.27.1", "closures_stripped")
+        addr = go_func_addrs(path, "main.scaler")["main.scaler"]
+        proj, cfg = load_project_with_scoped_cfg(path, addr, call_tree_depth=1)
+        func = proj.kb.functions[addr]
+        guess = SimTypeFunction([SimTypeLongLong()], SimTypeBottom(label="void")).with_arch(proj.arch)
+        assert isinstance(guess, SimTypeFunction)
+        func.set_prototype(Flavors.GO_FLAVOR, guess, source=PrototypeSource.CCA_LOW)
+        dec = proj.analyses[Decompiler].prep(fail_fast=True)(func, cfg=cfg.model, flavor="go")
+        assert dec.codegen is not None and dec.codegen.text is not None
+        text = dec.codegen.text
+        assert re.search(r"^\s+return main\.scaler\.func1\{X0: \w+\}$", text, re.MULTILINE), text
+        header = GoDecompilationTarget.header(text)
+        assert re.search(r"\) (\*runtime\.funcval|func\(.*\).*) \{$", header), text
+
+
 class TestStackClosureSelfReference(unittest.TestCase):
     def test_record_ends_at_its_own_address(self):
         # i386 esbuild matchTSConfigPaths: _context_offsets over-claimed a word, and the slot there held &record (an
@@ -157,6 +180,28 @@ class TestStackClosureSelfReference(unittest.TestCase):
         assert "end" in state
         text = dec.codegen.text
         assert "sort.Slice(items, main.sortItems.func1{cap_0: items})" in text, text
+
+
+class TestStaticFuncvalVariableGo127(GoDecompilationTarget):
+    """
+    runtime.callCgoSymbolizer assigns ``call := cgocall`` or ``call = asmcgocall``, both static funcvals, and calls
+    ``call(_cgo_call_symbolizer_function, noescape(unsafe.Pointer(arg)))`` through the variable.
+    """
+
+    BINARY = go_binary("go1.27.1", "basics")
+    # cgocall and asmcgocall are reached only through the func value, so the scoped CFG needs them named
+    FUNCS = ("runtime.callCgoSymbolizer", "runtime.cgocall", "runtime.asmcgocall")
+
+    def test_call_through_func_variable(self):
+        text = self.texts["runtime.callCgoSymbolizer"]
+        m = re.search(r"^\s+(\w+) = runtime\.cgocall$", text, re.MULTILINE)
+        assert m, text
+        call = rf"^\s+{m.group(1)}\(_cgo_call_symbolizer_function, runtime\.noescape\(arg\)\)$"
+        assert re.search(call, text, re.MULTILINE), text
+
+
+class TestStaticFuncvalVariableAArch64Go127(TestStaticFuncvalVariableGo127):
+    BINARY = go_binary("go1.27.1", "basics", "aarch64")
 
 
 if __name__ == "__main__":
