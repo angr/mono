@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "aaf96e6c28b1856bbc483db30275e1a4db6e1352",
-      "committed_at": "2026-10-26T23:41:12-07:00",
-      "subject": "EagerEval: Assign a new idx for the constant from x + x => x * 2 (#7678)",
+      "commit": "5703b0d8bd01662199d91b3b350db279a7d5d739",
+      "committed_at": "2026-10-27T11:14:23-07:00",
+      "subject": "claripy: build Base results with Base::from_ast (#7686)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,7 +123,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-27T09:57:45+00:00",
+  "imported_at": "2026-10-28T09:59:46+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
