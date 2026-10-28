@@ -652,20 +652,20 @@ class PhoenixStructurer(StructurerBase):
                             drop_succ = False
                             succ_ = succ
 
+                            # loop refinement may already have turned jumps to the latch into continues, which are right
+                            # only if the latch becomes part of the loop condition
+                            latch_continues = self._continues_to(node, succ.addr)
+
                             # absorb the entire succ block if possible
                             if (
                                 self._improve_algorithm
                                 and self._is_sequential_statement_block(succ)
-                                and self._should_use_multistmtexprs(succ)
+                                and self._should_use_multistmtexprs(succ, apply_limits=not latch_continues)
                             ):
                                 r = self._build_multistatementexpr_statements(succ)
                                 assert r is not None
                                 stmts, phi_stmts = r
-                                if (
-                                    stmts
-                                    and sum(1 for stmt in stmts if not isinstance(stmt, Label))
-                                    <= self._multistmtexpr_stmt_threshold
-                                ):
+                                if stmts:
                                     edge_cond_succhead = MultiStatementExpression(
                                         self.ail_manager.next_atom(),
                                         stmts,
@@ -684,14 +684,19 @@ class PhoenixStructurer(StructurerBase):
                                         else Block(succ.addr, 0, statements=phi_stmts)
                                     )
 
+                            body = node
+                            if latch_continues and not drop_succ and self._count_statements(succ_):
+                                # the latch could not be folded and stays at the end of the body, where a continue would
+                                # skip its statements. phi assignments do not count: dephication removes them
+                                body = self._replace_continues_with_jumps(node, latch_continues, succ)
                             if drop_succ:
-                                new_node = SequenceNode(node.addr, nodes=[node])
-                            elif self._last_jump_leaves(node, succ.addr):
-                                new_node = SequenceNode(node.addr, nodes=[node, succ_])
+                                new_node = SequenceNode(node.addr, nodes=[body])
+                            elif self._last_jump_leaves(body, succ.addr):
+                                new_node = SequenceNode(node.addr, nodes=[body, succ_])
                             else:
                                 # the kept phi block directly follows node: as in any sequence, node's jump to it falls
                                 # through instead of becoming a goto to the next line
-                                new_node = self._merge_nodes(node, succ_)
+                                new_node = self._merge_nodes(body, succ_)
                             loop_node = LoopNode(
                                 "do-while",
                                 edge_cond_succhead,
@@ -1047,7 +1052,24 @@ class PhoenixStructurer(StructurerBase):
                         break_cond = self.cond_proc.recover_edge_condition(fullgraph, src_block, dst)
                         assert successor.addr is not None
                         split_src_block = None
-                        if claripy.is_true(break_cond):
+                        edge_is_unconditional = claripy.is_true(break_cond)
+                        fallthrough_node = (
+                            None
+                            if edge_is_unconditional
+                            else next(iter(succ for succ in fullgraph.successors(src) if succ is not dst), None)
+                        )
+                        if not edge_is_unconditional and fallthrough_node is None:
+                            # dst is src's only successor in the graph, so the graph gives a conditional break nothing
+                            # to fall through to. If src_block does not end in a conditional jump, the break may
+                            # instead be unconditional, which only src_block's statements and its place in src can
+                            # show: the recovered condition cannot. For a head-controlled loop block it is read off the
+                            # block's first internal conditional jump, which need not be the edge's.
+                            edge_is_unconditional = (
+                                not isinstance(last_src_stmt, ConditionalJump)
+                                and self._block_only_exits_to(src_block, successor)
+                                and self._node_ends_with(src, src_block)
+                            )
+                        if edge_is_unconditional:
                             break_stmt = Jump(
                                 self.ail_manager.next_atom(),
                                 Const(self.ail_manager.next_atom(), successor.addr, self.project.arch.bits),
@@ -1056,9 +1078,6 @@ class PhoenixStructurer(StructurerBase):
                             )
                             break_node = Block(last_src_stmt.tags["ins_addr"], None, statements=[break_stmt])
                         else:
-                            fallthrough_node = next(
-                                iter(succ for succ in fullgraph.successors(src) if succ is not dst), None
-                            )
                             if fallthrough_node is not None:
                                 # we create a conditional jump that will be converted to a conditional break later
                                 break_stmt = Jump(
@@ -1111,7 +1130,7 @@ class PhoenixStructurer(StructurerBase):
                                 # the fallthrough node does not exist in the graph. we create a conditional jump that
                                 # jumps to an address
                                 if not isinstance(last_src_stmt, ConditionalJump):
-                                    raise TypeError(f"Unexpected last_src_stmt type {type(last_src_stmt)}")
+                                    raise TypeError(f"Unexpected last_src_stmt {last_src_stmt!r}")
                                 other_target = (
                                     last_src_stmt.true_target
                                     if isinstance(last_src_stmt.false_target, Const)
@@ -4007,18 +4026,21 @@ class PhoenixStructurer(StructurerBase):
             for stmt in last_stmts
         )
 
-    def _should_use_multistmtexprs(self, node: Block | BaseNode) -> bool:
+    def _should_use_multistmtexprs(self, node: Block | BaseNode, apply_limits: bool = True) -> bool:
         """
         The original Phoenix algorithm had no support for multi-stmt expressions, such as the following:
         if ((x = y) && z) { ... }
 
         There are multiple levels at which multi-stmt expressions can be used. If the Phoenix algorithm is not not
-        set to be in improved mode, then we should not use multi-stmt expressions at all.
+        set to be in improved mode, then we should not use multi-stmt expressions at all. With apply_limits=False, only
+        ask whether multi-stmt expressions are enabled, however many statements and calls node holds.
         """
         if not self._improve_algorithm:
             return False
         if self._use_multistmtexprs == MultiStmtExprMode.NEVER:
             return False
+        if not apply_limits:
+            return True
         if self._use_multistmtexprs == MultiStmtExprMode.ALWAYS:
             ctr = AILCallCounter()
             ctr.walk(node)
@@ -4030,6 +4052,39 @@ class PhoenixStructurer(StructurerBase):
             return ctr.calls <= 1 and ctr.non_label_stmts <= self._multistmtexpr_stmt_threshold
         l.warning("Unsupported enum value for _use_multistmtexprs: %s", self._use_multistmtexprs)
         return False
+
+    @staticmethod
+    def _continues_to(node, target_addr: int) -> list[ContinueNode]:
+        """
+        Return the continues in node, outside nested loops, that land on target_addr.
+        """
+        continues = []
+
+        def _handle_Continue(cont: ContinueNode, **kwargs):  # pylint:disable=unused-argument
+            if cont.target == target_addr:
+                continues.append(cont)
+
+        def _handle_Loop(loop_node: LoopNode, **kwargs):  # pylint:disable=unused-argument
+            return None
+
+        SequenceWalker(handlers={ContinueNode: _handle_Continue, LoopNode: _handle_Loop}).walk(node)
+        return continues
+
+    def _replace_continues_with_jumps(self, node, continues: list[ContinueNode], target):
+        """
+        Return a copy of node in which each of the given continues is a jump to target.
+        """
+        target_idx = target.idx if isinstance(target, (Block, MultiNode)) else 0
+        jumps = {}
+        for cont in continues:
+            jump = Jump(
+                self.ail_manager.next_atom(),
+                Const(self.ail_manager.next_atom(), target.addr, self.project.arch.bits),
+                target_idx=target_idx,
+                ins_addr=cont.addr,
+            )
+            jumps[cont] = Block(cont.addr, 0, statements=[jump])
+        return NodeReplacer(node, jumps).result
 
     @staticmethod
     def _find_node_going_to_dst(
@@ -4162,6 +4217,79 @@ class PhoenixStructurer(StructurerBase):
             return _Holder.parent_and_block[-1]
         return _Holder.parent_and_block[0]
 
+    @staticmethod
+    def _block_only_exits_to(block, successor) -> bool:
+        """
+        Determine whether an unconditional break to ``successor`` can be appended to ``block``: every way out of
+        the block reaches ``successor``, and the statement the break replaces goes nowhere else either.
+
+        A single AIL block can hold conditional jumps in the middle of it. A lifter that unrolls a string
+        instruction turns one instruction into a byte-copy loop, and that loop's back edge is a conditional
+        jump to an address inside the block (see ``is_head_controlled_loop_block``), so it never leaves the
+        block at all.
+
+        Only ``block``'s own statements are read. False whenever they do not settle it: an indirect jump, a
+        target that is neither inside the block nor ``successor``, a return, an incomplete switch-case head, a
+        block that ends somewhere other than at ``successor``, or a block that ends in a conditional jump,
+        which decides the edge itself.
+        """
+        if not isinstance(block, Block) or not block.statements:
+            return False
+        size = block.original_size
+        if size is None or isinstance(block.statements[-1], ConditionalJump):
+            return False
+        successor_addr = successor.addr
+        successor_idx = successor.idx if isinstance(successor, (Block, MultiNode)) else None
+
+        def _is_successor(target, target_idx) -> bool:
+            return (
+                isinstance(target, Const)
+                and target.value == successor_addr
+                and (successor_idx is None or target_idx == successor_idx)
+            )
+
+        for stmt in block.statements:
+            if isinstance(stmt, ConditionalJump):
+                targets = [(stmt.true_target, stmt.true_target_idx), (stmt.false_target, stmt.false_target_idx)]
+            elif isinstance(stmt, Jump):
+                targets = [(stmt.target, stmt.target_idx)]
+            elif isinstance(stmt, (Return, IncompleteSwitchCaseHeadStatement)):
+                return False
+            else:
+                continue
+            for target, target_idx in targets:
+                if target is None:
+                    # an empty target falls through to the next statement, which does not leave the block. The
+                    # statement the block ends with is checked below, where an empty target cannot pass.
+                    continue
+                if not isinstance(target, Const):
+                    # an indirect jump: we cannot say where it goes
+                    return False
+                if not _is_successor(target, target_idx) and not (block.addr <= target.value < block.addr + size):
+                    return False
+
+        last_stmt = block.statements[-1]
+        if isinstance(last_stmt, Jump):
+            # the break replaces this statement, so it must go nowhere but the successor; a target back inside
+            # the block would be a loop the break would silently drop
+            return _is_successor(last_stmt.target, last_stmt.target_idx)
+        # no jump at the end: the block falls off its own end, which must be where the successor starts
+        return block.addr + size == successor_addr
+
+    @staticmethod
+    def _node_ends_with(node, block) -> bool:
+        """
+        Determine whether ``block`` is the last thing ``node`` runs: ``node`` is ``block``, or ``node`` is a
+        sequence whose last child ends with it. False for anything else, including a node that merely contains
+        ``block`` somewhere and may run code after it that a break would jump over.
+        """
+        current = node
+        while current is not block:
+            if not isinstance(current, (SequenceNode, MultiNode)) or not current.nodes:
+                return False
+            current = current.nodes[-1]
+        return True
+
     def _unpack_sequencenode_head_overlay(self, seq: SequenceNode):
         if not seq.nodes:
             return False, None
@@ -4203,6 +4331,11 @@ class PhoenixStructurer(StructurerBase):
         non_case_succs = [succ for succ in succs if succ.addr not in jumptable_entries]
         region.add_node(incscnode.head)
         region.remove_node(incscnode, absorbed_into=incscnode.head)
+        # _match_acyclic_incomplete_switch_cases folds a switch head into an IncompleteSwitchCaseNode, so when that
+        # switch head is the region head the graph helper's head moves onto the IncompleteSwitchCaseNode with it.
+        # That node has just left the graph, so hand the helper the block taking its place: our callers follow this
+        # with DirectedGraphHelper.reset(), which drops the caches and keeps the head.
+        self._graph_helper.replace_head(incscnode, incscnode.head)
         for pred in preds:
             region.add_edge(pred, incscnode.head)
         for succ in succs:
