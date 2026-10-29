@@ -103,9 +103,9 @@
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "8c19aac98dc3bd931732a96b4c04cc1970e31dfb",
-      "committed_at": "2026-10-26T11:23:34-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#601)",
+      "commit": "5ae29727cf5a9c30433a46e7350027ac7965a221",
+      "committed_at": "2026-10-28T21:48:35-07:00",
+      "subject": "IRConst: give vex_int_class() classes .size (#602)",
       "excluded": [
         ".gitmodules"
       ],
@@ -123,7 +123,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-28T23:13:25+00:00",
+  "imported_at": "2026-10-29T09:33:10+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
