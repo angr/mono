@@ -1114,9 +1114,11 @@ class TestDecompiler(unittest.TestCase):
             print_decompilation_result(dec)
 
             code = dec.codegen.text
-            # Make sure argument a0 is correctly typed to char*
+            # a0 is a char* in the source; its signedness cannot be inferred, so it is typed unsigned char*
             lines = code.split("\n")
-            assert "local_strlen(char *a0)" in lines[0], f"Argument a0 seems to be incorrectly typed: {lines[0]}"
+            assert "local_strlen(unsigned char *a0)" in lines[0], (
+                f"Argument a0 seems to be incorrectly typed: {lines[0]}"
+            )
 
     def _setup_decompiling_strings_local_strcat(self):
         bin_path = os.path.join(test_location, "x86_64", "types", "strings")
@@ -1142,9 +1144,9 @@ class TestDecompiler(unittest.TestCase):
             print_decompilation_result(dec)
 
             code = dec.codegen.text
-            # Make sure argument a0 is correctly typed to char*
+            # a0 and a1 are char* in the source; their signedness cannot be inferred, so they are typed unsigned char*
             lines = code.split("\n")
-            assert "local_strcat(char *a0, char *a1)" in lines[0], (
+            assert "local_strcat(unsigned char *a0, unsigned char *a1)" in lines[0], (
                 f"Argument a0 and a1 seem to be incorrectly typed: {lines[0]}"
             )
 
@@ -1180,9 +1182,9 @@ class TestDecompiler(unittest.TestCase):
             print_decompilation_result(dec)
 
             code = dec.codegen.text
-            # Make sure argument a0 is correctly typed to char*
+            # a0 and a1 are char* in the source; their signedness cannot be inferred, so they are typed unsigned char*
             lines = code.split("\n")
-            assert "local_strcat(char *a0, char *a1)" in lines[0], (
+            assert "local_strcat(unsigned char *a0, unsigned char *a1)" in lines[0], (
                 f"Argument a0 and a1 seem to be incorrectly typed: {lines[0]}"
             )
 
@@ -2079,9 +2081,9 @@ class TestDecompiler(unittest.TestCase):
             print_decompilation_result(d)
 
             # make sure the types of extern variables are correct
-            assert "extern char num_connections;" in d.codegen.text
-            assert "extern char num_packets;" in d.codegen.text
-            assert "extern char src;" in d.codegen.text
+            assert "extern unsigned char num_connections;" in d.codegen.text
+            assert "extern unsigned char num_packets;" in d.codegen.text
+            assert "extern unsigned char src;" in d.codegen.text
 
             # make sure there are no unidentified stack variables
             assert "stack_base" not in d.codegen.text
@@ -6084,6 +6086,43 @@ class TestDecompiler(unittest.TestCase):
         assert isinstance(arg2_type, SimTypeLongLong), f"Unexpected arg2 type: {arg2_type}"
         assert arg2_type.signed is False
 
+    def test_decompiling_msvcr120_csqrtf_converted_double_stays_double(self, decompiler_options=None):
+        # ldexp() returns a double in xmm0, `cvtsd2ss xmm0, xmm0` overwrites its low 4 bytes, and `addss xmm0, xmm6`
+        # then reads the whole register. The double's def survives in xmm0's bytes 4..7 only as the base of the
+        # conversion's Insert, so it must not be widened along with the read: it stays a double
+        bin_path = os.path.join(test_location, "x86_64", "windows", "msvcr120.dll")
+        proj, _ = load_project_with_scoped_cfg(bin_path, 0x18008ADE4)
+        f = proj.kb.functions[0x18008ADE4]
+        d = proj.analyses[Decompiler].prep(fail_fast=True)(f, options=decompiler_options)
+        assert d.codegen is not None and d.codegen.text is not None
+        print_decompilation_result(d)
+        text = d.codegen.text
+        m = re.search(r"\b(v\d+) = ldexp\(", text)
+        assert m is not None, "the result of ldexp() is not assigned to a variable as is"
+        assert re.search(rf"\bdouble {m.group(1)};", text), f"{m.group(1)} is not declared as a double"
+        assert "__longlong_as_double" not in text
+
+    def test_decompiling_float_reloaded_around_a_loop_stays_float(self, decompiler_options=None):
+        # sub_742eca squares its float argument with mulss, stores it back to the argument's stack slot and passes it
+        # to sub_742f3a in a loop, reloading it with movss after each call. VEX lifts that movss as the value, a 4-byte
+        # zero and an 8-byte zero written into xmm0, and the loop header merges them with the mulss result. Merging
+        # them into one 16-byte variable leaves an Insert chain the narrower cannot undo, so the float is printed as an
+        # integer
+        bin_path = os.path.join(
+            test_location, "i386", "windows", "a71a3c3b922705cb5e2d8aa9c74f5c73c47fb27f10b1327eb2bb054d99a14397"
+        )
+        proj, cfg = load_project_with_scoped_cfg(bin_path, 0x742ECA, call_tree_depth=1)
+        f = proj.kb.functions[0x742ECA]
+        d = proj.analyses[Decompiler].prep(fail_fast=True)(f, cfg=cfg.model, options=decompiler_options)
+        assert d.codegen is not None and d.codegen.text is not None
+        print_decompilation_result(d)
+        text = d.codegen.text
+        assert "__float_as_int(" not in text
+        assert "_INSERT(" not in text
+        m = re.search(r"\bsub_742f3a\(\w+, (\w+),", text)
+        assert m is not None, "sub_742f3a() is not called with a plain second argument"
+        assert m.group(1) == "a1" or re.search(rf"\bfloat {m.group(1)};", text), f"{m.group(1)} is not a float"
+
     def test_decompiling_abnormal_switch_case_within_a_loop_with_redundant_jump(self, decompiler_options=None):
         bin_path = os.path.join(
             test_location, "x86_64", "windows", "0a9bd4898d4c966cda1102952a74b3b829581c5b6bbeb4c4e6a09cefde8c0d26"
@@ -6914,6 +6953,24 @@ class TestDecompiler(unittest.TestCase):
         # ensure decompling this function should not take over 30 seconds - it was taking at least two minutes before
         # recent optimizations
 
+    def test_decompiling_armel_go_boundserror(self, decompiler_options=None):
+        # An ARM32 register-offset store (strb rX, [rB, rI]) lets the traversal pair a stack base with a
+        # .rodata address in the index register, producing an ~800 KB stack variable that swallowed the
+        # frame of runtime.boundsError.Error.
+        bin_path = os.path.join(test_location, "armel", "decompiler", "errorpaths_go")
+        proj, cfg = load_project_with_scoped_cfg(bin_path, 0x2744C)
+
+        start = time.time()
+        dec = proj.analyses[Decompiler].prep(fail_fast=True)(
+            cfg.functions[0x2744C], cfg=cfg.model, options=decompiler_options
+        )
+        elapsed = time.time() - start
+        assert dec.codegen is not None and dec.codegen.text is not None
+        print_decompilation_result(dec)
+
+        assert "|Stack bp-" not in dec.codegen.text, "an unresolved stack variable leaked into the output"
+        assert elapsed <= 120, f"Decompiling runtime.boundsError.Error took {elapsed} seconds"
+
     def test_fastfail_intrinsic(self, decompiler_options=None):
         bin_path = os.path.join(test_location, "x86_64", "windows", "fastfail.exe")
         proj = angr.Project(bin_path, auto_load_libs=False)
@@ -7065,6 +7122,36 @@ class TestDecompiler(unittest.TestCase):
             }""")
 
         assert text == expected
+
+    def test_syscall_wrapper_return_without_argument_calling_convention(self, decompiler_options=None):
+        bin_path = os.path.join(test_location, "i386", "arbitrary_transmit")
+        proj = angr.Project(bin_path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True, data_references=True)
+        proj.analyses.CompleteCallingConventions(recover_variables=True, cfg=cfg.model)
+
+        func = proj.kb.functions["receive"]
+        facts = proj.analyses.FunctionFactCollector(func)
+        func.calling_convention = None
+        func.prototype = None
+        assert func.calling_convention is None
+        assert func.prototype is None
+        assert facts.retval_size == 4
+        assert facts.retval_incidental is True
+
+        def no_cc(self):
+            self.cc = None
+            self.prototype = None
+
+        with mock.patch.object(CallingConventionAnalysis, "_analyze", no_cc):
+            dec = proj.analyses.Decompiler(func, cfg=cfg.model, options=decompiler_options)
+        assert dec.codegen is not None and dec.codegen.text is not None
+        assert not dec.errors
+        print_decompilation_result(dec)
+
+        text = normalize_whitespace(dec.codegen.text)
+        assert re.search(r"return ::cle##kernel::receive\([^;]+\);", text) is not None
+        assert re.search(r"::cle##kernel::receive\([^;]+\); return;", text) is None
+        assert func.calling_convention is None
 
     def test_flipbooleancmp_fallthru_with_side_effects(self, decompiler_options=None):
         bin_path = os.path.join(test_location, "x86_64", "decompiler", "adds_then_call.o")
@@ -7390,7 +7477,7 @@ class TestDecompiler(unittest.TestCase):
         assert dec.codegen is not None and dec.codegen.text is not None
         print_decompilation_result(dec)
 
-        assert "char * assign_ite(unsigned int a0, char *a1, char *a2)" in dec.codegen.text
+        assert "unsigned char * assign_ite(unsigned int a0, unsigned char *a1, unsigned char *a2)" in dec.codegen.text
         assert "char *v0" in dec.codegen.text
         assert "v0 = (!a0 ? a2 : a1)" in dec.codegen.text
         assert "return v0" in dec.codegen.text
@@ -7604,7 +7691,7 @@ class TestDecompiler(unittest.TestCase):
         # Before the fix, the rewriter returned a 1-bit expression for a 32-bit ccall and decompilation crashed.
         text = dec.codegen.text
         assert re.search(r"\bv\d+ < 8\b", text), "the CondB SUBB ccall was not rewritten into a byte comparison"
-        assert re.search(r"> \(char\)", text), "the CondBE SUBB ccall operands were not narrowed to byte width"
+        assert re.search(r"> \(unsigned char\)", text), "the CondBE SUBB ccall operands were not narrowed to byte width"
 
     def test_widening_conversion_signedness(self, decompiler_options=None):
         # A widening integer conversion carries the signedness of its source operand: a sign-extending Convert
@@ -7751,7 +7838,7 @@ class TestDecompiler(unittest.TestCase):
         # the straddling read is its own 4-byte variable, and the byte at +14 is read out of it
         m = re.search(r"int (v\d+);\s*// \[bp\+0xb\]", text)
         assert m is not None
-        assert f"*(char *)((void*)&{m.group(1)} + 3)" in text
+        assert f"*(unsigned char *)((void*)&{m.group(1)} + 3)" in text
 
 
 if __name__ == "__main__":
