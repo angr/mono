@@ -25,6 +25,7 @@ from angr.sim_type import (
     SimTypeFloat,
     SimTypeFunction,
     SimTypeInt,
+    SimTypeLength,
     SimTypeLong,
     SimTypeLongLong,
     SimTypeNum,
@@ -378,6 +379,14 @@ class TestTypes(unittest.TestCase):
             (1, 7),
         ]
 
+    def test_unsigned_char_c_repr(self):
+        uchar = angr.types.parse_type("unsigned char")
+        assert isinstance(uchar, SimTypeChar) and not uchar.signed
+        assert uchar.c_repr() == "unsigned char"
+        assert uchar.c_repr(name="c") == "unsigned char c"
+        assert SimTypePointer(uchar).c_repr() == "unsigned char *"
+        assert SimTypeChar().c_repr(name="c") == "char c"
+
     def test_sub_byte_types_align_to_one_byte(self):
         # SimTypeNum is sized in bits, so a type narrower than a byte used to report an
         # alignment of zero -- the truncated quotient -- and every struct laying such a
@@ -515,6 +524,12 @@ class TestTypes(unittest.TestCase):
         back_empty = SimType.from_json(json.loads(json.dumps(empty.to_json())))
         assert isinstance(back_empty, SimCppClass)
         assert back_empty.size == 0
+
+    def test_length_json_roundtrip_keeps_signedness(self):
+        for signed in (True, False):
+            back = SimType.from_json(json.loads(json.dumps(SimTypeLength(signed=signed).to_json())))
+            assert isinstance(back, SimTypeLength)
+            assert back.signed is signed
 
     def test_simstruct_cmp_recursion_error(self):
         t0 = SimStruct(fields={"a": SimTypeBottom()})

@@ -12,7 +12,13 @@ from angr.ailment.statement import Assignment, Jump, Label, Return
 from angr.analyses.decompiler.region_identifier import RegionIdentifier
 from angr.analyses.decompiler.region_overlay import RegionOverlay
 from angr.analyses.decompiler.structurer_nodes import ConditionNode, MultiNode
-from angr.analyses.decompiler.utils import calls_in_graph, remove_labels, to_ail_supergraph, update_jump_target_idx
+from angr.analyses.decompiler.utils import (
+    calls_in_graph,
+    fix_copied_node_labels,
+    remove_labels,
+    to_ail_supergraph,
+    update_jump_target_idx,
+)
 from angr.utils.ail import is_phi_assignment
 
 _l = logging.getLogger(name=__name__)
@@ -239,7 +245,7 @@ class ReturnDuplicatorBase:
                     node_copy = self._copy_node_and_update_phi_variables(node_copy, pred)
                 node_copy = self._use_fresh_virtual_variables(node_copy, vvar_mapping)
                 node_copy.idx = self.next_node_idx(node.addr, graph)
-                self._fix_copied_node_labels(node_copy)
+                fix_copied_node_labels(node_copy)
                 copies[node] = node_copy
 
             # modify Jump.target_idx and ConditionalJump.{true,false}_target_idx accordingly
@@ -568,50 +574,28 @@ class ReturnDuplicatorBase:
                 return _unpack_block_type_to_addrs(node.true_node) | _unpack_block_type_to_addrs(node.false_node)
             return set()
 
-        def _unpack_region_to_block_addrs(region: RegionOverlay):
-            region_addrs = set()
+        # the region tree can be deeper than Python's recursion limit, so walk it with an explicit stack. regions are
+        # recorded parents first, so folding them in reverse completes every subregion before its parent takes it in.
+        all_region_block_sets = {}
+        subregions = {}
+        stack = [top_region]
+        while stack:
+            region = stack.pop()
+            block_addrs = set()
+            children = []
             for node in region.graph.nodes:
                 if isinstance(node, (Block, MultiNode, ConditionNode)):
-                    region_addrs |= _unpack_block_type_to_addrs(node)
-                elif isinstance(node, RegionOverlay):
-                    region_addrs |= _unpack_region_to_block_addrs(node)
-
-            return region_addrs
-
-        def _unpack_every_region(region: RegionOverlay, addrs_by_region: dict):
-            addrs_by_region[region] = set()
-            for node in region.graph.nodes:
-                if isinstance(node, Block):
-                    addrs_by_region[region].add(node.addr)
-                elif isinstance(node, MultiNode):
-                    for _node in node.nodes:
-                        addrs_by_region[region].add(_node.addr)
-                elif isinstance(node, ConditionNode):
-                    addrs_by_region[region] |= _unpack_block_type_to_addrs(node.true_node)
-                    addrs_by_region[region] |= _unpack_block_type_to_addrs(node.false_node)
+                    block_addrs |= _unpack_block_type_to_addrs(node)
                 else:
-                    addrs_by_region[region] |= _unpack_region_to_block_addrs(node)
-                    _unpack_every_region(node, addrs_by_region)
+                    children.append(node)
+            all_region_block_sets[region] = block_addrs
+            subregions[region] = children
+            stack.extend(reversed(children))
 
-        all_region_block_sets = {}
-        _unpack_every_region(top_region, all_region_block_sets)
+        for region in reversed(all_region_block_sets):
+            for child in subregions[region]:
+                all_region_block_sets[region] |= all_region_block_sets[child]
         return all_region_block_sets
-
-    @staticmethod
-    def _fix_copied_node_labels(block: Block):
-        for i in range(len(block.statements)):  # pylint:disable=consider-using-enumerate
-            stmt = block.statements[i]
-            if isinstance(stmt, Label):
-                # fix the default name by suffixing it with the new block ID
-                new_name = stmt.name or f"Label_{stmt.tags['ins_addr']:x}"
-                if "block_idx" in stmt.tags:
-                    suffix = f"__{stmt.tags['block_idx']}"
-                    new_name = new_name.removesuffix(suffix)
-                else:
-                    new_name = stmt.name
-                new_name += f"__{block.idx}"
-
-                block.statements[i] = Label(stmt.idx, new_name, **(stmt.tags | {"block_idx": block.idx}))
 
     @staticmethod
     def unwrap_conv(expr):

@@ -1953,6 +1953,82 @@ class TestJumpTableResolver(unittest.TestCase):
 
         self._compare(cfg.jump_tables, all_jumptables)
 
+    def test_i386_gcc_pie_got_relative_jumptables(self):
+        # `call __x86.get_pc_thunk.bx; add ebx, imm` leaves the GOT address in ebx; the table address and its entries
+        # are both offsets from it, e.g. `mov eax, [ebx+ecx*4-0x37fc]; add eax, ebx; jmp eax`
+        p = angr.Project(os.path.join(test_location, "i386", "nl"), auto_load_libs=False)
+        cfg = p.analyses.CFGFast(normalize=True)
+
+        expected = {
+            0x40278C: {0x40278E, 0x402CDC, 0x402DAB, 0x402DCC, 0x402DFA, 0x402E37, 0x402E74},
+            0x402EC4: {
+                0x402860,
+                0x402988,
+                0x4029B0,
+                0x4029C0,
+                0x402A00,
+                0x402BF0,
+                0x402ED0,
+                0x402EE0,
+                0x402EF8,
+                0x402F50,
+                0x402F60,
+                0x402F70,
+                0x402F88,
+                0x402FA0,
+                0x402FB0,
+                0x402FD0,
+            },
+            0x40311F: {0x402B18, 0x403128},
+            0x403D90: {
+                0x403DA8,
+                0x403E20,
+                0x403EA0,
+                0x403ED0,
+                0x403F00,
+                0x403F30,
+                0x403F70,
+                0x403FC8,
+                0x404020,
+                0x4040C6,
+            },
+            0x404614: {
+                0x404640,
+                0x4046D0,
+                0x4046F0,
+                0x404720,
+                0x404750,
+                0x404818,
+                0x4048D8,
+                0x404910,
+                0x4049D8,
+                0x404AF0,
+                0x404BB8,
+                0x404C80,
+                0x404D48,
+            },
+            0x4050C8: {
+                0x4050D0,
+                0x4050E0,
+                0x405110,
+                0x405130,
+                0x405150,
+                0x405170,
+                0x4051D0,
+                0x405230,
+                0x405280,
+                0x4052D8,
+                0x405300,
+                0x405350,
+                0x4053A8,
+            },
+        }
+        jumps = {ij.ins_addr: ij for ij in cfg.indirect_jumps.values()}
+        for jump_addr, targets in expected.items():
+            ij = jumps[jump_addr]
+            assert ij.jumptable, f"{jump_addr:#x} is not resolved as a jump table"
+            assert set(ij.resolved_targets) == targets
+
     def test_kprca_00009(self):
         p = angr.Project(os.path.join(test_location, "cgc", "KPRCA_00009"), auto_load_libs=False)
         cfg = p.analyses.CFGFast()
@@ -2832,6 +2908,117 @@ class TestJumpTableResolver(unittest.TestCase):
             0x40D1F8,
         ]
 
+    def test_ppc_jumptable_behind_bcctr_alignment_mask(self):
+        # PowerPC ignores the low two bits of the count register, so the lifter masks the target of every bcctr with
+        # ~3, and the jump table load sits behind that mask.
+        p = angr.Project(os.path.join(test_location, "ppc", "libc.so.6"), auto_load_libs=False)
+        # only the function that holds the dispatch, so that the test does not scan all of libc
+        cfg = p.analyses[CFGFast].prep()(regions=[(0x4C6A00, 0x4C6A00 + 0x47C4)])
+
+        assert 0x4C6B38 in cfg.model.jump_tables
+        assert cfg.indirect_jumps[0x4C6B38].type == IndirectJumpType.Jumptable_AddressLoadedFromMemory
+        jumptable = cfg.model.jump_tables[0x4C6B38]
+        assert jumptable.jumptable_addr == 0x55A054
+        assert jumptable.jumptable_entry_size == 4
+        # The switch has 60 cases. The table is bounded by the mask that truncates the index (clrlwi r9, r9, 0x18)
+        # instead of the comparison against 0x3b that follows it, so the entries past the 60th are read out of the
+        # tables that come after this one.
+        assert jumptable.jumptable_entries is not None
+        assert len(jumptable.jumptable_entries) == 256
+        assert jumptable.jumptable_entries[:60] == [
+            0x4C6DC0,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6E00,
+            0x4C6DC0,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D10,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6CD0,
+            0x4C6DC0,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6D1C,
+            0x4C6B90,
+            0x4C6B50,
+        ]
+
+    def test_ppc64_jumptable_behind_bcctr_alignment_mask(self):
+        # The same mask on PPC64, where the table holds 32-bit offsets. The entries are narrower than a pointer and a
+        # base address is added to them, so this table must not be taken for a vtable.
+        p = angr.Project(os.path.join(test_location, "ppc64el", "fauxware_static"), auto_load_libs=False)
+        # only read_encoded_value_with_base, which holds the dispatch
+        cfg = p.analyses[CFGFast].prep()(regions=[(0x10096D20, 0x10096F00)])
+
+        assert 0x10096D40 in cfg.model.jump_tables
+        assert cfg.indirect_jumps[0x10096D40].type == IndirectJumpType.Jumptable_AddressLoadedFromMemory
+        jumptable = cfg.model.jump_tables[0x10096D40]
+        assert jumptable.jumptable_addr == 0x10096D58
+        assert jumptable.jumptable_entry_size == 4
+        # The switch has 13 cases, and the table is bounded by the index mask as above.
+        assert jumptable.jumptable_entries is not None
+        assert len(jumptable.jumptable_entries) == 16
+        assert jumptable.jumptable_entries[:13] == [
+            0x10096D90,
+            0x10096E00,
+            0x10096E40,
+            0x10096E50,
+            0x10096D90,
+            0x10096EC4,
+            0x10096EC4,
+            0x10096EC4,
+            0x10096EC4,
+            0x10096E70,
+            0x10096DF0,
+            0x10096E60,
+            0x10096D90,
+        ]
+
     def test_amd64_fmt0_with_constant_propagation_r12(self):
         p = angr.Project(os.path.join(test_location, "x86_64", "fmt_0"), auto_load_libs=False)
         cfg = p.analyses[CFGFast].prep()()
@@ -3145,6 +3332,19 @@ class TestJumpTableResolver(unittest.TestCase):
             ],
         )
 
+    def test_amd64_rust_unbounded_jumptable_scan_stops_outside_code(self):
+        # Without data references only the entry scan bounds the table at 0x434134. The zero entries after its eight
+        # cases resolve to the table's own address, which is not executable, so they are not jump targets.
+        p = angr.Project(os.path.join(test_location, "x86_64", "printenv-rust"), auto_load_libs=False)
+        cfg = p.analyses[CFGFast].prep()(
+            regions=[(0x502470, 0x5025E0)], function_starts=[0x502470, 0x502570], data_references=False
+        )
+
+        self._compare(
+            cfg.model.jump_tables,
+            [J(0x502570, 0x434134, [0x502583, 0x502589, 0x502583, 0x50259D, 0x502591, 0x5025B5, 0x5025C1, 0x5025A9])],
+        )
+
     def test_amd64_rust_niche_decoded_jumptables(self):
         # jql_runner::array::get_array_index matches on a niche-encoded serde_json::Value discriminant:
         # `idx = (d <s 0) ? d ^ 0x8000000000000000 : 5`. Nothing bounds the index, so the tables are sized from data.
@@ -3161,6 +3361,67 @@ class TestJumpTableResolver(unittest.TestCase):
         # the two tables are adjacent; the first one must not run into the second one
         assert len(cfg.model.jump_tables[0x4E63D8].jumptable_entries) == 6
         assert len(cfg.model.jump_tables[0x4E6439].jumptable_entries) == 6
+
+    def test_amd64_jumptables_index_masked_in_jump_block(self):
+        # Each jump block masks its own index with `and <reg>, 3`, so no predecessor checks its range. Two of the blocks
+        # follow a call, and the other two are reached from several blocks that do not form a diamond.
+        p = angr.Project(os.path.join(test_location, "x86_64", "bbbq"), auto_load_libs=False)
+        cfg = p.analyses[CFGFast].prep()(normalize=True)
+
+        self._compare(
+            cfg.model.jump_tables,
+            [
+                J(0x424259, 0x403ADC, [0x42445E, 0x4243AA, 0x4243C8, 0x4243FC]),
+                J(0x45146B, 0x405264, [0x4514E2, 0x451544, 0x4514F4, 0x451529]),
+                J(0x4564C7, 0x405294, [0x45645C, 0x4564DC, 0x45655D, 0x4564B7]),
+                J(0x456542, 0x405294, [0x45645C, 0x4564DC, 0x45655D, 0x4564B7]),
+            ],
+        )
+
+    def test_amd64_masked_index_does_not_read_past_label_array(self):
+        # The function at 0x41a970 dispatches Lua opcodes with `jmp [r13 + (op & 0x7f) * 8]` through an array of 83
+        # label addresses. The mask allows 128 entries, and the ones after the array belong to the next objects, among
+        # them the address of the function 0x41eb50.
+        p = angr.Project(os.path.join(test_location, "x86_64", "luac_gcc13.3.0_O2"), auto_load_libs=False)
+        cfg = p.analyses[CFGFast].prep()(normalize=True)
+
+        assert 0x41EB50 in cfg.kb.functions
+        for block_addr in (0x41A9D0, 0x41AA59, 0x41ABA7, 0x41AF9A, 0x41BAF9):
+            assert 0x41EB50 not in cfg.indirect_jumps[block_addr].resolved_targets
+
+    def test_aarch64_rust_jumptable_index_not_bounded_by_loop_guard(self):
+        # The loop body loads an enum discriminant from memory (`ldrb w4, [x1], #1`) and uses it to index the byte table
+        # at 0x442a5b. Nothing bounds the index. The jump block's only predecessor ends in the loop guard
+        # `subs x16, x16, #4; b.lo`, which must not be taken as the bounds check because the table address does not
+        # depend on x16. The table is sized from the data instead: 0x41a3e8 references 0x442a65, the next table.
+        p = angr.Project(
+            os.path.join(test_location, "aarch64", "rust", "jumptable_behind_loop_guard"), auto_load_libs=False
+        )
+        cfg = p.analyses[CFGFast].prep()(
+            regions=[(0x41324C, 0x415100), (0x41A3CC, 0x41A400)], function_starts=[0x41324C, 0x41A3CC]
+        )
+
+        self._compare(
+            cfg.model.jump_tables,
+            [
+                J(
+                    0x414BB4,
+                    0x442A5B,
+                    [
+                        0x414BD0,
+                        0x414BF4,
+                        0x414BDC,
+                        0x414C0C,
+                        0x414C18,
+                        0x414C2C,
+                        0x414C2C,
+                        0x414C00,
+                        0x414C24,
+                        0x414BE8,
+                    ],
+                )
+            ],
+        )
 
     def test_arm_thumb_jumptable_multi_variable_ranges(self):
         # Correctly resolving this indirect jump requires Balancer (in claripy) to handle the range of the addition of
@@ -3315,6 +3576,15 @@ class TestJumpTableResolver(unittest.TestCase):
             0x400060,
         }
 
+    def test_amd64_index_difference_of_two_loads(self):
+        # the switch index is end - (start & ~7) - 2 with both operands loaded from memory, and the `cmp 6; ja` bound
+        # check is in the block before the table jump
+        p = angr.Project(os.path.join(test_location, "x86_64", "jumptable_index_difference"), auto_load_libs=False)
+        cfg = p.analyses.CFGFast()
+        jt = cfg.model.jump_tables[0x401088]
+        assert jt.jumptable_addr == 0x402000
+        assert jt.jumptable_entries == [0x4010B0, 0x4010B8, 0x4010C0, 0x4010C8, 0x4010D0, 0x4010A0, 0x4010A8]
+
     def test_secondary_jumptable_amd64(self):
         proj = angr.Project(
             os.path.join(
@@ -3357,6 +3627,64 @@ class TestJumpTableResolver(unittest.TestCase):
         assert jt0.jumptables[0].size == 4 * 5
         assert jt0.jumptables[0].entries_guessed is True
         assert jt0.jumptables[0].entries == [0x4154DA, 0x4154F0, 0x4154F0, 0x4154F0, 0x4154F0]
+
+    @staticmethod
+    def _bss_regions(*path):
+        proj = angr.Project(os.path.join(test_location, *path), auto_load_libs=False)
+        return JumpTableResolver(proj)._bss_regions  # pylint:disable=protected-access
+
+    def test_bss_regions_on_macho(self):
+        # A Mach-O zero-fill section is called __bss, so matching the name ".bss" found nothing and
+        # reads from it came back as the zeroes CLE pads the segment with.
+        assert self._bss_regions("aarch64", "dyld_ios15.macho") == [(0x10000C1B0, 0x100)]
+
+    def test_bss_regions_cover_every_zero_fill_section(self):
+        # .sbss as well as .bss
+        assert self._bss_regions("mipsel", "jumptable_0") == [(0x100004A8, 0x6C), (0x10000520, 0xE8)]
+
+    def test_bss_regions_exclude_thread_local_zero_fill(self):
+        # .tbss is laid over the addresses of .init_array, .fini_array and .data.rel.ro, which are
+        # initialized; only .bss and __libc_freeres_ptrs are uninitialized memory.
+        assert self._bss_regions("i386", "bronze_ropchain") == [(0x80DB320, 0xCDC), (0x80DBFFC, 0x14)]
+
+    def test_jump_table_base_in_bss_is_rejected(self):
+        path = os.path.join(test_location, "x86_64", "fpijr_callback_array")
+        proj = angr.Project(path, auto_load_libs=False)
+
+        # .bss is matched by name, so the region set here is the same one the resolver always had.
+        assert JumpTableResolver(proj)._bss_regions == [(0x404020, 0x60)]  # pylint:disable=protected-access
+
+        cfg = proj.analyses.CFGFast(normalize=True, data_references=False, resolve_indirect_jumps=True)
+
+        # The dispatch at 0x4011d0 indexes a callback array the program fills in at run time. Its base
+        # is a concrete .bss address, so the entries come from the loader's zero fill rather than from
+        # the file, and every one of them is 0.
+        assert 0x4011D0 not in cfg.model.jump_tables
+
+    def test_jump_table_base_in_zero_fill_is_rejected(self):
+        path = os.path.join(test_location, "aarch64", "lynx-2.9.0dev.10_ios_arm64.macho")
+        proj = angr.Project(path, auto_load_libs=False, use_sim_procedures=False)
+        cfg = proj.analyses.CFGFast(normalize=True, data_references=False, resolve_indirect_jumps=True)
+
+        # 0x10001e8fc dispatches through x28. With the zero-fill regions hooked, the resolver's
+        # slice takes the stale adrp/add at 0x10001e788 for the base rather than the adr at
+        # 0x10001e800 that reaches the dispatch, so the base lands in __DATA,__common.
+        assert 0x10001E8FC not in cfg.model.jump_tables
+
+        # A second dispatch reads a real table out of __TEXT,__const and must still resolve, so
+        # that the assertion above cannot pass by the resolver never resolving anything here.
+        jt = cfg.model.jump_tables[0x10009D01C]
+        assert len(jt.jumptables) == 1
+        assert jt.jumptables[0].addr == 0x1001069D3
+        assert jt.jumptables[0].entry_size == 1
+        assert sorted(jt.jumptables[0].entries) == [
+            0x10009D034,
+            0x10009D058,
+            0x10009D074,
+            0x10009D080,
+            0x10009D0D8,
+            0x10009D0E4,
+        ]
 
 
 class TestJumpTableResolverCallTables(unittest.TestCase):

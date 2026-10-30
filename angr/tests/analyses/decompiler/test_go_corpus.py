@@ -124,12 +124,10 @@ class TestGoCorpusLinuxAmd64Equality(CorpusChecks, GoDecompilationTarget):
         return count
 
     def check_one_result(self):
-        # the calling-convention guess counts rbx as a second result, which no return sets: no return carries what
-        # rbx was left holding
+        # no return carries a second value, and the equality functions that return a comparison return bool
         for name in self.FUNCS:
             returns = re.findall(r"^\s+return (.+)$", self.body(self.texts[name]), re.MULTILINE)
             assert returns and all(self.values(r) == 1 for r in returns), self.texts[name]
-        for name in ("type:.eq.M16I", "type:.eq.SS"):
             assert self.header(self.texts[name]).endswith(") bool {"), self.texts[name]
 
 
@@ -274,6 +272,21 @@ class TestGoCorpusLinuxAmd64Stdlib(CorpusChecks, GoDecompilationTarget):
         # the descriptors of the type switch ahead of it print as names, not as their first field
         assert "&go:itab.*crypto/internal/fips140/sha256.Digest,hash.Hash" in text, text
         assert ".Inter" not in text and ".Size_" not in text, text
+
+
+class TestGoCorpusLinuxAmd64SharedSwitchDefault(CorpusChecks, GoDecompilationTarget):
+    """Two lowered switches whose defaults reach one panic block."""
+
+    BINARY = AGE_KEYGEN
+    FUNCS = ("crypto/internal/fips140/sha512.(*Digest).Reset",)
+
+    def check_labels_are_unique(self):
+        # LoweredSwitchSimplifier gives each switch its own copy of the shared default block; each copy's label must
+        # be its own, and every goto must name a defined label
+        text = self.texts["crypto/internal/fips140/sha512.(*Digest).Reset"]
+        labels = re.findall(r"^(LABEL_\w+):$", text, re.MULTILINE)
+        assert len(labels) == len(set(labels)), text
+        assert set(re.findall(r"\bgoto (LABEL_\w+)", text)) <= set(labels), text
 
 
 class TestGoCorpusDarwinArm64(CorpusChecks, GoDecompilationTarget):
