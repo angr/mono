@@ -453,6 +453,141 @@ class TestReceiverNamesI386Go127(GoDecompilationTarget):
         assert "func (a *internal/strconv.decimal) Assign(" in self.texts["internal/strconv.(*decimal).Assign"]
 
 
+class TestFloatPhiI386Go127(GoDecompilationTarget):
+    """
+    386 loads a float64 into xmm with movsd, which VEX lifts as two 8-byte writes, the upper one a zero. Where such a
+    load meets a full-width write of the register, the merged value must still get its phi.
+    """
+
+    BINARY = go_binary("go1.27.1", "strcat", arch="i386")
+    FUNCS = ("runtime.(*gcControllerState).endCycle",)
+
+    def test_utilization_merges_both_paths(self):
+        # utilization := gcBackgroundUtilization
+        # if assistDuration > 0 { utilization += float64(c.assistTime.Load()) / float64(assistDuration*int64(procs)) }
+        text = self.texts["runtime.(*gcControllerState).endCycle"]
+        m = re.search(r"^\s*(\w+) = \S+ \+ \w+ / \w+$", text, re.MULTILINE)
+        assert m, text
+        # c.consMark = ... / ((1 - utilization) * ...) reads the merged value
+        assert re.search(rf"\(\S+ - {m.group(1)}\) \* ", text), text
+
+
+class TestFloatNegI386Go127(GoDecompilationTarget):
+    """
+    386 negates a float64 by XORing its xmm register with a sign-mask constant. Once the register is narrowed to the 8
+    bytes the value occupies, the XOR is 64 bits wide, which no 386 general-purpose register op produces, so it is still
+    a negation when its operand is a float64 passed on the stack.
+    """
+
+    BINARY = go_binary("go1.27.1", "strcat", arch="i386")
+    FUNCS = ("runtime.modf", "runtime.ceil")
+
+    def test_negated_stack_arguments_are_named(self):
+        # if f < 0 { int, frac = modf(-f); ... } (src/runtime/float.go)
+        text = self.texts["runtime.modf"]
+        assert "runtime.modf(fneg(f))" in text, text
+        assert "f ^ 0x8000000000000000" not in text, text
+        # return -floor(-x)
+        text = self.texts["runtime.ceil"]
+        assert "runtime.floor(fneg(x))" in text, text
+        assert "x ^ 0x8000000000000000" not in text, text
+
+
+class TestUnnamedParamsGo127(GoDecompilationTarget):
+    """Go signatures name unnamed and blank parameters ``~pN``, which is not a Go identifier."""
+
+    BINARY = go_binary("go1.27.1", "basics_stripped")
+    FUNCS = ("runtime.(*PanicNilError).Error", "internal/sync.throw")
+
+    def test_unnamed_params(self):
+        error, throw = self.texts["runtime.(*PanicNilError).Error"], self.texts["internal/sync.throw"]
+        assert "func (a0 *runtime.PanicNilError) Error() string {" in error, error
+        assert "func internal/sync.throw(a0 string) {" in throw and "runtime.throw(a0)" in throw, throw
+        assert "~p" not in error + throw
+
+
+class TestSignatureArgNamesI386Go127(GoDecompilationTarget):
+    """
+    Semantic naming keeps the argument names a signature gives: loop-counter naming renamed ``IndexByte``'s ``c`` to
+    ``i``, and array-index naming renamed ``BEPutUint64``'s ``b`` to ``idx``.
+    """
+
+    BINARY = go_binary("go1.27.1", "recv", arch="i386")
+    FUNCS = ("internal/bytealg.IndexByte", "internal/byteorder.BEPutUint64")
+
+    def test_signature_arg_names(self):
+        assert self.header(self.texts["internal/bytealg.IndexByte"]).startswith(
+            "func internal/bytealg.IndexByte(b []byte, c byte) "
+        )
+        assert self.header(self.texts["internal/byteorder.BEPutUint64"]).startswith(
+            "func internal/byteorder.BEPutUint64(b []uint8, v uint64)"
+        )
+
+
+class TestSignatureArgNamesGo127Stripped(GoDecompilationTarget):
+    """
+    Semantic naming keeps the argument names a signature gives: call-result naming renamed ``memHashFallback``'s
+    ``p`` to ``t``, and size naming renamed ``uncheckedPutSlot``'s ``key`` and ``elem`` to ``n``. A placeholder is
+    not a name: no signature names the closure ``injectglist.func1``'s argument, and its ``a0`` is still replaced. The
+    temporary hoisted in ``mapassign_faststr`` does not take its kept parameter name ``t``.
+    """
+
+    BINARY = go_binary("go1.27.1", "basics_stripped")
+    FUNCS = (
+        "internal/runtime/maps.memHashFallback",
+        "internal/runtime/maps.(*table).uncheckedPutSlot",
+        "runtime.injectglist.func1",
+        "runtime.mapassign_faststr",
+    )
+
+    def test_signature_arg_names(self):
+        assert self.header(self.texts["internal/runtime/maps.memHashFallback"]).startswith(
+            "func internal/runtime/maps.memHashFallback(p unsafe.Pointer, "
+        )
+        header = self.header(self.texts["internal/runtime/maps.(*table).uncheckedPutSlot"])
+        assert re.search(r"\bkey unsafe\.Pointer, elem unsafe\.Pointer\)", header), header
+        header = self.header(self.texts["runtime.injectglist.func1"])
+        assert header.startswith("func runtime.injectglist.func1(") and not re.search(r"\ba0\b", header), header
+        text = self.texts["runtime.mapassign_faststr"]
+        assert self.header(text).startswith("func runtime.mapassign_faststr(t *internal/abi.MapType, "), text
+        assert not re.search(r"^\s+var t\b", text, re.MULTILINE), text
+
+
+class TestArgumentNameNotReusedGo127(GoDecompilationTarget):
+    """
+    A name an argument keeps is not given to another variable: with ``copyVal``'s parameter keeping its signature name
+    ``ptr``, semantic naming also called the result of ``unsafe_New`` ``ptr``, and the copy read
+    ``typedmemmove(typ, ptr, ptr)``.
+    """
+
+    BINARY = go_binary("go1.27.1", "atomics")
+    FUNCS = ("reflect.copyVal",)
+
+    def test_argument_name_not_reused(self):
+        text = self.texts["reflect.copyVal"]
+        assert self.header(text).startswith(
+            "func reflect.copyVal(typ *internal/abi.Type, fl reflect.flag, ptr unsafe.Pointer) "
+        )
+        copy = re.search(r"reflect\.typedmemmove\(typ, (\w+), ptr\)", text)
+        assert copy is not None and copy.group(1) != "ptr", text
+
+
+class TestHoistedTemporaryNamesI386Go127(GoDecompilationTarget):
+    """
+    The temporary an if/else value is hoisted into does not take an argument's name: ``InSlice`` declared ``var t int``
+    beside its receiver ``t``, so ``addChecked(t, t, ...)`` read the temporary twice.
+    """
+
+    BINARY = go_binary("go1.27.1", "recv", arch="i386")
+    FUNCS = ("internal/abi.(*FuncType).InSlice",)
+
+    def test_hoisted_temporary_names(self):
+        text = self.texts["internal/abi.(*FuncType).InSlice"]
+        assert self.header(text).startswith("func (t *internal/abi.FuncType) InSlice() "), text
+        assert re.search(r"internal/abi\.addChecked\(t, (\w+), ", text) is not None, text
+        assert not re.search(r"^\s+var t\b", text, re.MULTILINE), text
+
+
 class TestMapsArmGo127(GoDecompilationTarget):
     """
     A map read on 32-bit arm folds to m[k]: the fold labels the result words with arm's r0/r1 (it raised KeyError for
@@ -473,6 +608,30 @@ class TestMapsArmGo127(GoDecompilationTarget):
             assert "mapaccess1" not in text, text
         # the comma-ok read decompiles; its results live on the stack, which the two-word fold does not handle yet
         assert "func main.lookupOk(" in self.texts["main.lookupOk"]
+
+
+class TestRequestsArmGo127(GoDecompilationTarget):
+    """
+    A receive with the ok flag on 32-bit arm comes back as a receive: its (value, ok) result is labelled with arm's
+    r0/r1 (it raised KeyError for an arch other than amd64/arm64/386, and the basic-preset retry lost every Go rewrite
+    in the function).
+    """
+
+    BINARY = os.path.join(test_location, "armel", "go", "go1.27.1", "requests")
+    FUNCS = ("main.serve",)
+    WINDOW = 0x400
+
+    def test_requests_arm(self):
+        self.run_checks()
+
+    def check_request_loop(self):
+        text = self.texts["main.serve"]
+        assert re.search(r"^\s+\w+ := <-\w+$", text, re.MULTILINE), text
+        assert re.search(r"^\s+delete\(", text, re.MULTILINE), text
+        assert re.search(r"^\s+main\.quit <- ", text, re.MULTILINE), text
+        assert re.search(r"^\s+close\(\w+\)$", text, re.MULTILINE), text
+        for gone in ("chanrecv2", "mapdelete", "chansend1", "closechan"):
+            assert gone not in text, (gone, text)
 
 
 class TestLangdetectArmGo127(GoDecompilationTarget):
@@ -695,6 +854,20 @@ class TestNames(unittest.TestCase):
         assert not is_go_closure_name("pkg.(*T).funcName")
 
 
+class TestEqualityFunctionSignatures(unittest.TestCase):
+    def test_signature_from_go1_5(self):
+        # go1.4 and earlier also pass the size, so their equality functions keep the guess
+        for version, name, expected in (
+            ("go1.10.8", "type..eq.runtime.itab", "func(unsafe.Pointer, unsafe.Pointer) bool"),
+            ("go1.4.3", "type..eq.runtime._panic", None),
+        ):
+            proj = angr.Project(go_binary(version, "basics_stripped"), auto_load_libs=False)
+            sigs = proj.kb.go_signatures
+            sigs.load_sources()
+            proto = sigs.prototype(name)
+            assert (None if proto is None else str(proto)) == expected, (version, proto)
+
+
 class TestInferredSignatureRecords(unittest.TestCase):
     def test_result_words_and_groups(self):
         rec = GoInferredSignature()
@@ -847,6 +1020,24 @@ class TestHeapClosureRecordOnStackGo127N(unittest.TestCase):
         negative = [v for v in manager.get_variables(sort="reg") if v.reg < 0]
         assert not negative, [(v.name, v.reg) for v in negative]
         manager.serialize()
+
+
+class TestDefaultLocalNamesAvoidArgumentsGo(GoDecompilationTarget):
+    """
+    A default local name never repeats an argument's name. ``reflect.deepValueEqual``'s signature names its
+    parameters ``v1`` and ``v2``, the same form as default local names.
+    """
+
+    BINARY = os.path.join(test_location, "x86_64", "go", "age")
+    FUNCS = ("reflect.deepValueEqual",)
+
+    def test_default_local_names_avoid_arguments(self):
+        text = self.texts["reflect.deepValueEqual"]
+        assert self.header(text).startswith("func reflect.deepValueEqual(v1 reflect.Value, v2 reflect.Value, "), text
+        cfunc = self.codegens["reflect.deepValueEqual"].cfunc
+        arg_names = {arg.name for arg in cfunc.arg_list}
+        local_names = {var.name for var in cfunc.unified_local_vars}
+        assert not arg_names & local_names, sorted(arg_names & local_names)
 
 
 if __name__ == "__main__":

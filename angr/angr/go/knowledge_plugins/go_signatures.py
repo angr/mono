@@ -517,11 +517,22 @@ class GoSignatures(KnowledgeBasePlugin):
     def type(self, type_str: str) -> SimType:
         return self.parser.parse(type_str)
 
-    @staticmethod
-    def _implicit_signature(name: str) -> GoFuncSignature | None:
-        """Entry points and package initializers never take or return anything."""
+    def _implicit_signature(self, name: str) -> GoFuncSignature | None:
+        """
+        Signatures the compiler fixes by name: entry points and package initializers never take or return anything,
+        and a generated equality function compares two values through pointers to them.
+        """
         if name == "main.main" or re.search(r"\.init(?:\.\d+)?$", name):
             return GoFuncSignature(name)
+        if name.startswith(("type:.eq.", "type..eq.")):
+            # func(p, q *T) bool since go1.5, func(p, q unsafe.Pointer) bool since go1.27 (reflectdata/alg.go); go1.4
+            # and earlier, which also spell the name type..eq., pass the size as well
+            minor = re.match(r"go1\.(\d+)", self.go_version or "")
+            if name.startswith("type..eq.") and (minor is None or int(minor.group(1)) < 5):
+                return None
+            return GoFuncSignature(
+                name, [GoParam("p", "unsafe.Pointer"), GoParam("q", "unsafe.Pointer")], [GoParam("", "bool")]
+            )
         return None
 
     def prototype(self, name: str) -> GoSimTypeFunction | None:
@@ -763,8 +774,10 @@ class GoSignatures(KnowledgeBasePlugin):
             returnty = results[0]
         else:
             returnty = GoSimTypeTuple(results, [r.name for r in sig.results])
+        # the compiler names unnamed and blank parameters "~pN", which is not an identifier: leave them unnamed
+        arg_names = ["" if p.name.startswith("~") else p.name for p in params]
         arch = self._kb._project.arch
-        return GoSimTypeFunction(args, returnty, arg_names=[p.name for p in params], variadic=variadic).with_arch(arch)
+        return GoSimTypeFunction(args, returnty, arg_names=arg_names, variadic=variadic).with_arch(arch)
 
     def copy(self):
         o = GoSignatures(self._kb)
