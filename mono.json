@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "d752a326ebdeecc65bccde605e6a31cc2c2174a1",
-      "committed_at": "2026-10-28T11:55:32-07:00",
-      "subject": "claripy: produce native asts from Coerce types (#7694)",
+      "commit": "6afa0c79a83d9f677a46b0275cdb63bf16c1979e",
+      "committed_at": "2026-10-30T14:44:15-07:00",
+      "subject": "clarirs: refactor simplifiers to use semantic names and drop unnecessary tuple-lets (#7708)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,7 +123,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-29T09:33:10+00:00",
+  "imported_at": "2026-10-31T01:54:47+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
