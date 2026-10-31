@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 """The diff-relative pyright gate, as angr/ci-settings runs it.
 
-Same ratchet as ci/lint.py and for the same reason: upstream scores each
-changed file's "badness" -- (errors * 10 + warnings) / lines -- at the merge
-base and at HEAD, and fails if it goes up. Nothing here has to typecheck
-cleanly; it has to not get worse.
+Same ratchet as ci/lint.py and for the same reason: count each changed file's
+pyright *errors* on both sides of the diff, and fail the file if the count
+goes up. Nothing here has to typecheck cleanly; it has to not get worse. The
+base side is the merge base, the same one ci/lint.py uses; upstream's script
+scores master's tip instead.
+
+Upstream used to score a per-line "badness" -- (errors * 10 + warnings) /
+lines -- and angr/ci-settings#129 replaced it with the raw error count on
+2026-09-01. This tree keeps its own copy of the scripts, because upstream's
+run inside the CI image against one component checkout and this one is a
+monorepo, so the rule has to be carried across by hand. Badness moved with the
+file's length: deleting lines from a file that carried an error raised its
+score, so a pure deletion failed, and a file that grew fast enough absorbed a
+new error. It also counted a warning as a tenth of an error. None of that is
+true any more.
 
     ci/typecheck.py
     ci/typecheck.py --base HEAD~1
@@ -22,6 +33,19 @@ import vendored
 
 ROOT = Path(__file__).resolve().parent.parent
 BASE_TREE = ROOT / ".typecheck-base"
+
+
+class FileReport:
+    """One file's error count, and every diagnostic pyright raised against it.
+
+    A plain class rather than a dataclass: ci/tests loads these scripts by
+    path, without registering them in `sys.modules`, and `dataclasses` looks
+    the defining module up there to resolve annotations.
+    """
+
+    def __init__(self) -> None:
+        self.errors = 0
+        self.diagnostics: list[tuple[int, int, str, str]] = []
 
 
 def git(*args: str) -> str:
@@ -51,23 +75,27 @@ def require_pyright() -> None:
         )
     except OSError as exc:
         raise SystemExit(
-            f"pyright does not run ({exc}); the badness ratchet cannot mean anything"
+            f"pyright does not run ({exc}); the error ratchet cannot mean anything"
         ) from exc
     if result.returncode != 0:
         print(result.stderr[-2000:], file=sys.stderr)
-        raise SystemExit("pyright does not run; the badness ratchet cannot mean anything")
+        raise SystemExit("pyright does not run; the error ratchet cannot mean anything")
 
 
-def badness(paths: list[Path], tree: Path) -> dict[str, float]:
-    """pyright badness per file: (errors * 10 + warnings) / lines.
+def typecheck_files(paths: list[Path], tree: Path) -> dict[str, FileReport]:
+    """pyright's report per file: the error count, and every diagnostic.
 
     Run from `tree`, the same way ci/lint.py runs pylint from the tree it is
     scoring. pyright reads its default `exclude` -- `**/node_modules`,
     `**/__pycache__` and `**/.*` -- relative to the working directory, so from
     the repository root the baseline worktree `.typecheck-base` matched
     `**/.*` and pyright read none of it: `filesAnalyzed` came back 0, every
-    baseline scored 0.0000, and against zero any file carrying a diagnostic is
-    a regression. From inside that tree the same files are just files.
+    baseline counted 0 errors, and against zero any file carrying one is a
+    regression. From inside that tree the same files are just files.
+
+    Warnings go in `diagnostics` and nowhere else: they are printed under a
+    file that regressed, as upstream prints them, and ci-settings#129 stopped
+    them counting towards the verdict.
     """
     if not paths:
         return {}
@@ -85,20 +113,23 @@ def badness(paths: list[Path], tree: Path) -> dict[str, float]:
         print(result.stderr[-2000:], file=sys.stderr)
         raise SystemExit("pyright produced no JSON") from exc
 
-    counts: dict[str, list[int]] = {str(p): [0, 0] for p in paths}
+    out = {str(p): FileReport() for p in paths}
     unattributed = 0
     for item in report.get("generalDiagnostics", []):
         f = item.get("file")
-        if f not in counts:
+        if f not in out:
             # Never silently: if pyright ever spells a path differently than
             # we do, every diagnostic lands here, both measurements come out
             # zero, and the ratchet passes everything forever.
             unattributed += 1
             continue
-        if item.get("severity") == "error":
-            counts[f][0] += 1
-        elif item.get("severity") == "warning":
-            counts[f][1] += 1
+        severity = item["severity"]
+        if severity == "error":
+            out[f].errors += 1
+        start = item.get("range", {"start": {"line": 1, "character": 1}})["start"]
+        out[f].diagnostics.append(
+            (start["line"], start["character"], severity, item["message"])
+        )
     if unattributed:
         raise SystemExit(
             f"pyright reported {unattributed} diagnostics against paths this "
@@ -106,7 +137,7 @@ def badness(paths: list[Path], tree: Path) -> dict[str, float]:
         )
 
     # The other half of the same silence: a file pyright declined to read
-    # produces no diagnostics and scores a clean 0.0000, which is what an
+    # produces no diagnostics and counts a clean 0 errors, which is what an
     # excluded baseline tree looked like for as long as it was hidden.
     analysed = int(report.get("summary", {}).get("filesAnalyzed", 0))
     if analysed < len(paths):
@@ -115,13 +146,6 @@ def badness(paths: list[Path], tree: Path) -> dict[str, float]:
             "given; the comparison would be meaningless."
         )
 
-    out = {}
-    for f, (errors, warnings) in counts.items():
-        try:
-            lines = max(1, len(Path(f).read_text(encoding="utf-8", errors="replace").splitlines()))
-        except OSError:
-            lines = 1
-        out[f] = (errors * 10 + warnings) / lines
     return out
 
 
@@ -133,7 +157,7 @@ def main() -> int:
     require_pyright()
     base = merge_base(args.base)
     # A vendored submodule is source this repository does not write. Its
-    # files arrive in one commit and would score as new code that has to
+    # files arrive in one commit and would count as new code that has to
     # be perfect, which says nothing about the change under review.
     vendored_paths = vendored.paths()
     changed = [
@@ -147,32 +171,36 @@ def main() -> int:
         print("no Python files changed.")
         return 0
 
-    head = badness([ROOT / p for p in changed], ROOT)
+    head = typecheck_files([ROOT / p for p in changed], ROOT)
 
     # Same reason as ci/lint.py: pyright needs the tree, not loose files.
     subprocess.run(["rm", "-rf", str(BASE_TREE)], check=True)
     git("worktree", "add", "--detach", "--quiet", str(BASE_TREE), base)
     try:
         base_paths = [BASE_TREE / p for p in changed if (BASE_TREE / p).exists()]
-        before = badness(base_paths, BASE_TREE)
+        before = typecheck_files(base_paths, BASE_TREE)
     finally:
         git("worktree", "remove", "--force", str(BASE_TREE))
 
     regressions = []
     for path in changed:
         after = head[str(ROOT / path)]
-        # A file that did not exist scores against zero, as upstream does:
+        # A file that did not exist counts against zero, as upstream does:
         # a new module is allowed no errors at all. Exempting new files meant
         # an arbitrarily broken one passed.
-        was = before.get(str(BASE_TREE / path), 0.0)
-        print(f"{path}: badness {was:.4f} -> {after:.4f}")
-        if after > was:
+        was = before.get(str(BASE_TREE / path), FileReport()).errors
+        print(f"{path}: errors {was} -> {after.errors}")
+        if after.errors > was:
             regressions.append((path, was, after))
 
     if regressions:
-        print("\ntype badness increased:", file=sys.stderr)
+        print("\npyright errors increased:", file=sys.stderr)
         for path, was, after in regressions:
-            print(f"  {path}: {was:.4f} -> {after:.4f}", file=sys.stderr)
+            print(f"  {path}: {was} -> {after.errors}", file=sys.stderr)
+            # Upstream prints the diagnostics under the file that regressed,
+            # which is the difference between a number and something to fix.
+            for line, char, severity, text in sorted(after.diagnostics):
+                print(f"    {path}:{line}:{char}: [{severity}] {text}", file=sys.stderr)
         return 1
     print("\nno file got worse.")
     return 0
