@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 import cle
 
 TEST_BASE = os.path.join(os.path.dirname(os.path.realpath(__file__)), os.path.join("..", "..", "binaries"))
@@ -69,7 +71,48 @@ def test_rebase_granularity_is_not_a_hard_object_limit():
         assert ld.find_object_containing(obj.min_addr) is obj
 
 
+def test_the_main_binary_base_is_not_handed_out_twice():
+    """
+    A container backend loads its children through the loader, and a child can be marked as the
+    main binary: a universal Mach-O marks every slice it loads, because a Mach-O executable
+    refuses to load as anything else. The position-independent main binary has a fixed base
+    address, so the second such object was placed on top of the first.
+    """
+    path = os.path.join(TEST_BASE, "tests", "i386", "manysum")
+    ld = cle.Loader(path, auto_load_libs=False)
+
+    first = MockBackend(0x1000, arch=ld.main_object.arch, is_main_bin=True)
+    second = MockBackend(0x1000, arch=ld.main_object.arch, is_main_bin=True)
+    ld.dynamic_load(first)
+    ld.dynamic_load(second)
+
+    assert first.mapped_base == 0x400000
+    assert second.min_addr > first.max_addr
+
+
+def test_archive_members_fill_a_16_bit_address_space():
+    """
+    A page is a sixteenth of AVR's 64 KiB, so falling back to one costs a whole page per archive
+    member and leaves nowhere to put a member larger than what is left over.
+    """
+    pytest.importorskip("pypcode")
+    path = os.path.join(TEST_BASE, "tests", "avr", "libgcov_avr31.a")
+    ld = cle.Loader(path)
+
+    members = [obj for obj in ld.all_objects if obj.parent_object is ld.main_object]
+    assert len(members) == 28
+
+    placed = sorted(members, key=lambda o: o.min_addr)
+    assert placed[-1].max_addr < 2**ld.main_object.arch.bits
+    for lower, upper in zip(placed, placed[1:]):
+        assert lower.max_addr < upper.min_addr
+    for obj in members:
+        assert ld.find_object_containing(obj.min_addr, membership_check=False) is obj
+
+
 if __name__ == "__main__":
     test_sparse_main_object()
     test_sparse_main_object_unsorted_program_headers()
     test_rebase_granularity_is_not_a_hard_object_limit()
+    test_the_main_binary_base_is_not_handed_out_twice()
+    test_archive_members_fill_a_16_bit_address_space()

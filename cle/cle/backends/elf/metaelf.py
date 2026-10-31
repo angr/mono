@@ -33,17 +33,57 @@ def maybedecode(string):
     return string if isinstance(string, str) else string.decode()
 
 
+# FreeBSD has branded its executables two ways. EI_OSABI is the one the gABI defines, and
+# before it existed FreeBSD wrote its name into the identification bytes from byte 8 on,
+# which is what brandelf(1) sets; its own loader calls that "FreeBSD 3.x's traditional
+# string branding w/in the ELF header" and still accepts either spelling.
+# __elfN(get_brandinfo) in sys/kern/imgact_elf.c matches
+# `hdr->e_ident[EI_OSABI] == bi->brand` or `strcmp(&hdr->e_ident[OLD_EI_BRAND],
+# bi->compat_3_brand) == 0`, with OLD_EI_BRAND defined as 8 and FreeBSD's own brandinfo
+# carrying "FreeBSD".
+_OLD_EI_BRAND = 8
+_EI_BRANDS = {b"FreeBSD": "ELFOSABI_FREEBSD"}
+
+
+def _describe_os(elf):
+    """
+    The operating system an ELF declares, read the way its loader would read it.
+
+    A branded binary leaves EI_OSABI at ELFOSABI_SYSV, which says nothing about the OS, so
+    the brand is only consulted when the header itself names no OS.
+    """
+    osabi = elf.header.e_ident.EI_OSABI
+    if osabi == "ELFOSABI_SYSV":
+        brand = elf.e_ident_raw[_OLD_EI_BRAND:].split(b"\0")[0]
+        if brand in _EI_BRANDS:
+            return describe_ei_osabi(_EI_BRANDS[brand])
+    return describe_ei_osabi(osabi)
+
+
 def _get_relro(elf):
     # The tests for partial and full RELRO have been taken from
     # checksec.sh v1.5 (https://www.trapkit.de/tools/checksec/):
     #   - Partial RELRO has a 'GNU_RELRO' segment
     #   - Full RELRO also has a 'BIND_NOW' flag in the dynamic section
-    if not any(seg.header.p_type == "PT_GNU_RELRO" for seg in elf.iter_segments()):
+
+    # Ask the program headers directly: iter_segments() builds a DynamicSegment for PT_DYNAMIC, and building
+    # one walks the whole section table, so a section CLE has no use for here can fail the load.
+    if not any(
+        elf._get_segment_header(i)["p_type"] == "PT_GNU_RELRO"  # pylint: disable=protected-access
+        for i in range(elf.num_segments())
+    ):
         return Relro.NONE
     dyn_sec = elf.get_section_by_name(".dynamic")
     if dyn_sec is None or not isinstance(dyn_sec, DynamicSection):
         return Relro.PARTIAL
-    flags = [tag for tag in dyn_sec.iter_tags() if tag.entry.d_tag == "DT_FLAGS"]
+    try:
+        flags = [tag for tag in dyn_sec.iter_tags() if tag.entry.d_tag == "DT_FLAGS"]
+    except Exception:  # pylint: disable=broad-except
+        # DT_FLAGS is a number, but pyelftools resolves the dynamic string table for every tag it
+        # yields, and an object without one cannot. Not being able to confirm BIND_NOW is what
+        # partial RELRO already means, so report that rather than failing the load over it.
+        log.debug("Could not read the dynamic table while detecting RELRO", exc_info=True)
+        return Relro.PARTIAL
     if len(flags) != 1:
         return Relro.PARTIAL
     return (
@@ -61,7 +101,7 @@ class MetaELF(Backend):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         tmp_reader = elftools.elf.elffile.ELFFile(self._binary_stream)
-        self.os = describe_ei_osabi(tmp_reader.header.e_ident.EI_OSABI)
+        self.os = _describe_os(tmp_reader)
         self.elfflags = tmp_reader.header.e_flags
         self.relro = _get_relro(tmp_reader)
         self._plt = {}
@@ -440,7 +480,9 @@ class MetaELF(Backend):
         Get initial rtoc value for PowerPC64 architecture.
         """
         if self.is_ppc64_abiv1:
-            return self._ppc64_abiv1_initial_rtoc
+            if self._ppc64_abiv1_initial_rtoc is None:
+                return None
+            return AT.from_lva(self._ppc64_abiv1_initial_rtoc, self).to_mva()
         elif self.is_ppc64_abiv2:
             return self._ppc64_abiv2_get_initial_rtoc()
         else:
@@ -483,12 +525,18 @@ class MetaELF(Backend):
                     if seg.header.p_type == "PT_NULL":
                         break
                     elif seg.header.p_type == "PT_DYNAMIC":
-                        for tag in seg.iter_tags():
-                            if tag.entry.d_tag == "DT_SONAME":
-                                return maybedecode(tag.soname)
+                        # Ask for DT_SONAME specifically: an unfiltered iter_tags() makes pyelftools
+                        # resolve the dynamic string table for every tag, which objects with no
+                        # string table at all cannot do.
+                        for tag in seg.iter_tags("DT_SONAME"):
+                            return maybedecode(tag.soname)
                         if isinstance(path, str):
                             return os.path.basename(path)
 
-            except elftools.common.exceptions.ELFError:
-                pass
+            # This is a best-effort heuristic, so any failure to parse just means "no soname". The
+            # exception type is deliberately not narrowed: a file that names a DT_SONAME it cannot
+            # resolve makes pyelftools assert rather than raise ELFError, and which of the two a
+            # given malformed file gets has already changed once between pyelftools releases.
+            except Exception:  # pylint: disable=broad-except
+                log.debug("Could not extract a soname from %s", path, exc_info=True)
             return None
