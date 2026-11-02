@@ -11,6 +11,7 @@ from cle.errors import CLEInvalidBinaryError, CLEOperationError
 from cle.utils import stream_or_path
 
 from .backend import Backend, register_backend
+from .go32 import coff_image_offset
 from .region import Segment
 from .relocation import Relocation
 
@@ -319,8 +320,6 @@ class MZ(Backend):
             relocation_end = header.relocation_table_offset + header.relocation_count * 4
             if relocation_end > header.header_size:
                 raise CLEInvalidBinaryError("MZ relocation table extends past the executable header")
-        if header.overlay_number != 0:
-            raise CLEInvalidBinaryError(f"MZ overlay {header.overlay_number} is not an ordinary primary executable")
         if header.minimum_allocation_size > _REAL_MODE_ADDRESS_SPACE:
             raise CLEInvalidBinaryError("MZ minimum allocation exceeds the 20-bit real-mode address space")
         if header.entry_rva is None:
@@ -357,6 +356,9 @@ class MZ(Backend):
 
     @staticmethod
     def _recognized_extension(reader: _Reader) -> bytes | None:
+        # a DJGPP go32 stub carries no extended-header pointer: its program is the COFF image after the stub
+        if coff_image_offset(reader._stream) is not None:
+            return b"COFF"
         # e_lfanew lives at 0x3c whatever the header paragraph count says, and PE images exist whose
         # stub declares a two-paragraph header and still carries a real pointer there, so this must
         # not be gated on the declared header size.

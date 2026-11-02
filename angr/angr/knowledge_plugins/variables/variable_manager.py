@@ -92,6 +92,28 @@ def _defaultdict_set():
     return defaultdict(set)
 
 
+_SYMBOL_VERSION = re.compile(r"@@?[^@]*$")
+
+
+def variable_name_from_label(label: str) -> str:
+    """
+    Derive a variable name from the symbol label at the variable's address.
+
+    MSVC decorates a variable with its enclosing scopes, at-separated and innermost first, behind a
+    leading question mark, as in ?count@detail@ns@@3HA; those become the :: spelling the code
+    generators use for scoped names elsewhere. Every other label is a plain symbol name, and the
+    only at-separated suffix it can carry is the version an ELF reference resolved against, written
+    into the name as stderr@GLIBC_2.2.5 or stderr@@GLIBC_2.2.5. That names the same object as the
+    plain symbol, which cle keeps the version on separately.
+    """
+    if label.startswith("?"):
+        name = label[1:]
+        if "@@" in name:
+            name = name[: name.index("@@")]
+        return "::".join(name.split("@")[::-1])
+    return _SYMBOL_VERSION.sub("", label)
+
+
 class VariableManagerInternal(Serializable):
     """
     Manage variables for a function. It is meant to be used internally by VariableManager, but it's common to be
@@ -769,7 +791,11 @@ class VariableManagerInternal(Serializable):
         atom: ailment.expression.Atom | None = None,
     ):
         existing = self._ident_to_variable.get(variable.ident)
-        if existing is None or existing != variable:
+        if existing is not None and existing == variable:
+            # record our own object: annotations read back from claripy can carry an equal variable of another
+            # analysis, which identity-keyed updates such as rebind_variable_records() would then miss
+            variable = existing
+        else:
             if existing is not None:
                 self._supersede_variable(variable)
             self._ident_to_variable[variable.ident] = variable
@@ -1209,13 +1235,7 @@ class VariableManagerInternal(Serializable):
                     continue
                 if labels is not None and var.addr in labels:
                     var.renamed = True
-                    var.name = labels[var.addr]
-                    # poor man's demangling
-                    var.name = var.name.removeprefix("?")
-                    if "@@" in var.name:
-                        var.name = var.name[: var.name.index("@@")]
-                    if "@" in var.name:
-                        var.name = "::".join(var.name.split("@")[::-1])
+                    var.name = variable_name_from_label(labels[var.addr])
                 elif isinstance(var.addr, int):
                     var.name = f"g_{var.addr:x}"
                 elif var.ident is not None:
@@ -1236,7 +1256,8 @@ class VariableManagerInternal(Serializable):
         the sorted list. These variables are likely completely removed during the dephication process.
 
         :param labels:    Known labels in the binary.
-        :param arg_names: Known argument names.
+        :param arg_names: Known argument names. No default local name repeats one of them, or the name of a variable
+                          this call keeps.
         :param reset:     Reset all variable names or not.
         :param func_blocks: A list of function blocks of the function where these variables are accessed.
         """
@@ -1278,9 +1299,7 @@ class VariableManagerInternal(Serializable):
                     continue
                 # assign names directly
                 if labels is not None and var.addr in labels:
-                    var.name = labels[var.addr]
-                    if "@@" in var.name:
-                        var.name = var.name[: var.name.index("@@")]
+                    var.name = variable_name_from_label(labels[var.addr])
                 elif var.ident:
                     var.name = var.ident
                 else:
@@ -1305,14 +1324,24 @@ class VariableManagerInternal(Serializable):
                     sorted_reg_variables.remove(var)
                     phi_only_vars.append(var)
 
+        taken = set(arg_names or ())
+        local_vars = []
         for var in chain(sorted_stack_variables, sorted_reg_variables, sorted_combo_reg_variables, phi_only_vars):
-            idx = next(var_ctr)
+            keep = False
             if var.auto_renamed and not var.renamed:
                 # a semantic name from an earlier run: drop it so this run can name the variable afresh
                 var.auto_renamed = False
             elif var.name is not None and var.name != var.ident and not reset:
+                keep = True
+                taken.add(var.name)
+            local_vars.append((var, keep))
+        for var, keep in local_vars:
+            idx = next(var_ctr)
+            if keep:
                 continue
             if isinstance(var, (SimStackVariable, SimRegisterVariable, SimComboRegisterVariable)):
+                while f"v{idx}" in taken:
+                    idx = next(var_ctr)
                 var.name = f"v{idx}"
             # clear the hash cache
             var._hash = None
@@ -1484,12 +1513,14 @@ class VariableManagerInternal(Serializable):
                 congruence_classes[v] = canon_partition
 
         if interference is not None:
-            # unify variables based on phi nodes
+            # A phi may include variables owned by another manager, such as globals, which are not candidates for
+            # unification in this function.
             for v, subvs in self._phi_variables.items():
                 if not isinstance(v, (SimRegisterVariable, SimStackVariable)):
                     continue
                 for subv in subvs:
-                    unify(subv, v)
+                    if subv in congruence_classes:
+                        unify(subv, v)
 
             # unify stack variables at the same offsets only if their corresponding vvars do not interfere
             stack_vars_by_offset: dict[int, set[SimStackVariable]] = defaultdict(set)
