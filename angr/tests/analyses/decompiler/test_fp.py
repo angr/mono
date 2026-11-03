@@ -331,6 +331,8 @@ class TestFPDecompilation:
         assert "+" in text
         assert "Insert" not in text
         assert "unsigned int *" not in text
+        # the addition reads the double identity_f64 returns; an integer cast of the call would convert its value
+        assert re.search(r"\((?:unsigned )?(?:int|long long)\)\s*identity_f64\(", text) is None, text
 
     def test_chained_f64_calls(self, bin_name):
         if bin_name.endswith("_O1") and "amd64" in bin_name:
@@ -451,6 +453,12 @@ class TestFPDecompilation:
             assert "uint128_t" not in text
             assert "float" in text
 
+    def test_sum_array_f32_adds_float_values(self, bin_name):
+        # the accumulator may sit in an integer-typed register variable; the float addition reads its bits, so an
+        # integer cast of it as an addend would convert its value
+        text = _env(bin_name).get_text("sum_array_f32")
+        assert re.search(r"\((?:unsigned )?(?:int|long long)\)v\d+ \+ \*", text) is None, text
+
     def test_int_to_f32(self, bin_name):
         text = _env(bin_name).get_text("int_to_f32")
         sig = _sig(text)
@@ -506,6 +514,8 @@ class TestFPDecompilation:
         assert "a0" in text and "a1" in text
         assert "+" in text
         assert "(long long)" not in text
+        # the addition reads the float square_f32 returns; an integer cast of the call would convert its value
+        assert re.search(r"\((?:unsigned )?(?:int|long long)\)\s*square_f32\(", text) is None, text
 
     def test_negate_f32(self, bin_name):
         text = _env(bin_name).get_text("negate_f32")
@@ -1230,7 +1240,7 @@ class TestByteSliceOfNonLvalue:
 
     def test_ah_of_sum(self):
         text = _decompile_asm_func("byte_slice_i386.o", "ah_of_sum", cca=True)
-        assert "(char)(a0 + 24341 >> 8)" in text, text
+        assert "(unsigned char)(a0 + 24341 >> 8)" in text, text
         assert "&(" not in text, text
 
     def test_al_of_sum(self):
@@ -1239,7 +1249,7 @@ class TestByteSliceOfNonLvalue:
 
     def test_ah_of_slot(self):
         text = _decompile_asm_func("byte_slice_i386.o", "ah_of_slot", cca=True)
-        assert "*(char *)((void*)&v0 + 1)" in text, text
+        assert "*(unsigned char *)((void*)&v0 + 1)" in text, text
 
 
 class TestAdcSbbCarry:
@@ -1289,7 +1299,7 @@ class TestStackLoadAcrossSpUpdate:
     def test_load_offset(self, func_name, slot):
         text = _decompile_asm_func("sp_lea_i386.o", func_name, cca=True)
         assert "[bp+0x1]" not in text, text
-        assert f"if (*(char *)((void*)&{slot} + 1) & 65)" in text, text
+        assert f"if (*(unsigned char *)((void*)&{slot} + 1) & 65)" in text, text
 
 
 _FLOAT_BITS = r"__float_as_int\(\(float\)a0\)|\*\(unsigned int \*\)&v\d+"
@@ -1678,7 +1688,7 @@ class TestX87CallDelta:
         text = _decompile_asm_func(_X87_CALL_DELTA_BIN, "fxam_fn")
         _assert_no_x87_leaks(text)
         assert "_ccall" not in text
-        if text.startswith("char "):
+        if text.startswith(("char ", "unsigned char ")):
             # with the (inferred) char return type only al is returned, and al is zero after fnstsw ax
             assert "return 0;" in text, text
         else:
