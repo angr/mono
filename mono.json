@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "6afa0c79a83d9f677a46b0275cdb63bf16c1979e",
-      "committed_at": "2026-10-30T14:44:15-07:00",
-      "subject": "clarirs: refactor simplifiers to use semantic names and drop unnecessary tuple-lets (#7708)",
+      "commit": "d816a4fa3bfecf657c01389fdd336fc094c3513e",
+      "committed_at": "2026-11-02T16:21:15-07:00",
+      "subject": "clarirs: route all evals back to batch_eval_n",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "ec800ec5c45b7766e51921168ffe8b98fadf24e0",
-      "committed_at": "2026-10-26T11:22:01-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#1758)",
+      "commit": "1af4c02877c0ada70b457b4e321da07a912e4b6f",
+      "committed_at": "2026-11-02T12:41:22-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#1759)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -52,9 +52,9 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "cb5e2e5cba2514c6bdd9b50013b60854392458ab",
-      "committed_at": "2026-10-26T11:22:35-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#394)",
+      "commit": "bcece51c5b72fa96d46f654572040e5beb7e2ca8",
+      "committed_at": "2026-11-02T11:47:21-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#395)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -68,9 +68,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "ac7bab8766473290d1a5c164525c2ea021f78a03",
-      "committed_at": "2026-10-26T11:22:55-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#880)",
+      "commit": "6f1f3ed578f62bcb24c69ea77cbfb0b3bd60fd9c",
+      "committed_at": "2026-11-02T12:42:20-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#881)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -87,25 +87,25 @@
     },
     "pypcode": {
       "upstream": "https://github.com/angr/pypcode",
-      "commit": "934ccb10ba48e5c33734176675572d84e5116446",
-      "committed_at": "2026-10-26T13:24:04-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate",
+      "commit": "44d0f58f96865fea3bc6fc7d797fe8bd1e2cfbfa",
+      "committed_at": "2026-11-02T15:48:16-07:00",
+      "subject": "v4.1.1.dev0",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pysoot": {
       "upstream": "https://github.com/angr/pysoot",
-      "commit": "923ec64577978b177610415578dd83044cdb4cb9",
-      "committed_at": "2026-10-26T11:23:41-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#65)",
+      "commit": "fb24830fc18224e6f0cd50481b62014994a63c8c",
+      "committed_at": "2026-11-02T12:41:06-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#66)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "5ae29727cf5a9c30433a46e7350027ac7965a221",
-      "committed_at": "2026-10-28T21:48:35-07:00",
-      "subject": "IRConst: give vex_int_class() classes .size (#602)",
+      "commit": "63554810169ea89044458c27cfd820aa962446f4",
+      "committed_at": "2026-11-02T12:41:49-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#603)",
       "excluded": [
         ".gitmodules"
       ],
@@ -123,7 +123,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-10-31T01:54:47+00:00",
+  "imported_at": "2026-11-03T03:15:20+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",

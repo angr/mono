@@ -60,6 +60,8 @@ def op_attrs(p):
 
     attrs["from_signed"] = attrs["from_signed_back"] if attrs["from_signed"] is None else attrs["from_signed"]
     attrs.pop("from_signed_back", None)
+    if attrs["rounding_mode"] is not None:
+        attrs["rounding_mode"] = attrs["rounding_mode"].lstrip("_")
     if attrs["generic_name"] == "CmpOR":
         assert attrs["from_type"] == "D"
         attrs["generic_name"] = "CmpORD"
@@ -570,6 +572,8 @@ class SimIROp:
         if o == "__floordiv__" and self.is_signed:
             # yikes!!!!!!!
             return claripy.SDiv(*sized_args)
+        if o == "__mod__" and self.is_signed:
+            return claripy.SMod(*sized_args)
         if o == "Abs":
             return claripy.If(sized_args[0].SLT(0), -sized_args[0], sized_args[0])
 
