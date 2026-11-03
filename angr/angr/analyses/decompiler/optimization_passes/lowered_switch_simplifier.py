@@ -15,7 +15,11 @@ from angr.analyses.decompiler.structurer_nodes import (
     MultiNode,
     SequenceNode,
 )
-from angr.analyses.decompiler.utils import first_nonlabel_nonphi_statement, remove_last_statement
+from angr.analyses.decompiler.utils import (
+    first_nonlabel_nonphi_statement,
+    fix_copied_node_labels,
+    remove_last_statement,
+)
 from angr.analyses.decompiler.variable_map import variable_map_of
 from angr.utils.graph import GraphUtils
 from angr.utils.ssa import get_vvar_uselocs
@@ -219,7 +223,8 @@ class LoweredSwitchSimplifier(StructuringOptimizationPass):
 
     def _analyze_simplified_region(self, region, initial=False):
         super()._analyze_simplified_region(region, initial=initial)
-        finder = SwitchClusterFinder(region, variable_map_of(self.manager))
+        assert self._ri is not None
+        finder = SwitchClusterFinder(region, variable_map_of(self._ri.ail_manager))
         self._switches_present_in_code = len(finder.var2switches.values())
 
     def _check(self):
@@ -291,6 +296,21 @@ class LoweredSwitchSimplifier(StructuringOptimizationPass):
                 if default_reachable_from_case:
                     continue
 
+                # RULE 5: every edge out of the comparison tree goes to a case target or the default.
+                # _find_cascading_switch_variable_comparisons can stop short of a subtree, or skip a comparison of
+                # another variable, without recording where that edge leads. the rewrite below removes every
+                # comparison node, so the code behind such an edge would lose its last predecessor and be deleted.
+                # targets are compared by address, as in that function's case filter, so a copy of the default
+                # block with another idx still counts as the default.
+                tree_nodes = {case.original_node for case in cases} | set(redundant_nodes) | {original_head}
+                target_addrs = {case.target for case in cases}
+                if any(
+                    succ not in tree_nodes and succ.addr not in target_addrs
+                    for node in tree_nodes
+                    for succ in self._graph.successors(node)
+                ):
+                    continue
+
                 # the head is the root of the cascade and keeps its in-edges: the first case node when the
                 # cascade starts with an eq comparison, or the gt node whose subtrees hold the cases. every
                 # other comparison node is replaced by edges out of the head.
@@ -360,6 +380,7 @@ class LoweredSwitchSimplifier(StructuringOptimizationPass):
                             self._block_copies[case.original_node][-1].idx = (
                                 len(self._block_copies[case.original_node]) + 1000
                             )
+                            fix_copied_node_labels(self._block_copies[case.original_node][-1])
                         case_node_copy = self._block_copies[case.original_node][-1]
 
                         case_addrs.append(
@@ -454,6 +475,7 @@ class LoweredSwitchSimplifier(StructuringOptimizationPass):
                 for head in heads:
                     node_copy = succ_node.deep_copy(self.manager)
                     node_copy.idx = next_id
+                    fix_copied_node_labels(node_copy)
                     next_id += 1
 
                     # update the block ID in case_addrs
