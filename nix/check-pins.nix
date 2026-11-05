@@ -7,6 +7,7 @@ let
     claripy.z3-solver."4.13.0.0" = [
       "5.1.0.0"
       "5.3.1.0"
+      "5.3.3.0"
     ];
   };
   requirementsOf =
