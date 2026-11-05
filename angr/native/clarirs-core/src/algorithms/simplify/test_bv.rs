@@ -1185,9 +1185,10 @@ fn test_rotate_over_symbolic_rotation_by_constant() -> Result<()> {
     let x = ctx.bvs("x", 8)?;
     let s = ctx.bvs("s", 8)?;
     let three = ctx.bvv(BitVec::from((3, 8)))?;
-    let values: HashMap<u64, AstRef<'_>> = [
-        (x.hash(), ctx.bvv(BitVec::from((0b1001_0110, 8)))?),
-        (s.hash(), ctx.bvv(BitVec::from((2, 8)))?),
+    #[allow(clippy::mutable_key_type)]
+    let values: HashMap<AstRef<'_>, AstRef<'_>> = [
+        (x.clone(), ctx.bvv(BitVec::from((0b1001_0110, 8)))?),
+        (s.clone(), ctx.bvv(BitVec::from((2, 8)))?),
     ]
     .into_iter()
     .collect();
@@ -1318,5 +1319,37 @@ fn test_shared_subterms_simplify_once_per_call() -> Result<()> {
             "differs at x = {value:#x}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn test_ite_absorbs_nested_ite_on_same_condition() -> Result<()> {
+    let ctx = Context::new();
+    let c = ctx.bools("c")?;
+    let a = ctx.bvs("a", 32)?;
+    let b = ctx.bvs("b", 32)?;
+    let d = ctx.bvs("d", 32)?;
+    let inner = ctx.ite(&c, &a, &b)?;
+
+    // If(c, If(c, a, b), d) -> If(c, a, d)
+    assert_eq!(ctx.ite(&c, &inner, &d)?.simplify()?, ctx.ite(&c, &a, &d)?);
+    // If(c, d, If(c, a, b)) -> If(c, d, b)
+    assert_eq!(ctx.ite(&c, &d, &inner)?.simplify()?, ctx.ite(&c, &d, &b)?);
+    // Both sides at once.
+    assert_eq!(
+        ctx.ite(&c, &inner, ctx.ite(&c, &d, &b)?)?.simplify()?,
+        ctx.ite(&c, &a, &b)?
+    );
+    // Absorbing can leave identical branches: If(c, If(c, a, b), a) -> a
+    assert_eq!(ctx.ite(&c, &inner, &a)?.simplify()?, a);
+    // The condition is compared after If(!c, x, y) -> If(c, y, x).
+    assert_eq!(
+        ctx.ite(ctx.not(&c)?, &d, &inner)?.simplify()?,
+        ctx.ite(&c, &a, &d)?
+    );
+    // A different inner condition is left alone.
+    let other = ctx.ite(ctx.bools("c2")?, &a, &b)?;
+    let unrelated = ctx.ite(&c, &other, &d)?;
+    assert_eq!(unrelated.simplify()?, unrelated);
     Ok(())
 }

@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "d816a4fa3bfecf657c01389fdd336fc094c3513e",
-      "committed_at": "2026-11-02T16:21:15-07:00",
-      "subject": "clarirs: route all evals back to batch_eval_n",
+      "commit": "6aff0f9964487c454af6fd6bff2bb4ab5fcc2274",
+      "committed_at": "2026-11-04T15:46:16-07:00",
+      "subject": "clarirs: Change AstOp::with_leaves to not return None for leaves, drop reconstruct algorithm (#7741)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,7 +123,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-03T03:15:20+00:00",
+  "imported_at": "2026-11-05T02:53:28+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
