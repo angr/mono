@@ -64,8 +64,8 @@ self: super: {
     angrSource = sources.angr;
   };
 
-  # This upstream test is explicitly marked as requiring Internet access and
-  # waits indefinitely when the sandbox drops its connections.
+  # This upstream test is explicitly marked as requiring Internet access,
+  # which the Nix build sandbox does not provide.
   curio = super.curio.overridePythonAttrs (old: {
     disabledTests = (old.disabledTests or [ ]) ++ [ "test_errors" ];
   });
