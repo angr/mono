@@ -50,6 +50,23 @@ let
         hash = "sha256-48HlD3l3ECiz1um23FdR/aambA76zsM2Ta8Md9RMZAU=";
       };
     };
+    "5.3.3.0" = {
+      x86_64-linux = {
+        name = "z3_solver-${version}-py3-none-manylinux_2_27_x86_64.whl";
+        path = "2e/04/d785e50a2f6cd78549bebe730f2afeab5187c62085fc19b7ac272602fb2f";
+        hash = "sha256-BDECOoInjatwbAKjIPYxeO4HVfuPEKXJgPC/48hPb5Y=";
+      };
+      aarch64-linux = {
+        name = "z3_solver-${version}-py3-none-manylinux_2_38_aarch64.whl";
+        path = "e9/e4/73b6722cb58aeac9b6e95e02d7837ad8d929e7ba613bc73c7216ef09bffa";
+        hash = "sha256-cBYZ1JlWlYGeFQ6foQIYtnpaIkGGjzHd3M/i0/4V+YY=";
+      };
+      aarch64-darwin = {
+        name = "z3_solver-${version}-py3-none-macosx_13_0_arm64.whl";
+        path = "f6/c5/377b91ca159c84effd838f4e73181050c8dd02783a300b4cd245e44c365a";
+        hash = "sha256-gU3etgdTXCEeEeGvYMnGn+j5V7MEADpWLZv8PO76KVw=";
+      };
+    };
   };
   version = (import ./check-pins.nix lib).select {
     component = "angr";
