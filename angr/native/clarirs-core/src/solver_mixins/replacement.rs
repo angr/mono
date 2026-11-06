@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-
+use crate::algorithms::replace::Replacements;
 use crate::prelude::*;
 
 /// A solver mixin that applies expression replacements before delegating to
@@ -10,7 +9,7 @@ use crate::prelude::*;
 /// queries. Explicit replacements can also be added via
 /// [`add_replacement`](Self::add_replacement).
 ///
-/// The replacement dictionary maps AST hashes to their replacement `AstRef`
+/// The replacement dictionary maps ASTs to their replacement `AstRef`
 /// values. When a query is made, all known replacements are applied to the
 /// expression in a single pass before forwarding to the inner solver.
 #[derive(Clone, Debug)]
@@ -22,13 +21,10 @@ pub struct ReplacementSolver<'c, S: Solver<'c>> {
     /// solver from `constraints()` must not pick up values substituted by the
     /// replacements.
     original_constraints: Vec<AstRef<'c>>,
-    /// The canonical set of replacements (hash → replacement AST).
-    replacements: HashMap<u64, AstRef<'c>>,
-    /// Cache that includes derived replacements from sub-expression traversal.
-    replacement_cache: HashMap<u64, AstRef<'c>>,
+    /// The replacements.
+    replacements: Replacements<'c>,
     /// Whether to automatically extract replacements from `x == <concrete>` constraints.
     auto_replace: bool,
-    _marker: std::marker::PhantomData<&'c ()>,
 }
 
 impl<'c, S: Solver<'c>> ReplacementSolver<'c, S> {
@@ -40,10 +36,8 @@ impl<'c, S: Solver<'c>> ReplacementSolver<'c, S> {
         Self {
             inner,
             original_constraints: Vec::new(),
-            replacements: HashMap::new(),
-            replacement_cache: HashMap::new(),
+            replacements: Replacements::new(),
             auto_replace,
-            _marker: std::marker::PhantomData,
         }
     }
 
@@ -64,34 +58,28 @@ impl<'c, S: Solver<'c>> ReplacementSolver<'c, S> {
     /// Add an explicit replacement mapping: occurrences of `old` will be
     /// replaced with `new` in all future queries.
     pub fn add_replacement(&mut self, old: AstRef<'c>, new: AstRef<'c>) {
-        let hash = old.hash();
-        self.replacements.insert(hash, new.clone());
-        self.replacement_cache.insert(hash, new);
+        self.replacements.insert(old, new);
     }
 
     /// Remove specific replacements by their hashes.
     pub fn remove_replacements(&mut self, hashes: &[u64]) {
-        for hash in hashes {
-            self.replacements.remove(hash);
-        }
-        // Rebuild cache from canonical replacements
-        self.replacement_cache = self.replacements.clone();
+        self.replacements
+            .retain(|old, _| !hashes.contains(&old.hash()));
     }
 
     /// Clear all replacements.
     pub fn clear_replacements(&mut self) {
         self.replacements.clear();
-        self.replacement_cache.clear();
     }
 
-    /// Get the current replacement map (hash → AstRef).
-    pub fn replacements(&self) -> &HashMap<u64, AstRef<'c>> {
+    /// Get the current replacements.
+    pub fn replacements(&self) -> &Replacements<'c> {
         &self.replacements
     }
 
     /// Apply known replacements to an AstRef.
     fn apply_replacements(&self, ast: &AstRef<'c>) -> Result<AstRef<'c>, ClarirsError> {
-        ast.replace_many(&self.replacement_cache)
+        ast.replace_many(&self.replacements)
     }
 
     /// Try to extract a replacement from an equality constraint like `sym == concrete`.

@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "d816a4fa3bfecf657c01389fdd336fc094c3513e",
-      "committed_at": "2026-11-02T16:21:15-07:00",
-      "subject": "clarirs: route all evals back to batch_eval_n",
+      "commit": "1ac65fe62019963bf55ad3168b12757c95b7666b",
+      "committed_at": "2026-11-06T10:41:18-07:00",
+      "subject": "clarirs: match commutative sub-expressions in replace/replace_many (#7744)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -44,9 +44,9 @@
     },
     "angrop": {
       "upstream": "https://github.com/angr/angrop",
-      "commit": "6875df828b08db1922fde45a7290add1e05b6085",
-      "committed_at": "2026-09-07T05:40:10-07:00",
-      "subject": "rop_utils: Support controlling stack values that are shifted right. (#159)",
+      "commit": "79768326425633cb7f6e27dacc31f1cef774183e",
+      "committed_at": "2026-11-06T01:22:07-07:00",
+      "subject": "Merge pull request #157 from papadoxie/feat/ibt-endbr-support",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -123,7 +123,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-03T03:15:20+00:00",
+  "imported_at": "2026-11-06T17:56:41+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",

@@ -23,6 +23,10 @@ from angr.analyses.typehoon.simple_solver import (
     ConstraintGraphNode,
     ConstraintGraphTag,
     SimpleSolver,
+    Sketch,
+    SketchNode,
+    _is_pointee_label_prefix,
+    _is_pointee_label_suffix,
     map_offsets_to_bases,
 )
 from angr.analyses.typehoon.translator import TypeTranslator
@@ -232,6 +236,55 @@ class TestTypehoon(unittest.TestCase):
 
         sol = typehoon.solution[p]
         assert isinstance(sol, Pointer32) and isinstance(sol.basetype, Struct), sol
+
+    def test_offset_mirroring_stays_out_of_primitive_solving(self):
+        # reduced from sub_180048860 in issue #7729: p->node[i].field_38 = &p->node[i]. as two-way subtyping, the
+        # mirrored fields of the interior pointers made the constraint graph cyclic, and generating primitive constraints
+        # from it took seconds here and forever on the whole function. the idx values keep the original solving order.
+        addr = 0x180048860
+        func_f = TypeVariable(idx=(addr, 0))
+        p, v = TypeVariable(idx=(addr, 3)), TypeVariable(idx=(addr, 374))
+
+        def field(access, offset: int, idx: int) -> DerivedTypeVariable:
+            return DerivedTypeVariable(p, None, labels=[access, HasField(64, offset)], idx=(addr, idx))
+
+        def node(offset: int, idx: int) -> DerivedTypeVariable:
+            return DerivedTypeVariable(p, None, labels=[AddN(offset)], idx=(-1, idx))
+
+        # (node offset, node idx, offset of the field that points to it, field idx)
+        nodes = [
+            (16496, 3, 16552, 41),
+            (16528, 16, 16584, 44),
+            (16560, 18, 16616, 47),
+            (16592, 20, 16648, 50),
+            (16624, 22, 16680, 53),
+            (16656, 24, 16712, 56),
+            (16688, 26, 16744, 58),
+            (16720, 8, 16752, 60),
+        ]
+        constraints = {
+            Subtype(field(Load(), 24, 371), SInt64()),
+            Subtype(field(Store(), 16, 376), v),
+            *(
+                Subtype(field(Store(), field_off, field_idx), node(off, idx))
+                for off, idx, field_off, field_idx in nodes
+            ),
+        }
+        typevars = {
+            p,
+            v,
+            node(28, 143),
+            field(Load(), 16760, 406),
+            *(node(off, idx) for off, idx, _, _ in nodes[1:]),
+        }
+        solver = SimpleSolver(64, {func_f: set(constraints)}, {func_f: set(typevars)})
+
+        _, _, solving_constraints = solver.infer_shapes(set(typevars), set(constraints))
+        assert solving_constraints == constraints
+        # the mirrored fields are still typed: node 1's field_38 points to node 1
+        sol = solver.solution[p]
+        assert isinstance(sol, Pointer64) and isinstance(sol.basetype, Struct), sol
+        assert isinstance(sol.basetype.fields.get(16584), Pointer64), sol.basetype.fields
 
     def test_loop_carried_cursor_into_a_struct(self):
         # cur = buf + 20; do { cur -= 1; *cur = c; } while (...); with *(int *)buf also read. the phi makes cur its own
@@ -526,6 +579,59 @@ class TestTypehoon(unittest.TestCase):
         sol = solver.solution[t0]
         assert isinstance(sol, Pointer32)
         assert not SimpleSolver._nests_deeper_than(sol, MAX_TYPE_NESTING + 2)
+
+    @staticmethod
+    def _field_graph_constraints(edges: list[tuple[int, int]], count: int):
+        """q_k.load.<32>@(4j) <: q_j for every (k, j) in edges: a quotient graph of pointer classes and their fields."""
+        func = TypeVariable(name="F")
+        qs = [TypeVariable(name=f"q{i}") for i in range(count)]
+        constraints = {
+            Subtype(DerivedTypeVariable(qs[k], None, labels=[Load(), HasField(32, 4 * j)]), qs[j]) for k, j in edges
+        }
+        constraints.add(Subtype(DerivedTypeVariable(qs[-1], None, labels=[Load(), HasField(32, 0)]), Int32()))
+        return func, qs, constraints
+
+    def test_sketch_of_a_struct_pointing_into_its_later_fields_is_not_unrolled_per_path(self):
+        # reduced from sub_60845b88 in decbench u-boot O2-noinline: every pointer class has a field pointing to every
+        # later one, so the number of simple paths, and of nodes in a tree-shaped sketch, is exponential (2^19 here)
+        count = 20
+        func, qs, constraints = self._field_graph_constraints(
+            [(k, j) for k in range(count) for j in range(k + 1, count)], count
+        )
+        solver = SimpleSolver(32, {func: set(constraints)}, {func: set(qs)})
+
+        _, sketches, _ = solver.infer_shapes(set(qs), constraints)
+        assert sketches[qs[0]].graph.number_of_nodes() <= 4 * count
+        assert all(
+            sketch.graph.number_of_nodes() <= 2 * SimpleSolver.SKETCH_UNROLL_LIMIT for sketch in sketches.values()
+        )
+
+        sol = solver.solution[qs[0]]
+        assert isinstance(sol, Pointer32) and isinstance(sol.basetype, Struct), sol
+        assert sorted(sol.basetype.fields) == [4 * j for j in range(1, count)]
+
+    def test_unrolled_sketch_size_matches_unrolling(self):
+        # the memoized count must agree with _get_all_paths on graphs with cycles entered at different nodes
+        rng = random.Random(7)
+        count = 7
+        for _ in range(20):
+            edges = [(k, j) for k in range(count) for j in range(count) if k != j and rng.random() < 0.35]
+            func, qs, constraints = self._field_graph_constraints(edges, count)
+            solver = SimpleSolver(32, {func: set()}, {func: set()})
+            eq_classes, graph = solver.compute_quotient_graph(constraints, set(qs))
+            scc_ids = {node: i for i, scc in enumerate(networkx.strongly_connected_components(graph)) for node in scc}
+            for q in qs:
+                root = eq_classes.get(q, q)
+                if root not in graph:
+                    continue
+                sketch = Sketch(solver, root)
+                root_node = sketch.lookup(root)
+                assert isinstance(root_node, SketchNode)
+                solver._get_all_paths(graph, sketch, root, {root: root_node}, {})
+                unrolled = sum(1 for node in sketch.graph if isinstance(node, SketchNode)) - 1
+                assert solver._unrolled_sketch_size(graph, root, scc_ids, {}) == min(
+                    unrolled, SimpleSolver.SKETCH_UNROLL_LIMIT + 1
+                )
 
     def test_solving_cascading_type_constraints(self):
         p = angr.Project(os.path.join(test_location, "x86_64", "decompiler", "tiny_aes_test.elf"), auto_load_libs=False)
@@ -1229,6 +1335,64 @@ class TestDFAConstraintSolver(unittest.TestCase):
                 g.add_edge(rng.randint(2, n - 1), 1, label=node)
             expected = self._reference_constraints(g, 0, {1})
             assert DFAConstraintSolver._constraints_from_simple_paths(g, 0, {1}) == expected
+
+    def test_constraints_from_simple_paths_with_label_filters(self):
+        # the filters drop exactly the constraints whose recalled (lhs) or forgotten (rhs) labels they reject
+        rng = random.Random(11)
+        tvs = [TypeVariable(idx=(0, i)) for i in range(4)]
+        variances = [Variance.COVARIANT, Variance.CONTRAVARIANT]
+        whole = HasField(MAX_POINTSTO_BITS, 0)
+        mid_labels = [Load(), Store(), whole, HasField(32, 0)]
+        for _ in range(150):
+            n = rng.randint(3, 9)
+            g = networkx.MultiDiGraph()
+            g.add_nodes_from(range(n))
+            for _ in range(rng.randint(1, 3)):
+                node = ConstraintGraphNode(
+                    rng.choice(tvs), rng.choice(variances), ConstraintGraphTag.LEFT, FORGOTTEN.PRE_FORGOTTEN
+                )
+                g.add_edge(0, rng.randint(1, n - 1), label=node)
+            for _ in range(rng.randint(n, 3 * n)):
+                src, dst = rng.randint(2, n - 1), rng.randint(2, n - 1)
+                g.add_edge(src, dst, label=(rng.choice(mid_labels), rng.choice(["recall", "forget"])))
+            for _ in range(rng.randint(1, n)):
+                node = ConstraintGraphNode(
+                    rng.choice(tvs), rng.choice(variances), ConstraintGraphTag.RIGHT, FORGOTTEN.PRE_FORGOTTEN
+                )
+                g.add_edge(rng.randint(2, n - 1), 1, label=node)
+            reference = self._reference_constraints(g, 0, {1})
+
+            def labels_of(tv):
+                return tuple(tv.labels) if isinstance(tv, DerivedTypeVariable) else ()
+
+            lhs_filtered = DFAConstraintSolver._constraints_from_simple_paths(
+                g, 0, {1}, lhs_labels_ok=_is_pointee_label_prefix
+            )
+            assert lhs_filtered == {c for c in reference if _is_pointee_label_prefix(labels_of(c.sub_type))}
+            rhs_filtered = DFAConstraintSolver._constraints_from_simple_paths(
+                g, 0, {1}, rhs_labels_ok=_is_pointee_label_suffix
+            )
+            assert rhs_filtered == {c for c in reference if _is_pointee_label_suffix(labels_of(c.super_type))}
+
+    def test_rhs_label_filter_bounds_enumeration_through_a_dense_forget_cycle(self):
+        # reduced from issue #7729: forget edges between every pair of k states give ~k! simple paths, all of which
+        # end in a primitive with a label chain that Sketch.add_constraint ignores
+        k = 13
+        tv = TypeVariable(idx=(0, 0))
+        g = networkx.MultiDiGraph()
+        g.add_edge(
+            0, 2, label=ConstraintGraphNode(tv, Variance.COVARIANT, ConstraintGraphTag.LEFT, FORGOTTEN.PRE_FORGOTTEN)
+        )
+        int_node = ConstraintGraphNode(Int32(), Variance.COVARIANT, ConstraintGraphTag.RIGHT, FORGOTTEN.PRE_FORGOTTEN)
+        for i in range(2, k + 2):
+            g.add_edge(i, 1, label=int_node)
+            for j in range(2, k + 2):
+                if i != j:
+                    g.add_edge(i, j, label=(HasField(32, 4 * j), "forget"))
+        constraints = DFAConstraintSolver._constraints_from_simple_paths(
+            g, 0, {1}, rhs_labels_ok=_is_pointee_label_suffix
+        )
+        assert constraints == {Subtype(tv, Int32())}
 
 
 if __name__ == "__main__":

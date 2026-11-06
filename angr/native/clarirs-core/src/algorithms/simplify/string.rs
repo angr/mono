@@ -27,7 +27,7 @@ pub(crate) fn simplify_string<'c>(
             match (string.op(), start_idx.op(), count.op()) {
                 (AstOp::StringV(s), AstOp::BVV(start_bv), AstOp::BVV(length_bv)) => {
                     // Convert the bitvectors to usize indices.
-                    let start = start_bv.to_usize().unwrap_or(0);
+                    let start = start_bv.to_usize().unwrap_or(usize::MAX);
                     let length = length_bv.to_usize().unwrap_or(s.chars().count());
                     let num_chars = s.chars().count();
 
@@ -39,7 +39,11 @@ pub(crate) fn simplify_string<'c>(
 
                     // Convert character-based indices to byte-based indices.
                     let char_start = s.chars().take(start).map(|c| c.len_utf8()).sum();
-                    let char_end = s.chars().take(start + length).map(|c| c.len_utf8()).sum();
+                    let char_end = s
+                        .chars()
+                        .take(start.saturating_add(length))
+                        .map(|c| c.len_utf8())
+                        .sum();
 
                     let substring = s.get(char_start..char_end).unwrap_or("").to_string();
                     Ok(ctx.stringv(substring)?)
@@ -75,30 +79,7 @@ pub(crate) fn simplify_string<'c>(
                 _ => Ok(ctx.bv_to_str(inner)?),
             }
         }
-        AstOp::ITE(..) => {
-            let if_ = state.get_child_simplified(0)?;
-            let then_ = state.get_child_simplified(1)?;
-            let else_ = state.get_child_simplified(2)?;
-
-            // If both branches are identical, return either one
-            if then_ == else_ {
-                return Ok(then_.clone());
-            }
-
-            match if_.op() {
-                // If the condition is a concrete boolean value, return the appropriate branch
-                AstOp::BoolV(value) => {
-                    if *value {
-                        Ok(then_.clone())
-                    } else {
-                        Ok(else_.clone())
-                    }
-                }
-                // If the condition has a Not at the top level, invert the branches
-                AstOp::Not(inner) => Ok(ctx.ite(inner, else_, then_)?),
-                _ => Ok(ctx.ite(if_, then_, else_)?),
-            }
-        }
+        AstOp::ITE(..) => super::simplify_ite(state),
         _ => unreachable!("non-string op dispatched to simplify_string"),
     }
 }
