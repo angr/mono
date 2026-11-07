@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "1ac65fe62019963bf55ad3168b12757c95b7666b",
-      "committed_at": "2026-11-06T10:41:18-07:00",
-      "subject": "clarirs: match commutative sub-expressions in replace/replace_many (#7744)",
+      "commit": "0300235803cba3914cefb6b5344e5853f921d3f5",
+      "committed_at": "2026-11-06T15:47:41-07:00",
+      "subject": "fgets: handle newlines in symbolic files (#7647)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,13 +123,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-06T17:56:41+00:00",
+  "imported_at": "2026-11-07T17:55:53+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "76ad9e296dde8f82b8ede93ce06a578cd1933639",
-      "committed_at": "2026-10-26T17:24:36Z",
-      "subject": "Add stripped zlib minigzip (O0) for the Phoenix switch-default-is-loop-latch structuring test (gz_decomp).",
+      "commit": "dde9019ccb1d5f873e3052282a29fecf6c6ec45c",
+      "committed_at": "2026-11-07T00:19:00-07:00",
+      "subject": "Add an x86-64 object with a C++ function taking __float128 by value (#277)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }

@@ -51,8 +51,6 @@ pub enum AstOp<'c> {
     ITE(AstRef<'c>, AstRef<'c>, AstRef<'c>),
 
     // Equality (any sort) and bitvector comparisons (all produce a bool).
-    // `Eq`/`Neq` apply to any sort; for floats they have IEEE `fp.eq`
-    // semantics, otherwise they are structural.
     Eq(AstRef<'c>, AstRef<'c>),
     Neq(AstRef<'c>, AstRef<'c>),
     ULT(AstRef<'c>, AstRef<'c>),
@@ -65,6 +63,7 @@ pub enum AstOp<'c> {
     SGE(AstRef<'c>, AstRef<'c>),
 
     // Float comparisons (produce a bool)
+    FpEq(AstRef<'c>, AstRef<'c>),
     FpLt(AstRef<'c>, AstRef<'c>),
     FpLeq(AstRef<'c>, AstRef<'c>),
     FpGt(AstRef<'c>, AstRef<'c>),
@@ -136,7 +135,7 @@ pub enum AstOp<'c> {
     // String leaves and operations
     StringS(InternedString),
     StringV(String),
-    StrConcat(AstRef<'c>, AstRef<'c>),
+    StrConcat(Vec<AstRef<'c>>),
     StrSubstr(AstRef<'c>, AstRef<'c>, AstRef<'c>),
     StrReplace(AstRef<'c>, AstRef<'c>, AstRef<'c>),
     BVToStr(AstRef<'c>),
@@ -203,7 +202,7 @@ macro_rules! ast_op_arity {
 
 ast_op_arity! {
     leaf: [BoolS, BoolV, BVS, BVV, FPS, FPV, StringS, StringV],
-    nary: [And, Or, Xor, Add, Mul, Concat, Union, Intersection],
+    nary: [And, Or, Xor, Add, Mul, Concat, Union, Intersection, StrConcat],
     unary: [
         Not, Neg, ByteReverse, ZeroExt(n), SignExt(n), Extract(hi, lo), StrLen, StrToBV,
         FpToIEEEBV, FpToUBV(size, rm), FpToSBV(size, rm), FpNeg, FpAbs, FpSqrt(rm),
@@ -211,10 +210,10 @@ ast_op_arity! {
         FpIsNan, FpIsInf, StrIsDigit, BVToStr,
     ],
     binary: [
-        Eq, Neq, ULT, ULE, UGT, UGE, SLT, SLE, SGT, SGE, FpLt, FpLeq, FpGt, FpGeq,
+        Eq, Neq, ULT, ULE, UGT, UGE, SLT, SLE, SGT, SGE, FpEq, FpLt, FpLeq, FpGt, FpGeq,
         StrContains, StrPrefixOf, StrSuffixOf, Sub, UDiv, SDiv, URem, SRem, ShL, LShR, AShR,
         RotateLeft, RotateRight, Widen, FpAdd(rm), FpSub(rm), FpMul(rm),
-        FpDiv(rm), StrConcat,
+        FpDiv(rm),
     ],
     ternary: [ITE, StrIndexOf, FpFP, StrSubstr, StrReplace],
 }
@@ -293,6 +292,7 @@ impl<'c> AstOp<'c> {
             | AstOp::SLE(..)
             | AstOp::SGT(..)
             | AstOp::SGE(..)
+            | AstOp::FpEq(..)
             | AstOp::FpLt(..)
             | AstOp::FpLeq(..)
             | AstOp::FpGt(..)
@@ -441,7 +441,8 @@ impl<'c> AstOp<'c> {
             ),
 
             // Binary float operations and comparisons (same sort)
-            AstOp::FpLt(a, b)
+            AstOp::FpEq(a, b)
+            | AstOp::FpLt(a, b)
             | AstOp::FpLeq(a, b)
             | AstOp::FpGt(a, b)
             | AstOp::FpGeq(a, b)
@@ -468,13 +469,19 @@ impl<'c> AstOp<'c> {
             ),
 
             // String predicates and operations
-            AstOp::StrContains(a, b)
-            | AstOp::StrPrefixOf(a, b)
-            | AstOp::StrSuffixOf(a, b)
-            | AstOp::StrConcat(a, b) => require(
-                a.ast_type().is_string() && b.ast_type().is_string(),
-                "string operation requires string operands",
-            ),
+            AstOp::StrContains(a, b) | AstOp::StrPrefixOf(a, b) | AstOp::StrSuffixOf(a, b) => {
+                require(
+                    a.ast_type().is_string() && b.ast_type().is_string(),
+                    "string operation requires string operands",
+                )
+            }
+            AstOp::StrConcat(v) => {
+                nonempty(v)?;
+                require(
+                    v.iter().all(|a| a.ast_type().is_string()),
+                    "StrConcat requires string operands",
+                )
+            }
             AstOp::StrIsDigit(a) | AstOp::StrLen(a) | AstOp::StrToBV(a) => require(
                 a.ast_type().is_string(),
                 "string operation requires a string operand",

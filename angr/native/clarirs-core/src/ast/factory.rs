@@ -525,20 +525,13 @@ pub trait AstFactory<'c>: Sized {
         self.make_ast(AstOp::FpSqrt(lhs.into_owned(), rm.into()))
     }
 
+    /// IEEE 754 equality (`fp.eq`); `eq_` is `=`, and inequality is `not(fp_eq(..))`.
     fn fp_eq(
         &'c self,
         lhs: impl IntoOwned<AstRef<'c>>,
         rhs: impl IntoOwned<AstRef<'c>>,
     ) -> Result<AstRef<'c>, ClarirsError> {
-        self.make_ast(AstOp::Eq(lhs.into_owned(), rhs.into_owned()))
-    }
-
-    fn fp_neq(
-        &'c self,
-        lhs: impl IntoOwned<AstRef<'c>>,
-        rhs: impl IntoOwned<AstRef<'c>>,
-    ) -> Result<AstRef<'c>, ClarirsError> {
-        self.make_ast(AstOp::Neq(lhs.into_owned(), rhs.into_owned()))
+        self.make_ast(AstOp::FpEq(lhs.into_owned(), rhs.into_owned()))
     }
 
     fn fp_lt(
@@ -587,10 +580,17 @@ pub trait AstFactory<'c>: Sized {
 
     fn str_concat(
         &'c self,
+        args: impl IntoIterator<Item = AstRef<'c>>,
+    ) -> Result<AstRef<'c>, ClarirsError> {
+        self.make_ast(AstOp::StrConcat(args.into_iter().collect()))
+    }
+
+    fn str_concat2(
+        &'c self,
         lhs: impl IntoOwned<AstRef<'c>>,
         rhs: impl IntoOwned<AstRef<'c>>,
     ) -> Result<AstRef<'c>, ClarirsError> {
-        self.make_ast(AstOp::StrConcat(lhs.into_owned(), rhs.into_owned()))
+        self.str_concat([lhs.into_owned(), rhs.into_owned()])
     }
 
     fn str_substr(
