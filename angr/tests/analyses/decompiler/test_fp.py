@@ -24,7 +24,7 @@ from angr.analyses.complete_calling_conventions import (
 from angr.analyses.decompiler.edits import set_variable_type
 from angr.analyses.decompiler.structured_codegen.c import CFunctionCall, _decode_binary128
 from angr.analyses.decompiler.structured_codegen.c_serialize import parse_codegen, serialize_codegen
-from angr.calling_conventions import SimCCMicrosoftFastcall
+from angr.calling_conventions import SimCCMicrosoftFastcall, SimCCSystemVAMD64, SimRegArg
 from angr.knowledge_plugins.functions.function_parser import CallingConventionSerializer
 from angr.sim_type import (
     SimTypeDouble,
@@ -331,6 +331,8 @@ class TestFPDecompilation:
         assert "+" in text
         assert "Insert" not in text
         assert "unsigned int *" not in text
+        # the addition reads the double identity_f64 returns; an integer cast of the call would convert its value
+        assert re.search(r"\((?:unsigned )?(?:int|long long)\)\s*identity_f64\(", text) is None, text
 
     def test_chained_f64_calls(self, bin_name):
         if bin_name.endswith("_O1") and "amd64" in bin_name:
@@ -451,6 +453,12 @@ class TestFPDecompilation:
             assert "uint128_t" not in text
             assert "float" in text
 
+    def test_sum_array_f32_adds_float_values(self, bin_name):
+        # the accumulator may sit in an integer-typed register variable; the float addition reads its bits, so an
+        # integer cast of it as an addend would convert its value
+        text = _env(bin_name).get_text("sum_array_f32")
+        assert re.search(r"\((?:unsigned )?(?:int|long long)\)v\d+ \+ \*", text) is None, text
+
     def test_int_to_f32(self, bin_name):
         text = _env(bin_name).get_text("int_to_f32")
         sig = _sig(text)
@@ -506,6 +514,8 @@ class TestFPDecompilation:
         assert "a0" in text and "a1" in text
         assert "+" in text
         assert "(long long)" not in text
+        # the addition reads the float square_f32 returns; an integer cast of the call would convert its value
+        assert re.search(r"\((?:unsigned )?(?:int|long long)\)\s*square_f32\(", text) is None, text
 
     def test_negate_f32(self, bin_name):
         text = _env(bin_name).get_text("negate_f32")
@@ -1230,7 +1240,7 @@ class TestByteSliceOfNonLvalue:
 
     def test_ah_of_sum(self):
         text = _decompile_asm_func("byte_slice_i386.o", "ah_of_sum", cca=True)
-        assert "(char)(a0 + 24341 >> 8)" in text, text
+        assert "(unsigned char)(a0 + 24341 >> 8)" in text, text
         assert "&(" not in text, text
 
     def test_al_of_sum(self):
@@ -1239,7 +1249,7 @@ class TestByteSliceOfNonLvalue:
 
     def test_ah_of_slot(self):
         text = _decompile_asm_func("byte_slice_i386.o", "ah_of_slot", cca=True)
-        assert "*(char *)((void*)&v0 + 1)" in text, text
+        assert "*(unsigned char *)((void*)&v0 + 1)" in text, text
 
 
 class TestAdcSbbCarry:
@@ -1289,7 +1299,7 @@ class TestStackLoadAcrossSpUpdate:
     def test_load_offset(self, func_name, slot):
         text = _decompile_asm_func("sp_lea_i386.o", func_name, cca=True)
         assert "[bp+0x1]" not in text, text
-        assert f"if (*(char *)((void*)&{slot} + 1) & 65)" in text, text
+        assert f"if (*(unsigned char *)((void*)&{slot} + 1) & 65)" in text, text
 
 
 _FLOAT_BITS = r"__float_as_int\(\(float\)a0\)|\*\(unsigned int \*\)&v\d+"
@@ -1495,6 +1505,41 @@ class TestSignedIntToFP:
         assert "(double)(int)(a1 >> 3)" in text, text
 
 
+# ======================================================================
+# float128_arg_amd64.o: a C++ function taking __float128 by value, which
+# the SysV x86-64 ABI classifies SSE, SSEUP and passes in one xmm register.
+# Its prototype comes from the mangled name.
+# ======================================================================
+
+
+class TestFloat128Arg(unittest.TestCase):
+    def test_in_one_xmm_register(self):
+        path = os.path.join(_fp_dir, "float128_arg_amd64.o")
+        if not os.path.exists(path):
+            pytest.skip(f"{path} not found")
+        proj = angr.Project(path, auto_load_libs=False)
+        cfg = proj.analyses[CFGFast].prep()(normalize=True)
+        proj.analyses[CompleteCallingConventionsAnalysis].prep()(cfg=cfg.model)
+        cc = SimCCSystemVAMD64(proj.arch)
+        proto = cfg.functions["_Z10accumulategd"].prototype
+        assert cc.arg_locs(proto) == [SimRegArg("xmm0", 16), SimRegArg("xmm1", 8)]
+        assert cc.return_val(SimTypeFloat128()) == SimRegArg("xmm0", 16)
+
+    def test_parameter(self):
+        text = _decompile_asm_func("float128_arg_amd64.o", "_Z10accumulategd", cca=True)
+        assert "void accumulate(__float128 arg_0, double arg_1)" in text, text
+        assert "total = arg_0;" in text, text
+
+    def test_call_passes_one_argument(self):
+        text = _decompile_asm_func("float128_arg_amd64.o", "_Z5drivei", cca=True)
+        assert re.search(r"accumulate\(seed, \(double\)v\d+ \* 0\.5\);", text), text
+
+    def test_callee(self):
+        # scale has a C name, so recovering its calling convention analyzes its call site in accumulate
+        text = _decompile_asm_func("float128_arg_amd64.o", "scale", cca=True)
+        assert "return a0 * 3.0;" in text, text
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -1678,7 +1723,7 @@ class TestX87CallDelta:
         text = _decompile_asm_func(_X87_CALL_DELTA_BIN, "fxam_fn")
         _assert_no_x87_leaks(text)
         assert "_ccall" not in text
-        if text.startswith("char "):
+        if text.startswith(("char ", "unsigned char ")):
             # with the (inferred) char return type only al is returned, and al is zero after fnstsw ax
             assert "return 0;" in text, text
         else:

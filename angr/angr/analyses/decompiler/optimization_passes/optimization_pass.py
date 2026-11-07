@@ -218,7 +218,7 @@ class OptimizationPass(BaseOptimizationPass):
         seen = set()
 
         if start_node is None:
-            start_node = self._get_block(self._func.addr)
+            start_node = self._get_block(self.entry_node_addr[0], idx=self.entry_node_addr[1])
         if start_node is None:
             return
 
@@ -234,7 +234,10 @@ class OptimizationPass(BaseOptimizationPass):
             if depth is not None and node_depth >= depth:
                 continue
 
-            for succ in sorted(self._graph.successors(node), key=lambda x: (x.addr, x.idx if hasattr(x, "idx") else 0)):
+            for succ in sorted(
+                self._graph.successors(node),
+                key=lambda x: (x.addr, (-1 if x.idx is None else x.idx) if hasattr(x, "idx") else 0),
+            ):
                 if succ not in seen:
                     queue.append((node_depth + 1, succ))
 
