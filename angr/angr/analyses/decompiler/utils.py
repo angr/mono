@@ -857,6 +857,36 @@ def last_node(node: BaseNode | Block) -> BaseNode | ailment.Block | None:
     return node
 
 
+def holds_incomplete_switch_case(node) -> bool:
+    """
+    Whether node is an IncompleteSwitchCaseNode, or a container that holds one somewhere inside it.
+
+    A jump table dispatch that LoweredSwitchSimplifier has already folded into an
+    IncompleteSwitchCaseNode reaches the structuring schemas wrapped in whatever loop, sequence and
+    code nodes the enclosing region produced. A schema that would rebuild the switch out of the
+    graph has to see through those wrappers, because rebuilding it discards the folded node together
+    with all of its case nodes.
+
+    MultiNode is not walked: it holds blocks and nothing else.
+    """
+    stack = [node]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, IncompleteSwitchCaseNode):
+            return True
+        if isinstance(current, CodeNode):
+            stack.append(current.node)
+        elif isinstance(current, LoopNode):
+            stack.append(current.sequence_node)
+        elif isinstance(current, SequenceNode):
+            stack.extend(current.nodes)
+    return False
+
+
 def first_nonlabel_node(seq: SequenceNode) -> BaseNode | ailment.Block | None:
     for node in seq.nodes:
         inner_node = node.node if isinstance(node, CodeNode) else node
@@ -918,6 +948,27 @@ def update_labels(graph: networkx.DiGraph, ail_manager: ailment.Manager):
     a graph where only _some_ of the nodes have labels.
     """
     return add_labels(remove_labels(graph), ail_manager)
+
+
+def fix_copied_node_labels(block: ailment.Block) -> None:
+    """
+    Rename the labels of a block that was copied under a new index: suffix each name with ``__<block.idx>`` (replacing
+    the suffix an earlier rename added) and set its ``block_idx`` tag to ``block.idx``. Without this, every copy keeps
+    the original's label name and ``(ins_addr, block_idx)`` key, which gotos use to find their label, so the copies
+    cannot be told apart and the same label can be printed more than once.
+    """
+    for i in range(len(block.statements)):  # pylint:disable=consider-using-enumerate
+        stmt = block.statements[i]
+        if isinstance(stmt, ailment.Stmt.Label):
+            new_name = stmt.name or f"Label_{stmt.tags['ins_addr']:x}"
+            if "block_idx" in stmt.tags:
+                suffix = f"__{stmt.tags['block_idx']}"
+                new_name = new_name.removesuffix(suffix)
+            else:
+                new_name = stmt.name
+            new_name += f"__{block.idx}"
+
+            block.statements[i] = ailment.Stmt.Label(stmt.idx, new_name, **{**stmt.tags, "block_idx": block.idx})
 
 
 def _flatten_structured_node(packed_node: SequenceNode | MultiNode) -> list[ailment.Block]:
