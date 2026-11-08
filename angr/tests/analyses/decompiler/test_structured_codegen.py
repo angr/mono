@@ -25,6 +25,7 @@ from angr.analyses.decompiler.structured_codegen.c import (
     CReturn,
     CStructField,
     CStructuredCodeGenerator,
+    CStructuredCodeWalker,
     CTypeCast,
     CUnaryOp,
     CVariable,
@@ -54,6 +55,7 @@ from angr.sim_type import (
     parse_cpp_file,
 )
 from angr.sim_variable import SimRegisterVariable
+from angr.utils.types import unpack_typeref
 from tests.common import WORKER, bin_location, load_project_with_scoped_cfg, print_decompilation_result
 
 test_location = os.path.join(bin_location, "tests")
@@ -278,18 +280,44 @@ class TestRightShiftRendering(unittest.TestCase):
         assert expression.c_repr() == "(unsigned int)(status()) >> (amount & 31)"
 
     def test_same_precedence_rhs_is_parenthesized(self):
-        # a < (b < c) and a << (b << c) are not a < b < c / a << b << c; a + (b + c) needs no parentheses
+        # a < (b < c) differs from a < b < c, and a * (b / c) from a * b / c; integer a + (b + c) needs no parentheses
         value_type = SimTypeInt(signed=False).with_arch(self.codegen.project.arch)
         a, b, c = (_RenderedExpression(n, value_type, codegen=self.codegen) for n in "abc")
-        for op, text in (
-            ("CmpLT", "a < (b < c)"),
-            ("CmpEQ", "a == (b == c)"),
-            ("Shl", "a << (b << c)"),
-            ("Add", "a + b + c"),
+        for op, rhs_op, text in (
+            ("CmpLT", "CmpLT", "a < (b < c)"),
+            ("CmpEQ", "CmpEQ", "a == (b == c)"),
+            ("Shl", "Shl", "a << (b << c)"),
+            ("Mul", "Div", "a * (b / c)"),
+            ("Mul", "Mod", "a * (b % c)"),
+            ("Div", "Mod", "a / (b % c)"),
+            ("Add", "Sub", "a + (b - c)"),
+            ("Add", "CmpLTs", "a + (b < c)"),
+            ("Add", "Add", "a + b + c"),
+            ("Mul", "Mul", "a * b * c"),
         ):
+            with self.subTest(op=op, rhs_op=rhs_op):
+                rhs = CBinaryOp(rhs_op, b, c, codegen=self.codegen)
+                assert CBinaryOp(op, a, rhs, codegen=self.codegen).c_repr() == text
+
+    def test_modulo_has_multiplicative_precedence(self):
+        value_type = SimTypeInt(signed=False).with_arch(self.codegen.project.arch)
+        a, b, c = (_RenderedExpression(n, value_type, codegen=self.codegen) for n in "abc")
+        lhs = CBinaryOp("Mul", a, b, codegen=self.codegen)
+        assert CBinaryOp("Mod", lhs, c, codegen=self.codegen).c_repr() == "a * b % c"
+
+    def test_floating_point_rhs_of_the_same_operator_is_parenthesized(self):
+        value_type = SimTypeDouble().with_arch(self.codegen.project.arch)
+        a, b, c = (_RenderedExpression(n, value_type, codegen=self.codegen) for n in "abc")
+        for op, text in (("Add", "a + (b + c)"), ("Mul", "a * (b * c)")):
             with self.subTest(op=op):
                 rhs = CBinaryOp(op, b, c, codegen=self.codegen)
                 assert CBinaryOp(op, a, rhs, codegen=self.codegen).c_repr() == text
+
+    def test_cast_shift_parenthesizes_same_precedence_count(self):
+        value_type = SimTypeInt(signed=False).with_arch(self.codegen.project.arch)
+        a, b, c = (_RenderedExpression(n, value_type, codegen=self.codegen) for n in "abc")
+        rhs = CBinaryOp("Shl", b, c, codegen=self.codegen)
+        assert CBinaryOp("Sar", a, rhs, codegen=self.codegen).c_repr() == "(int)(a) >> (b << c)"
 
     def test_decompile_signed_call_logical_shift(self):
         for directory, type_class, width in (
@@ -585,6 +613,80 @@ class TestSimpleCastQualification(unittest.TestCase):
         sizeless = sizeless.with_arch(arch)
         assert not qualifies_for_simple_cast(sizeless, longlong)
         assert not qualifies_for_simple_cast(longlong, sizeless)
+
+
+class _AssignmentCollector(CStructuredCodeWalker):
+    def __init__(self):
+        self.assignments: list[CAssignment] = []
+
+    def handle_CAssignment(self, obj):
+        self.assignments.append(obj)
+        return super().handle_CAssignment(obj)
+
+
+class TestPointerAssignmentCasts(unittest.TestCase):
+    """An assignment keeps a cast C needs: between a pointer and an integer, or between pointers to different types."""
+
+    @staticmethod
+    def _decompile(bin_name: str, func_addr: int):
+        proj = angr.Project(os.path.join(test_location, "x86_64", "decompiler", bin_name), auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True, data_references=True, show_progressbar=not WORKER)
+        proj.analyses.CompleteCallingConventions(recover_variables=True, cfg=cfg.model)
+        dec = proj.analyses[angr.analyses.Decompiler].prep(fail_fast=True)(cfg.functions[func_addr], cfg=cfg.model)
+        assert isinstance(dec.codegen, CStructuredCodeGenerator) and dec.codegen.text is not None
+        print_decompilation_result(dec)
+        collector = _AssignmentCollector()
+        collector.handle(dec.codegen.cfunc)
+        return dec.codegen.text, collector.assignments
+
+    def test_assignments_between_pointers_and_integers_keep_their_casts(self):
+        # add_fs_type in df.o is `fsp = xmalloc(sizeof *fsp); ...; fs_select_list = fsp;`. xmalloc's result and the
+        # global are recovered as integers and fsp as a pointer, so C needs a cast in both assignments.
+        text, assignments = self._decompile("df.o", 0x4002E0)
+        scalar = (SimTypeChar, SimTypeInt, SimTypeNum, SimTypePointer)
+        conversions = [
+            a
+            for a in assignments
+            if isinstance(a.lhs.type, scalar)
+            and isinstance(a.rhs.type, scalar)
+            and isinstance(a.lhs.type, SimTypePointer) != isinstance(a.rhs.type, SimTypePointer)
+        ]
+        assert not conversions, [a.c_repr() for a in conversions]
+        casts = [
+            a.rhs
+            for a in assignments
+            if isinstance(a.rhs, CTypeCast)
+            and isinstance(a.rhs.src_type, SimTypePointer) != isinstance(a.rhs.dst_type, SimTypePointer)
+        ]
+        assert {isinstance(c.dst_type, SimTypePointer) for c in casts} == {True, False}, text
+
+    def test_assignments_between_different_pointer_types_keep_their_casts(self):
+        # vec_push in known_patterns_stl5 calls std::vector<int>::push_back. The vector's pointer fields are recovered as
+        # pointers to a struct and the local holding _M_finish as an unsigned int *, so reading the field into the local
+        # and storing the local back each need a cast.
+        def pointee(ty):
+            return unpack_typeref(ty.pts_to)
+
+        text, assignments = self._decompile("known_patterns_stl5", 0x401570)
+        pointer_pairs = [
+            a for a in assignments if isinstance(a.lhs.type, SimTypePointer) and isinstance(a.rhs.type, SimTypePointer)
+        ]
+        incompatible = [
+            a
+            for a in pointer_pairs
+            if pointee(a.lhs.type) != pointee(a.rhs.type)
+            and not isinstance(pointee(a.lhs.type), SimTypeBottom)
+            and not isinstance(pointee(a.rhs.type), SimTypeBottom)
+        ]
+        assert not incompatible, [a.c_repr() for a in incompatible]
+        casts = [
+            a.rhs
+            for a in pointer_pairs
+            if isinstance(a.rhs, CTypeCast)
+            and isinstance(a.rhs.src_type, SimTypePointer)
+            and pointee(a.rhs.src_type) != pointee(a.rhs.dst_type)
+        ]
+        assert len(casts) >= 2, text
 
 
 class TestCommonType(unittest.TestCase):
