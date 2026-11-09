@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "85f95c55590025a330dd37d00fd56b645c44218d",
-      "committed_at": "2026-11-08T00:26:48-07:00",
-      "subject": "Phoenix: Fix dropping nested loop exits to region heads. (#7756)",
+      "commit": "e7c5e45a170f8e7e216bf8294a079ff85176cfe0",
+      "committed_at": "2026-11-09T03:20:35-07:00",
+      "subject": "Decompiler: Resilience against SimTypes that are larger than the arg variables. (#7762)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,13 +123,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-08T07:37:20+00:00",
+  "imported_at": "2026-11-09T14:36:44+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "ba4abdb589d260c621690b0a6c0c4564268ce456",
-      "committed_at": "2026-11-08T05:43:09Z",
-      "subject": "decompiler: add binary_struct_propagation test binaries",
+      "commit": "a60c6265c0631b0cc6e0c60794d5835bfa241897",
+      "committed_at": "2026-11-09T09:09:11Z",
+      "subject": "Add struct_ref_first_member test binary.",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
