@@ -135,6 +135,7 @@ from .base import (
     VariableFieldNode,
     VariableNode,
     register_display_name,
+    tie_break_type_name,
 )
 from .c import _float32_repr
 from .utils import first_stmt_addr
@@ -872,13 +873,17 @@ class GoFunction(GoConstruct, FunctionNode):  # pylint:disable=abstract-method
             # sort by the following:
             #   * if it's a a non-basic type
             #   * the number of occurrences
-            #   * the repr of the type itself
+            #   * the type's name (tie_break_type_name)
             # TODO: The type selection should actually happen during variable unification
             vartypes = [x[1] for x in cvar_and_vartypes]
             count = Counter(vartypes)
             vartypes = sorted(
                 count.copy(),
-                key=lambda x, ct=count: (isinstance(x, (SimTypeChar, SimTypeInt, SimTypeFloat)), ct[x], repr(x)),
+                key=lambda x, ct=count: (
+                    isinstance(x, (SimTypeChar, SimTypeInt, SimTypeFloat)),
+                    ct[x],
+                    tie_break_type_name(x),
+                ),
             )
 
             vla_dim = self.codegen._array_length_cexprs.get(variable)
@@ -1282,6 +1287,8 @@ _GO_CMP_SWAP = {
     "CmpLEs": "CmpGEs",
     "CmpGEs": "CmpLEs",
 }
+
+_GO_ORDERED_CMPS = frozenset(_GO_CMP_SWAP) - {"CmpEQ", "CmpNE"}
 
 
 def _go_block_chunks(body, indent_str: str, indent: int, codegen):
@@ -5766,8 +5773,14 @@ class GoStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializa
         if expr.op == "Round" and (round_op := _go_round_unop(expr.operands[0])) is not None:
             return self._math_call(round_op, expr.operands[1], expr.tags)
 
-        lhs = self._handle(expr.operands[0])
-        rhs = self._handle(expr.operands[1], likely_signed=expr.op not in {"And", "Or"})
+        # Go orders only integers, floats and strings, and no integer or float is wider than 64 bits, so a wider
+        # ordered comparison compares strings. The prototype the cmpstring fold sets is no help here: an if condition
+        # reaches this point as a new node without it
+        operand_type = None
+        if expr.op in _GO_ORDERED_CMPS and not expr.floating_point and expr.operands[0].bits > 64:
+            operand_type = GoSimTypeString().with_arch(self.project.arch)
+        lhs = self._handle(expr.operands[0], type_=operand_type)
+        rhs = self._handle(expr.operands[1], likely_signed=expr.op not in {"And", "Or"}, type_=operand_type)
         if isinstance(rhs, GoConstant) and expr.op in {"Shl", "Shr", "Sar", "Rol", "Ror"}:
             # a shift count is a number, never a rune
             rhs.fmt_char = False
@@ -8015,6 +8028,7 @@ class ITEHoisting:
         self._codegen = codegen
         self._cfunc = cfunc
         self._taken = {v.name for v in cfunc.unified_local_vars if v.name} | {n for n, _ in cfunc.extra_decls}
+        self._taken |= {arg.name for arg in cfunc.arg_list if arg.name}
         self._counter = 0
 
     def _fresh(self, ty) -> GoFakeVariable:

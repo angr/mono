@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING
 import archinfo
 import pyvex
 from archinfo.types import RegisterOffset
+from cle.address_translator import AT
+from cle.backends.gopclntab import GO_FUNC_FLAG_ASM
 
 from angr.analyses.analysis import AnalysesHub, Analysis
 from angr.block import Block
@@ -30,6 +32,8 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
+    from cle.backends.gopclntab import GoFunction
+
     from angr.codenode import CodeNode
 
 # if you're going to change these to an enum, please do some benchmarking
@@ -197,12 +201,16 @@ class SimEngineFactCollectorVEX(
         track_arg_uses: bool,
         seen_reg_uses: defaultdict[int, int],
         seen_reg_pushes: defaultdict[int, int],
+        entry_restores: set[tuple[int, int]] | None = None,
     ):
         self.bp_as_gpr = bp_as_gpr
         self.track_arg_uses = track_arg_uses
         self.seen_reg_uses = seen_reg_uses
         #: stores of a register's entry value to the stack (push reg): spills or stack-padding pushes
         self.seen_reg_pushes = seen_reg_pushes
+        #: (instruction address, register offset) of each write that puts a register's own entry value back into it,
+        #: as in a reload from the slot it was spilled to (pop after push); recorded only when a set is given
+        self.entry_restores = entry_restores
         super().__init__(project)
         cc_cls = default_cc_for_project(project)
         self._fp_arg_reg_offsets: frozenset[int] = frozenset(
@@ -266,6 +274,8 @@ class SimEngineFactCollectorVEX(
         if isinstance(stmt.data, pyvex.IRExpr.RdTmp):
             t = self.state.tmps.get(stmt.data.tmp, None)
             if t is not None and t[0] == KIND_REG and t[1] == stmt.offset:
+                if t[2] == 0 and self.entry_restores is not None:
+                    self.entry_restores.add((self.ins_addr, stmt.offset))
                 same_ins_read = False
                 for i in range(self.stmt_idx, -1, -1):
                     if i >= self.block.vex.stmts_used:
@@ -527,11 +537,46 @@ class FactCollector(Analysis):
         self._tailcall_pops: set[int] = set()
         self._seen_reg_uses: defaultdict[int, int] = defaultdict(int)
         self._seen_reg_pushes: defaultdict[int, int] = defaultdict(int)
+        self._go_assembly = self._is_go_assembly(func)
+        self._entry_restores: set[tuple[int, int]] | None = set() if self._go_assembly else None
 
         self._analyze()
 
     def _callee_proto(self, func: Function) -> SimTypeFunction | None:
         return func.get_prototype(self._flavor)
+
+    def _has_trusted_prototype(self, func: Function) -> bool:
+        return (
+            func.calling_convention is not None
+            and self._callee_proto(func) is not None
+            and func.get_prototype_source(self._flavor) >= PrototypeSource.SIMPROC
+        )
+
+    def _walkable_target(self, func: Function) -> bool:
+        """
+        Whether to walk the blocks of ``func``, the target of a tail jump whose prototype is not trusted. Do not walk it
+        when it has no calling convention or prototype: it has not been analyzed yet, or no convention fits its reads,
+        as with an exception-handling chunk split off from a larger function. Do not walk it either when its guessed
+        prototype takes every argument register of that convention: code that reads every argument register, such as a
+        va_start save area or Go's gcWriteBarrier saving registers around a call, does not show which registers the
+        jumping function passes on.
+        """
+        cc = func.calling_convention
+        proto = self._callee_proto(func)
+        if cc is None or proto is None:
+            return False
+        if not cc.ARG_REGS:
+            return True
+        try:
+            locs = cc.arg_locs(self._callee_proto_deref(func))
+        except (TypeError, ValueError):
+            return False
+        used = set()
+        for loc in locs:
+            for part in loc.get_footprint():
+                if isinstance(part, SimRegArg):
+                    used.add(part.reg_name)
+        return not set(cc.ARG_REGS) <= used
 
     def _callee_proto_deref(self, func: Function) -> SimTypeFunction | None:
         proto = func.get_prototype(self._flavor)
@@ -559,7 +604,12 @@ class FactCollector(Analysis):
 
         bp_as_gpr = self.function.info.get("bp_as_gpr", False)
         engine = SimEngineFactCollectorVEX(
-            self.project, bp_as_gpr, self._track_arg_uses, self._seen_reg_uses, self._seen_reg_pushes
+            self.project,
+            bp_as_gpr,
+            self._track_arg_uses,
+            self._seen_reg_uses,
+            self._seen_reg_pushes,
+            self._entry_restores,
         )
         init_state = FactCollectorState()
         if self.project.arch.call_pushes_ret:
@@ -567,7 +617,7 @@ class FactCollector(Analysis):
         init_state.bp_value = init_state.sp_value
 
         traversed = set()
-        # the last element marks a tail call
+        # the bool marks a tail call; the last element is the function whose graph holds the node
         queue: list[
             tuple[
                 int,
@@ -575,11 +625,12 @@ class FactCollector(Analysis):
                 CodeNode | BlockNode | HookNode | FuncNode,
                 CodeNode | BlockNode | HookNode | FuncNode | None,
                 bool,
+                Function,
             ]
-        ] = [(0, init_state, startpoint, None, False)]
+        ] = [(0, init_state, startpoint, None, False, self.function)]
         end_states: list[FactCollectorState] = []
         while queue:
-            depth, state, node, retnode, is_tailcall = queue.pop(0)
+            depth, state, node, retnode, is_tailcall, graph_func = queue.pop(0)
             if isinstance(node, BlockNode) and node in traversed:
                 continue
             traversed.add(node)
@@ -599,21 +650,37 @@ class FactCollector(Analysis):
                     continue
             if is_tailcall and self.kb.functions.contains_addr(node.addr):
                 tail_func = self.kb.functions.get_by_addr(node.addr)
-                self._tailcall_pops |= self._tailcall_callee_pops(state, tail_func)
-                if (
-                    func is None
-                    and tail_func.calling_convention is not None
-                    and self._callee_proto(tail_func) is not None
-                    and tail_func.get_prototype_source(self._flavor) >= PrototypeSource.SIMPROC
-                ):
-                    # a tail jump targets a BlockNode. Treat it as a call if the target's prototype is trustworthy.
-                    # otherwise, analyzing the target's first block is safer than using the inferred arguments.
+                if graph_func is self.function:
+                    self._tailcall_pops |= self._tailcall_callee_pops(state, tail_func)
+                if func is None and (self._has_trusted_prototype(tail_func) or graph_func is not self.function):
+                    # a tail jump targets a BlockNode. Treat it as a call if the target's prototype is trustworthy, or
+                    # if it leaves a target we are walking: reading on into its target compounds the guesses.
                     func = tail_func
+                elif (
+                    func is None
+                    and tail_func is not self.function
+                    and tail_func.startpoint is not None
+                    and self._walkable_target(tail_func)
+                ):
+                    # otherwise, analyzing the target's code is safer than using its inferred arguments. Walk the
+                    # target's own graph: in ours, the target's entry block has no successors.
+                    graph_func = tail_func
+                    node = tail_func.startpoint
+                    traversed.add(node)
+                    # the target sees which registers we wrote, not the values we wrote to them, which would otherwise
+                    # feed its frame-pointer and register-save bookkeeping
+                    state = state.copy()
+                    for offset in state.simple_regs:
+                        if offset in state.reg_writes:
+                            state.simple_regs[offset] = None
             if func is not None:
-                if func.calling_convention is not None and self._callee_proto(func) is not None:
+                # inside a tail-jump target, a guessed callee prototype is part of what made the target's own guessed
+                # prototype, which we just declined to use
+                consume = graph_func is self.function or self._has_trusted_prototype(func)
+                if consume and func.calling_convention is not None and self._callee_proto(func) is not None:
                     # consume args and overwrite the return register
                     self._handle_function(state, func)
-                elif self._track_arg_passthru and state.sp_value is not None:
+                elif consume and self._track_arg_passthru and state.sp_value is not None:
                     # no usable prototype: still record which of our own args were pushed to the outgoing call
                     # stack so that the i386 FP arg heuristics can detect individually-passed args
                     pushed_args = []
@@ -624,8 +691,10 @@ class FactCollector(Analysis):
                                 pushed_args.append(val)
                     if pushed_args:
                         self.pushed_arg_callsites[state.ins_addr] = (func, pushed_args)
-                if (func.calling_convention is None or self._callee_proto(func) is None) and not func.is_syscall:
-                    # the callee's prototype is unknown, so use the default cc
+                if (
+                    not consume or func.calling_convention is None or self._callee_proto(func) is None
+                ) and not func.is_syscall:
+                    # the callee's prototype is unknown or unused, so use the default cc
                     default_cc_cls = default_cc_for_project(self.project)
                     if default_cc_cls is not None:
                         self._clobber_caller_saved_regs(state, default_cc_cls(self.project.arch))
@@ -640,10 +709,12 @@ class FactCollector(Analysis):
                     if self.project.arch.ret_offset is not None:
                         # the callee clobbers the return register whether or not its prototype is known
                         new_state.simple_regs[self.project.arch.ret_offset] = None
-                    queue.append((depth, new_state, retnode, None, False))
+                    queue.append((depth, new_state, retnode, None, False, graph_func))
                 continue
 
             block = self.project.factory.block(node.addr, size=node.size)
+            # a tail-jump target may use bp differently from us
+            engine.bp_as_gpr = graph_func.info.get("bp_as_gpr", False)
             engine.process(state, block=block)
             if block.vex.jumpkind == "Ijk_Ret" and self.project.arch.ret_offset is not None:
                 self._ret_values.append(state.simple_regs.get(self.project.arch.ret_offset))
@@ -651,7 +722,7 @@ class FactCollector(Analysis):
             successor_added = False
             call_succ, ret_succ = None, None
             call_is_tail = False
-            for succ, data in self.function.transition_out_edges(node):
+            for succ, data in graph_func.transition_out_edges(node):
                 edge_type = data.get("type")
                 outside = data.get("outside", False)
                 if depth + 1 <= self._max_depth:
@@ -661,7 +732,7 @@ class FactCollector(Analysis):
                     elif edge_type == "transition" and not outside:
                         if succ not in traversed:
                             successor_added = True
-                            queue.append((depth + 1, state.copy(), succ, None, False))
+                            queue.append((depth + 1, state.copy(), succ, None, False, graph_func))
                     elif edge_type in {"call", "syscall"} or (edge_type == "transition" and outside):
                         # a call or a tail-call
                         # note that it's ok to traverse a called function multiple times
@@ -672,7 +743,7 @@ class FactCollector(Analysis):
                         call_is_tail = edge_type == "transition"
             if call_succ is not None:
                 successor_added = True
-                queue.append((depth + 1, state.copy(), call_succ, ret_succ, call_is_tail))
+                queue.append((depth + 1, state.copy(), call_succ, ret_succ, call_is_tail, graph_func))
 
             if not successor_added:
                 end_states.append(state)
@@ -978,6 +1049,22 @@ class FactCollector(Analysis):
                 return True
         return False
 
+    def _is_go_assembly(self, func: Function) -> bool:
+        """
+        Whether ``func`` is Go assembly analysed with the register convention: the pclntab marks it as assembly, and the
+        linker has not marked it ABI0 (``.abi0``), whose results CallingConventionAnalysis places on the stack from
+        the size this analysis finds.
+        """
+        record = self._go_function_record(func)
+        return record is not None and bool(record.flag & GO_FUNC_FLAG_ASM) and not (func.name or "").endswith(".abi0")
+
+    def _go_function_record(self, func: Function) -> GoFunction | None:
+        """The main object's Go pclntab record of the function containing ``func.addr``, if any."""
+        obj = self.project.loader.main_object
+        if obj.gopclntab is None or not obj.contains_addr(func.addr):
+            return None
+        return obj.gopclntab.function_at(AT.from_mva(func.addr, obj).to_lva())
+
     def _analyze_endpoints_for_retval_size(self, end_states):
         """
         Analyze all endpoints to determine the return value size.
@@ -1005,6 +1092,14 @@ class FactCollector(Analysis):
         overflow_retreg_offset: int | None = None
         if (self.project.is_rust_binary or self.project.is_go_binary) and isinstance(cc.OVERFLOW_RETURN_VAL, SimRegArg):
             overflow_retreg_offset = cc.OVERFLOW_RETURN_VAL.check_offset(self.project.arch)
+
+        # Go assembly does not reliably follow the register result convention: most of it returns on the stack (ABI0),
+        # and helpers such as gcWriteBarrier put back the registers they save. A result register that still holds its
+        # entry value at the return, restored from a spill or never written, is no result there. In compiled Go it can
+        # be one: `func f(x int) int { g(); return x }` reloads x into rax
+        go_assembly = self._go_assembly
+        # whether a path calls or jumps into code the pclntab does not list, such as a C function
+        reaches_non_go = False
 
         retval_sizes = []
         propagated_retval_sizes = []
@@ -1034,6 +1129,8 @@ class FactCollector(Analysis):
                     else:
                         continue
                 if func is not None:
+                    if go_assembly and self._go_function_record(func) is None:
+                        reaches_non_go = True
                     func_proto = self._callee_proto(func)
                     if (
                         func.calling_convention is not None
@@ -1071,6 +1168,8 @@ class FactCollector(Analysis):
                     if isinstance(succ, (BlockNode, HookNode, FuncNode)) and self.kb.functions.contains_addr(succ.addr):
                         # attempt to convert it into a function
                         func_succ = self.kb.functions.get_by_addr(succ.addr)
+                    if go_assembly and func_succ is not None and self._go_function_record(func_succ) is None:
+                        reaches_non_go = True
                     if func_succ is not None and func_succ.name != "_security_check_cookie":
                         succ_proto = self._callee_proto(func_succ)
                         if (
@@ -1112,9 +1211,15 @@ class FactCollector(Analysis):
 
                 # collect tmps so we can trace back through RdTmp
                 tmp_definitions = {}
+                stmt_ins_addrs: list[int | None] = []
+                ins_addr = None
                 for stmt in block.vex.statements:
                     if isinstance(stmt, pyvex.IRStmt.WrTmp):
                         tmp_definitions[stmt.tmp] = stmt.data
+                    elif isinstance(stmt, pyvex.IRStmt.IMark):
+                        ins_addr = stmt.addr + stmt.delta
+                    if go_assembly:
+                        stmt_ins_addrs.append(ins_addr)
 
                 # scan the block statements backwards to find writes to the return value register
                 # block_retval_size stores the size of the first write (in the block) to the return register; this is
@@ -1123,8 +1228,17 @@ class FactCollector(Analysis):
                 block_retval_size = None
                 retval_stmt_idx = None
                 stack_canary_barrier = False
+                keeps_entry_value = False
                 for stmt_idx, stmt in reversed(list(enumerate(block.vex.statements))):
                     if isinstance(stmt, pyvex.IRStmt.Put):
+                        if (
+                            self._entry_restores is not None
+                            and (stmt_ins_addrs[stmt_idx], stmt.offset) in self._entry_restores
+                        ):
+                            if stmt.offset == retreg_offset and block_retval_size is None:
+                                keeps_entry_value = True
+                                break
+                            continue
                         assert block.vex.tyenv is not None
                         size = stmt.data.result_size(block.vex.tyenv) // self.project.arch.byte_width
 
@@ -1156,6 +1270,8 @@ class FactCollector(Analysis):
                         if stmt.offset == overflow_retreg_offset:
                             overflow_retval_sizes.append(max(size, 1))
 
+                if keeps_entry_value:
+                    continue
                 if block_retval_size is not None:
                     retval_sizes.append(block_retval_size)
                     assert retval_stmt_idx is not None
@@ -1186,8 +1302,10 @@ class FactCollector(Analysis):
                         if edge_type in {"transition", "fake_return"}:
                             queue.append((depth + 1, pred))
 
-        # ARM/AArch64: R0/X0 used for both arg0 and return
-        if not retval_sizes:
+        # ARM/AArch64: R0/X0 used for both arg0 and return, as is rax in Go's ABIInternal on amd64. Not in Go assembly,
+        # unless a path hands control to code outside Go (the libc trampolines on darwin jump to libc), whose result is
+        # then in the register
+        if not retval_sizes and not (go_assembly and not reaches_non_go):
             first_arg_offset = None
             if cc.ARG_REGS:
                 arg0_name = cc.ARG_REGS[0]

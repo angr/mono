@@ -763,7 +763,7 @@ class SimTypeChar(SimTypeReg):
         self.signed = signed
 
     def __repr__(self) -> str:
-        return "char"
+        return "char" if self.signed else "unsigned char"
 
     def store(self, state, addr, value: StoreType):
         # FIXME: This is a hack.
@@ -1593,6 +1593,13 @@ class SimTypeLength(SimTypeLong):
 
     def __repr__(self):
         return "size_t"
+
+    def to_json(self, fields: Iterable[str] | None = None, memo: dict[str, SimTypeRef] | None = None) -> dict[str, Any]:
+        d = super().to_json(fields=fields, memo=memo)
+        # SimTypeInt.to_json omits signed=True, which is SimTypeInt's default, but this class defaults to unsigned
+        if self.signed and (fields is None or "signed" in fields):
+            d["signed"] = True
+        return d
 
     @property
     def size(self):

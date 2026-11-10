@@ -29,6 +29,7 @@ from angr.calling_conventions import (
     go_cc_class,
 )
 from angr.enums import Flavors
+from angr.go.utils.version import _buildinfo_version
 from angr.sim_type import (
     SimStruct,
     SimTypeBottom,
@@ -44,6 +45,7 @@ from tests.common import bin_location, load_project_with_scoped_cfg
 
 test_location = os.path.join(bin_location, "tests")
 GO_BINARY = os.path.join(test_location, "x86_64", "langdetect_go")
+GO_DARWIN_BINARY = os.path.join(test_location, "x86_64", "terramate.macho")
 
 ARCH = archinfo.ArchAMD64()
 
@@ -265,6 +267,42 @@ class TestGoCallingConventionRecovery(unittest.TestCase):
         }
         assert "r14" not in reg_names
 
+    def test_write_barrier_returns_nothing(self):
+        # runtime.gcWriteBarrier2 jumps to the assembly helper gcWriteBarrier, which hands back a buffer slot in r11 and
+        # reloads every register it spilled around its call to runtime.wbBufFlush. os.init.0 calls
+        # runtime.gcWriteBarrier2
+        proj, _ = load_project_with_scoped_cfg(GO_BINARY, 0x47A600, extra_func_addrs=[0x462380])
+        funcs = proj.kb.functions
+        for addr, name in (
+            (0x45FC20, "gcWriteBarrier"),
+            (0x462380, "runtime.gcWriteBarrier2"),
+            (0x47A600, "os.init.0"),
+        ):
+            assert funcs[addr].name == name
+            proto = funcs[addr].prototype
+            assert proto is not None
+            assert isinstance(proto.returnty, SimTypeBottom), proto
+
+    def test_libc_trampoline_returns_what_libc_returns(self):
+        # syscall.libc_close_trampoline is assembly that jumps to libc's close through the import stub at 0x10bc160, so
+        # rax holds close's result when it returns
+        proj, _ = load_project_with_scoped_cfg(GO_DARWIN_BINARY, 0x109A200, extra_func_addrs=[0x10BC160])
+        func = proj.kb.functions[0x109A200]
+        assert func.name == "syscall.libc_close_trampoline"
+        assert func.prototype is not None and func.prototype.returnty is not None
+        assert func.prototype.returnty.size == 64, func.prototype
+
+    def test_abi0_assembly_keeps_its_stack_result(self):
+        # internal/cpu.getGOAMD64level.abi0 is the assembly body of `func getGOAMD64level() int32`, which stores its
+        # result at 8(SP) and leaves rax alone
+        proj, _ = load_project_with_scoped_cfg(GO_BINARY, 0x4028E0)
+        func = proj.kb.functions[0x4028E0]
+        assert func.name == "internal/cpu.getGOAMD64level.abi0"
+        assert isinstance(func.calling_convention, SimCCGoAMD64ABI0)
+        proto = func.prototype
+        assert proto is not None and proto.returnty is not None
+        assert not isinstance(proto.returnty, SimTypeBottom), proto
+
     def test_abi0_function_uses_the_stack_convention(self):
         # internal/cpu.cpuid.abi0 reads its arguments from 8(rsp) and 12(rsp)
         start, end = 0x4028A0, 0x4028BB
@@ -401,6 +439,9 @@ class TestGoCallingConventionByVersion(unittest.TestCase):
             (("x86_64", "go", "go1.15.15", "basics"), (1, 15), SimCCGoAMD64ABI0),
             (("x86_64", "go", "go1.16.15", "basics"), (1, 16), SimCCGoAMD64ABI0),
             (("x86_64", "go", "go1.22.5", "basics"), (1, 22), SimCCGoAMD64),
+            # stripped go1.27.0 builds whose read-only data names go1.9 first; only the build-info blob is right
+            (("x86_64", "go", "corpus", "u-root-v0.16.0-darwin-amd64"), (1, 27), SimCCGoAMD64),
+            (("x86_64", "go", "corpus", "u-root-v0.16.0-windows-amd64.exe"), (1, 27), SimCCGoAMD64),
             (("aarch64", "langdetect_go_go1.17.13"), (1, 17), SimCCGoAArch64ABI0),
             (("aarch64", "windows", "langdetect_go_go1.17.13.exe"), (1, 17), SimCCGoAArch64ABI0),
             (("aarch64", "langdetect_go_go1.18.10"), (1, 18), SimCCGoAArch64),
@@ -414,6 +455,16 @@ class TestGoCallingConventionByVersion(unittest.TestCase):
                 assert proj.go_version_range == (version, version)
                 assert default_cc_for_project(proj) is cc
                 assert type(proj.factory.cc()) is cc
+
+    def test_release_from_buildinfo_blob(self):
+        # go1.13-go1.17 blobs point at the version string; go1.10 has no blob
+        for path, version in (
+            (("x86_64", "go", "go1.16.15", "basics_stripped"), "go1.16.15"),
+            (("x86_64", "go", "go1.10.8", "basics_stripped"), None),
+        ):
+            with self.subTest(binary=os.path.join(*path)):
+                proj = angr.Project(os.path.join(test_location, *path), auto_load_libs=False)
+                assert _buildinfo_version(proj) == version
 
     def test_printfloat_takes_one_float_from_the_stack_on_arm64_go117(self):
         path = os.path.join(test_location, "aarch64", "langdetect_go_go1.17.13")
