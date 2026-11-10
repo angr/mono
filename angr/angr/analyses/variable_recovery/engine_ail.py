@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, TypeGuard, cast
 from angr import ailment, claripy
 from angr.ailment.constant import UNDETERMINED_SIZE
 from angr.ailment.expression import Array, FunctionLikeMacro, Let, RustEnum, StringLiteral, Struct
-from angr.ailment.utils import is_lsb_overwrite
+from angr.ailment.utils import is_lsb_extract, is_lsb_overwrite
 from angr.analyses.typehoon import typeconsts, typevars
 from angr.analyses.typehoon.translator import TypeTranslator
 from angr.engines.light.engine import SimEngineNostmtAIL
@@ -477,9 +477,19 @@ class SimEngineVRAIL(
                         self.state.typevars.add_type_variable(stack_var, stack_typevar)
                         existing_variables.add(stack_var)
                     for stack_var in existing_variables:
-                        if self.state.typevars.has_type_variable_for(stack_var):
-                            tv = self.state.typevars.get_type_variable(stack_var)
+                        if not self.state.typevars.has_type_variable_for(stack_var):
+                            continue
+                        tv = self.state.typevars.get_type_variable(stack_var)
+                        if 0 < arg_ty_basesize <= stack_var.size:
                             self.state.add_type_constraint(typevars.Subtype(tv, arg_ty.basetype))
+                            continue
+                        # stack_var is smaller than arg_ty, but we do not want to change the size of stack_var at this
+                        # point (this is a bit too late in the variable recovery process and requires a second pass if
+                        # we change the size of stack_var). Instead, we create a second type variable for the whole
+                        # stack object.
+                        obj_tv = self.tv_manager.new_tv()
+                        self.state.typevars.add_type_variable(stack_var, obj_tv, latest=False)
+                        self.state.add_type_constraint(typevars.Subtype(obj_tv, arg_ty.basetype))
                 if (
                     isinstance(arg_ty, typeconsts.Pointer)
                     and isinstance(arg_ty.basetype, typeconsts.Struct)
@@ -897,7 +907,10 @@ class SimEngineVRAIL(
         r = self._expr(expr.base)
         self._expr(expr.offset)
         typevar = None
-        if r.typevar is not None:
+        if r.typevar is not None and is_lsb_extract(expr):
+            # only consider the real truncation case. value extractions whose offset is not 0 should not be treated as
+            # truncations, otherwise we would incorrectly merge the type of a struct field with the type of the struct
+            # itself.
             if isinstance(r.typevar, typevars.DerivedTypeVariable) and isinstance(
                 r.typevar.one_label(), typevars.ConvertTo
             ):

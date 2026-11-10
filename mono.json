@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "e7c5e45a170f8e7e216bf8294a079ff85176cfe0",
-      "committed_at": "2026-11-09T03:20:35-07:00",
-      "subject": "Decompiler: Resilience against SimTypes that are larger than the arg variables. (#7762)",
+      "commit": "bbdd957c4e5ee9c3f6262f18350b2a13809bc4ad",
+      "committed_at": "2026-11-10T11:30:22Z",
+      "subject": "Update version to 10.0.7.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "1af4c02877c0ada70b457b4e321da07a912e4b6f",
-      "committed_at": "2026-11-02T12:41:22-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#1759)",
+      "commit": "a56c84dd3e39786662203f8a886ae352fb51c60a",
+      "committed_at": "2026-11-10T11:30:25Z",
+      "subject": "Update version to 10.0.7.dev0 [ci skip]",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -52,9 +52,9 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "bcece51c5b72fa96d46f654572040e5beb7e2ca8",
-      "committed_at": "2026-11-02T11:47:21-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#395)",
+      "commit": "d5c6ad1b1b07beda46727405139dbf87f275b157",
+      "committed_at": "2026-11-10T11:30:27Z",
+      "subject": "Update version to 10.0.7.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -68,9 +68,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "6f1f3ed578f62bcb24c69ea77cbfb0b3bd60fd9c",
-      "committed_at": "2026-11-02T12:42:20-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#881)",
+      "commit": "faf26a1a6c9f06d6a9a8e3a967f0def7c91a5446",
+      "committed_at": "2026-11-10T11:30:31Z",
+      "subject": "Update version to 10.0.7.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -95,17 +95,17 @@
     },
     "pysoot": {
       "upstream": "https://github.com/angr/pysoot",
-      "commit": "fb24830fc18224e6f0cd50481b62014994a63c8c",
-      "committed_at": "2026-11-02T12:41:06-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#66)",
+      "commit": "0117508a1fdcadea95d041b1d8989ac4df93b051",
+      "committed_at": "2026-11-09T11:52:46-07:00",
+      "subject": "Update github actions runner OS versions (#68)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "63554810169ea89044458c27cfd820aa962446f4",
-      "committed_at": "2026-11-02T12:41:49-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#603)",
+      "commit": "f2bb8fe1a7eca297766fd74b7b345d5fc1624bc3",
+      "committed_at": "2026-11-10T11:30:33Z",
+      "subject": "Update version to 10.0.7.dev0 [ci skip]",
       "excluded": [
         ".gitmodules"
       ],
@@ -123,13 +123,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-09T14:36:44+00:00",
+  "imported_at": "2026-11-10T14:35:11+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "a60c6265c0631b0cc6e0c60794d5835bfa241897",
-      "committed_at": "2026-11-09T09:09:11Z",
-      "subject": "Add struct_ref_first_member test binary.",
+      "commit": "972124e25839618eeffa1bb333213a12bf80f840",
+      "committed_at": "2026-11-10T11:30:29Z",
+      "subject": "Update version to 10.0.7.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
