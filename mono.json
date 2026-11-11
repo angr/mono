@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "bbdd957c4e5ee9c3f6262f18350b2a13809bc4ad",
-      "committed_at": "2026-11-10T11:30:22Z",
-      "subject": "Update version to 10.0.7.dev0 [ci skip]",
+      "commit": "db9bb8b924083acdeb0318cbced255c92b694001",
+      "committed_at": "2026-11-11T00:01:05-07:00",
+      "subject": "AngrDB: Serialize more plugins. Close #7777. (#7778)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,7 +123,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-10T14:35:11+00:00",
+  "imported_at": "2026-11-11T14:36:56+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
