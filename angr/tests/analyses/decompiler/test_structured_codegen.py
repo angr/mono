@@ -10,6 +10,7 @@ import re
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import archinfo
 
@@ -23,13 +24,17 @@ from angr.analyses.decompiler.structured_codegen.c import (
     CExpression,
     CGoto,
     CReturn,
+    CStatements,
     CStructField,
     CStructuredCodeGenerator,
+    CStructuredCodeWalker,
     CTypeCast,
     CUnaryOp,
     CVariable,
     CVariableField,
+    MakeTypecastsImplicit,
     c_return_type,
+    int_operand_signedness,
     qualifies_for_simple_cast,
     type_layout_key,
     type_to_c_repr_chunks,
@@ -53,7 +58,7 @@ from angr.sim_type import (
     TypeRef,
     parse_cpp_file,
 )
-from angr.sim_variable import SimRegisterVariable
+from angr.sim_variable import SimRegisterVariable, SimStackVariable, SimVariable
 from tests.common import WORKER, bin_location, load_project_with_scoped_cfg, print_decompilation_result
 
 test_location = os.path.join(bin_location, "tests")
@@ -76,11 +81,15 @@ class _RenderedExpression(CExpression):
 class TestConvertRendering(unittest.TestCase):
     """How CStructuredCodeGenerator renders Convert expressions of assorted widths."""
 
+    codegen: CStructuredCodeGenerator
+
     @classmethod
     def setUpClass(cls):
         proj = angr.Project(os.path.join(test_location, "x86_64", "fauxware"), auto_load_libs=False)
         cfg = proj.analyses.CFGFast(normalize=True)
-        cls.codegen = proj.analyses.Decompiler(cfg.functions["main"], cfg=cfg).codegen
+        codegen = proj.analyses.Decompiler(cfg.functions["main"], cfg=cfg).codegen
+        assert isinstance(codegen, CStructuredCodeGenerator)
+        cls.codegen = codegen
 
     def _render(self, from_bits: int, to_bits: int, value: int = 0x1234) -> str:
         conv = Expr.Convert(0, from_bits, to_bits, False, Expr.Const(0, value, from_bits))
@@ -94,15 +103,150 @@ class TestConvertRendering(unittest.TestCase):
         assert self._render(32, 1) == "4660 & 1"
 
     def test_truncation_to_representable_width_is_a_cast(self):
-        assert self._render(32, 8) == "(char)4660"
+        assert self._render(32, 8) == "(unsigned char)4660"
         assert self._render(32, 16) == "(unsigned short)4660"
 
     def test_widening_is_always_a_cast(self):
         # Rounding up only loses information when truncating, so widening keeps casting even to a
         # width no C type has.
-        assert self._render(1, 5, value=1) == "(char)1"
+        assert self._render(1, 5, value=1) == "(unsigned char)1"
         assert self._render(8, 12, value=3) == "(unsigned short)3"
         assert self._render(32, 64, value=3) == "(unsigned long long)3"
+
+    def test_widening_sizeless_child_uses_ail_source_width(self):
+        unknown_type = SimTypeBottom().with_arch(self.codegen.project.arch)
+        child = CBinaryOp(
+            "Shr",
+            CConstant(1, unknown_type, codegen=self.codegen),
+            CConstant(2, unknown_type, codegen=self.codegen),
+            codegen=self.codegen,
+        )
+        assert child.type.size is None
+
+        conv = Expr.Convert(0, 1, 64, True, Expr.Const(0, 1, 1))
+        with patch.object(self.codegen, "_handle", return_value=child):
+            rendered = self.codegen._handle_Expr_Convert(conv)
+
+        assert isinstance(rendered, CTypeCast)
+        assert isinstance(rendered.expr, CTypeCast)
+        assert rendered.expr.dst_type.size == conv.from_bits
+        assert getattr(rendered.expr.dst_type, "signed", None) is True
+        assert rendered.c_repr() == "(long long)(int1_t)(1 >> 2)"
+
+    def test_widening_zero_width_child_uses_ail_source_width(self):
+        fieldless_type = SimStruct({}, name="fieldless").with_arch(self.codegen.project.arch)
+        child = CConstant(1, fieldless_type, codegen=self.codegen)
+        assert child.type.size == 0
+
+        conv = Expr.Convert(0, 32, 64, True, Expr.Const(0, 1, 32))
+        with patch.object(self.codegen, "_handle", return_value=child):
+            rendered = self.codegen._handle_Expr_Convert(conv)
+
+        assert isinstance(rendered, CTypeCast)
+        assert isinstance(rendered.expr, CTypeCast)
+        assert rendered.expr.dst_type.size == conv.from_bits
+        assert getattr(rendered.expr.dst_type, "signed", None) is True
+        assert rendered.c_repr() == "(long long)(int)1"
+
+    def test_widening_known_child_keeps_inferred_width(self):
+        known_type = self.codegen.default_simtype_from_bits(16, signed=False)
+        child = CConstant(1, known_type, codegen=self.codegen)
+        conv = Expr.Convert(0, 32, 64, True, Expr.Const(0, 1, 32))
+        with patch.object(self.codegen, "_handle", return_value=child):
+            rendered = self.codegen._handle_Expr_Convert(conv)
+
+        assert isinstance(rendered, CTypeCast)
+        assert isinstance(rendered.expr, CTypeCast)
+        assert rendered.expr.dst_type.size == known_type.size
+        assert getattr(rendered.expr.dst_type, "signed", None) is True
+        assert rendered.c_repr() == "(long long)(short)1"
+
+    def test_narrow_equality_reads_both_operands_with_one_signedness(self):
+        # C promotes a char and an unsigned char by their own signedness, so the same byte of 0x80 or more on both
+        # sides of == would compare unequal
+        codegen = self.codegen
+        assert isinstance(codegen, CStructuredCodeGenerator)
+
+        def narrowed(bits, signed, value):
+            return Expr.Convert(0, 64, bits, signed, Expr.Const(0, value, 64))
+
+        def widened(expr, signed):
+            return Expr.Convert(0, expr.bits, 32, signed, expr)
+
+        for bits in (8, 16):
+            for op in ("CmpEQ", "CmpNE"):
+                lhs, rhs = narrowed(bits, False, 0x1234), narrowed(bits, True, 0x5678)
+                for operands in ([lhs, rhs], [widened(lhs, False), widened(rhs, False)]):
+                    cmp = codegen._handle(Expr.BinaryOp(0, op, operands, False))
+                    assert isinstance(cmp, CBinaryOp)
+                    assert int_operand_signedness(cmp.lhs) is True and int_operand_signedness(cmp.rhs) is True
+
+        same = codegen._handle(Expr.BinaryOp(0, "CmpEQ", [narrowed(8, False, 1), narrowed(8, False, 2)], False))
+        assert same.c_repr() == "(unsigned char)1 == (unsigned char)2"
+        wide = Expr.BinaryOp(0, "CmpEQ", [narrowed(32, False, 1), narrowed(32, True, 2)], False)
+        assert isinstance(cmp := codegen._handle(wide), CBinaryOp) and cmp.signed is None
+        # a zero-extended byte against a sign-extended one is not a compare of the bytes, so it stays a 32-bit compare
+        lhs, rhs = narrowed(8, False, 1), narrowed(8, True, 2)
+        mixed_widening = Expr.BinaryOp(0, "CmpEQ", [widened(lhs, False), widened(rhs, True)], False)
+        assert isinstance(cmp := codegen._handle(mixed_widening), CBinaryOp) and cmp.signed is None
+
+    def test_widening_a_byte_keeps_the_cast_that_sets_its_extension(self):
+        # (int)(char)b sign-extends an unsigned char b and (unsigned int)(unsigned char)b zero-extends a char b. The
+        # inner cast alone converts implicitly, but without it the byte widens with its own signedness
+        codegen = self.codegen
+
+        def widened_byte(byte_signed):
+            byte = CVariable(
+                SimRegisterVariable(0, 1, name="b"), variable_type=SimTypeChar(signed=byte_signed), codegen=codegen
+            )
+            sign_cast = CTypeCast(None, SimTypeChar(signed=not byte_signed), byte, codegen=codegen)
+            return CTypeCast(None, SimTypeInt(signed=not byte_signed), sign_cast, codegen=codegen)
+
+        for byte_signed in (False, True):
+            expected = "(char)b" if not byte_signed else "(unsigned char)b"
+            assert MakeTypecastsImplicit().handle(widened_byte(byte_signed)).c_repr() == expected
+            word = CVariable(
+                SimRegisterVariable(16, 8, name="w"), variable_type=SimTypeLongLong(signed=False), codegen=codegen
+            )
+            assignment = MakeTypecastsImplicit().handle(CAssignment(word, widened_byte(byte_signed), codegen=codegen))
+            assert isinstance(assignment, CAssignment) and assignment.rhs.c_repr() == expected
+
+        # a byte below 0x80 widens the same either way, so both casts stay implicit
+        byte = CVariable(SimRegisterVariable(0, 1, name="b"), variable_type=SimTypeChar(signed=False), codegen=codegen)
+        masked = CBinaryOp("And", byte, CConstant(0x3F, SimTypeChar(signed=False), codegen=codegen), codegen=codegen)
+        sign_cast = CTypeCast(SimTypeChar(signed=False), SimTypeChar(), masked, codegen=codegen)
+        widened = CTypeCast(None, SimTypeInt(), sign_cast, codegen=codegen)
+        assert MakeTypecastsImplicit().handle(widened).c_repr() == "b & 63"
+
+
+class TestTiedDeclaration(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        proj = angr.Project(os.path.join(test_location, "x86_64", "fauxware"), auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+        cls.codegen = proj.analyses.Decompiler(cfg.functions["main"], cfg=cfg).codegen
+
+    def test_byte_signedness_does_not_change_the_declared_candidate(self):
+        # A variable is declared with the first of its equally common candidate types by name. A byte array passed by
+        # address has to win over a uint48_t when its bytes are unsigned, as it does when they print as char
+        codegen = self.codegen
+        assert isinstance(codegen, CStructuredCodeGenerator) and codegen.cfunc is not None
+        cfunc = codegen.cfunc
+        arch = codegen.project.arch
+        variable = SimStackVariable(-0x40, 6, name="v2")
+        array = SimTypeArray(SimTypeChar(signed=False), 6).with_arch(arch)
+        scalar = SimTypeNum(48, signed=False).with_arch(arch)
+        candidates: list[tuple[CVariable, SimType]] = [
+            (CVariable(variable, variable_type=ty, codegen=codegen), ty) for ty in (scalar, array)
+        ]
+        unified: dict[SimVariable, list[tuple[CVariable, SimType]]] = {variable: candidates}
+        saved = cfunc.unified_local_vars
+        try:
+            cfunc.unified_local_vars = unified
+            declarations = "".join(chunk for chunk, _ in cfunc.variable_list_repr_chunks())
+        finally:
+            cfunc.unified_local_vars = saved
+        assert declarations.strip().startswith("unsigned char v2[6];"), declarations
 
 
 class TestGotoRendering(unittest.TestCase):
@@ -278,18 +422,44 @@ class TestRightShiftRendering(unittest.TestCase):
         assert expression.c_repr() == "(unsigned int)(status()) >> (amount & 31)"
 
     def test_same_precedence_rhs_is_parenthesized(self):
-        # a < (b < c) and a << (b << c) are not a < b < c / a << b << c; a + (b + c) needs no parentheses
+        # a < (b < c) differs from a < b < c, and a * (b / c) from a * b / c; integer a + (b + c) needs no parentheses
         value_type = SimTypeInt(signed=False).with_arch(self.codegen.project.arch)
         a, b, c = (_RenderedExpression(n, value_type, codegen=self.codegen) for n in "abc")
-        for op, text in (
-            ("CmpLT", "a < (b < c)"),
-            ("CmpEQ", "a == (b == c)"),
-            ("Shl", "a << (b << c)"),
-            ("Add", "a + b + c"),
+        for op, rhs_op, text in (
+            ("CmpLT", "CmpLT", "a < (b < c)"),
+            ("CmpEQ", "CmpEQ", "a == (b == c)"),
+            ("Shl", "Shl", "a << (b << c)"),
+            ("Mul", "Div", "a * (b / c)"),
+            ("Mul", "Mod", "a * (b % c)"),
+            ("Div", "Mod", "a / (b % c)"),
+            ("Add", "Sub", "a + (b - c)"),
+            ("Add", "CmpLTs", "a + (b < c)"),
+            ("Add", "Add", "a + b + c"),
+            ("Mul", "Mul", "a * b * c"),
         ):
+            with self.subTest(op=op, rhs_op=rhs_op):
+                rhs = CBinaryOp(rhs_op, b, c, codegen=self.codegen)
+                assert CBinaryOp(op, a, rhs, codegen=self.codegen).c_repr() == text
+
+    def test_modulo_has_multiplicative_precedence(self):
+        value_type = SimTypeInt(signed=False).with_arch(self.codegen.project.arch)
+        a, b, c = (_RenderedExpression(n, value_type, codegen=self.codegen) for n in "abc")
+        lhs = CBinaryOp("Mul", a, b, codegen=self.codegen)
+        assert CBinaryOp("Mod", lhs, c, codegen=self.codegen).c_repr() == "a * b % c"
+
+    def test_floating_point_rhs_of_the_same_operator_is_parenthesized(self):
+        value_type = SimTypeDouble().with_arch(self.codegen.project.arch)
+        a, b, c = (_RenderedExpression(n, value_type, codegen=self.codegen) for n in "abc")
+        for op, text in (("Add", "a + (b + c)"), ("Mul", "a * (b * c)")):
             with self.subTest(op=op):
                 rhs = CBinaryOp(op, b, c, codegen=self.codegen)
                 assert CBinaryOp(op, a, rhs, codegen=self.codegen).c_repr() == text
+
+    def test_cast_shift_parenthesizes_same_precedence_count(self):
+        value_type = SimTypeInt(signed=False).with_arch(self.codegen.project.arch)
+        a, b, c = (_RenderedExpression(n, value_type, codegen=self.codegen) for n in "abc")
+        rhs = CBinaryOp("Shl", b, c, codegen=self.codegen)
+        assert CBinaryOp("Sar", a, rhs, codegen=self.codegen).c_repr() == "(int)(a) >> (b << c)"
 
     def test_decompile_signed_call_logical_shift(self):
         for directory, type_class, width in (
@@ -316,6 +486,87 @@ class TestRightShiftRendering(unittest.TestCase):
                 assert text.count(f"signed_status{width}(") == 1
                 assert source.prototype == prototype
                 assert not result.structuring_failures
+
+
+class TestWideningOperand(unittest.TestCase):
+    """A sign extension on an operand of +, - or *, or on the left operand of <<, sets the width C computes it in."""
+
+    @classmethod
+    def setUpClass(cls):
+        project = angr.Project(os.path.join(test_location, "x86_64", "decompiler", "ffs"), auto_load_libs=False)
+        cfg = project.analyses.CFGFast(normalize=True, data_references=True)
+        project.analyses.CompleteCallingConventions(cfg=cfg.model, recover_variables=True)
+        result = project.analyses[angr.analyses.Decompiler].prep(fail_fast=True)(
+            cfg.kb.functions["sub_404060"], cfg=cfg.model
+        )
+        codegen = result.codegen
+        assert isinstance(codegen, CStructuredCodeGenerator)
+        assert codegen.text is not None and codegen.cfunc is not None
+        cls.codegen = codegen
+        cls.text = codegen.text
+        variables: dict[str, CVariable] = {}
+
+        class _Variables(CStructuredCodeWalker):
+            def handle_CVariable(self, obj):
+                variables.setdefault(obj.c_repr(), obj)
+                return obj
+
+        _Variables().handle(codegen.cfunc)
+        cls.i, cls.n1 = variables["i"], variables["n1"]  # an int and an unsigned long long
+        arch = project.arch
+        cls.ll = SimTypeLongLong(signed=True).with_arch(arch)
+        cls.ull = SimTypeLongLong(signed=False).with_arch(arch)
+        cls.int = SimTypeInt(signed=True).with_arch(arch)
+        cls.char = SimTypeChar(signed=True).with_arch(arch)
+
+    def _cast(self, ty, expr):
+        return CTypeCast(None, ty, expr, codegen=self.codegen)
+
+    def _op(self, op, lhs, rhs):
+        return CBinaryOp(op, lhs, rhs, codegen=self.codegen)
+
+    def _const(self, value):
+        return CConstant(value, self.ull, codegen=self.codegen)
+
+    def _assign(self, lhs, rhs) -> str:
+        statements = CStatements([CAssignment(lhs, rhs, codegen=self.codegen)], codegen=self.codegen)
+        return MakeTypecastsImplicit().handle(statements).statements[0].c_repr().strip()
+
+    def test_sign_extended_int_is_scaled_in_64_bits(self):
+        # the __memmove_chk size: movsxd rdx, ebx; shl rdx, 4, with ebx the int i
+        assert "int i;" in self.text
+        assert "(long long)i * 16" in self.text
+
+    def test_operand_of_a_narrower_operation(self):
+        # (char)i * 3 cannot leave an int, so C computes it in int, and adding i needs i's own sign extension
+        mul = self._op("Mul", self._cast(self.ll, self._cast(self.char, self.i)), self._const(3))
+        expr = self._op("Add", mul, self._cast(self.ll, self.i))
+        assert self._assign(self.n1, expr) == "n1 = (char)i * 3 + (long long)i;"
+
+    def test_and_with_a_signed_operand_is_not_bounded(self):
+        masked = self._op("And", self._cast(self.int, self._cast(self.char, self.i)), self.i)
+        expr = self._op("Mul", self._cast(self.ll, masked), self._const(0x100))
+        assert self._assign(self.n1, expr) == "n1 = (long long)((char)i & i) * 0x100;"
+
+    def test_shift_takes_the_type_of_its_left_operand(self):
+        shifted = self._op("Shl", self._cast(self.ll, self.i), self.n1)
+        assert self._assign(self.n1, shifted) == "n1 = (long long)i << n1;"
+        # C ignores the amount's type, so the amount gets no cast back
+        amount = self._cast(self.ull, self._cast(self.char, self.i))
+        shifted = self._op("Shl", self._cast(self.ll, self.i), amount)
+        assert self._assign(self.n1, shifted) == "n1 = (long long)i << (char)i;"
+
+    def test_negation_takes_the_type_of_its_operand(self):
+        negated = CUnaryOp("Neg", self._cast(self.ll, self.i), codegen=self.codegen)
+        assert self._assign(self.n1, self._op("Sub", negated, self._cast(self.ll, self.i))) == "n1 = -i - (long long)i;"
+
+    def test_result_that_cannot_overflow_or_is_truncated_keeps_its_narrower_form(self):
+        byte = self._op("Mul", self._cast(self.ll, self._cast(self.char, self.i)), self._const(0x100))
+        assert self._assign(self.n1, byte) == "n1 = (char)i * 0x100;"
+        masked = self._op("And", self._op("Mul", self._cast(self.ll, self.i), self._const(16)), self._const(0xFFFFFFFF))
+        assert self._assign(self.n1, masked) == "n1 = i * 16 & 0xffffffff;"
+        narrowed = self._cast(self.int, self._op("Mul", self._cast(self.ll, self.i), self._const(3)))
+        assert "long long" not in self._assign(self.i, narrowed)
 
 
 class TestStoreWidth(unittest.TestCase):
@@ -564,6 +815,28 @@ class TestMultiRegisterReturnEndToEnd(unittest.TestCase):
         assert "return CONCAT(a2 + 1, 0xfffd);" in text, text
 
 
+class TestConvertOfZeroWidthChild(unittest.TestCase):
+    """A widening cast whose child is rendered with a type that has no width."""
+
+    def test_widening_a_child_typed_as_a_fieldless_struct(self):
+        # Go's runtime.setThreadCPUProfiler calls timer_create, and the kernel prototype spells that
+        # syscall's second argument as SimStruct({}, name="sigevent"). A struct with no fields has
+        # size 0, so a stack variable reaches the code generator with a type whose size is 0 rather
+        # than None. The intermediate sign-extension cast then asked for an integer of that width and
+        # got int0_t, and MakeTypecastsImplicit.collapse asserted on its size, so the whole function
+        # produced no C at all.
+        bin_path = os.path.join(test_location, "x86_64", "langdetect_go")
+        proj, cfg = load_project_with_scoped_cfg(bin_path, 0x430CA0, project_kwargs={"auto_load_libs": False})
+
+        dec = proj.analyses.Decompiler(cfg.functions[0x430CA0], cfg=cfg, fail_fast=True)
+        assert dec.codegen is not None
+        print_decompilation_result(dec)
+
+        text = dec.codegen.text or ""
+        assert text.strip()
+        assert "int0_t" not in text, text
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -769,3 +1042,48 @@ class TestPointerStepInCommaExpression(unittest.TestCase):
         for dst, _, step in comma_steps:
             assert re.search(rf"unsigned int \*{dst};", text) is not None
             assert step == "1", f"{dst} stepped by {step} bytes inside the comma expression"
+
+
+class TestUnsignedByteCompare(unittest.TestCase):
+    def test_unsigned_byte_compare_operand_prints_unsigned(self):
+        # runtime.(*mspan).decPinCounter tests a byte with `cmp byte ptr [rsi+0x10], 6; jbe`, an unsigned compare
+        bin_path = os.path.join(test_location, "x86_64", "windows", "langdetect_go.exe")
+        proj, cfg = load_project_with_scoped_cfg(bin_path, 0x140045F60, call_tree_depth=1)
+        dec = proj.analyses[angr.analyses.Decompiler].prep(fail_fast=True)(cfg.functions[0x140045F60], cfg=cfg.model)
+        assert isinstance(dec.codegen, CStructuredCodeGenerator) and dec.codegen.text is not None
+        print_decompilation_result(dec)
+
+        compares = []
+
+        class Collector(CStructuredCodeWalker):
+            def handle_CBinaryOp(self, obj):
+                if obj.op == "CmpGT" and isinstance(obj.rhs, CConstant) and obj.rhs.value == 6:
+                    compares.append(obj)
+                return super().handle_CBinaryOp(obj)
+
+        Collector().handle(dec.codegen.cfunc)
+        assert len(compares) == 1
+        assert compares[0].signed is False
+        assert compares[0].lhs.type.c_repr() == "unsigned char"
+
+
+class TestVoidPointerConstantOffset(unittest.TestCase):
+    def test_load_through_void_pointer_is_a_byte_offset_cast(self):
+        # mirai's main: `util_strlen(args[1])`, with args recovered as void*. The 8-byte load at byte 8 must
+        # print as a char* byte offset, not as the subscript `(long long)v21[8]`, which C rejects.
+        bin_path = os.path.join(test_location, "x86_64", "decompiler", "decbench_mirai_O2_noinline")
+        proj, cfg = load_project_with_scoped_cfg(bin_path, 0x402640)
+        func = cfg.functions[0x402640]
+        assert func.name == "main.cold"
+        dec = proj.analyses[angr.analyses.Decompiler].prep(fail_fast=True)(func, cfg=cfg.model)
+        assert dec.codegen is not None and dec.codegen.text is not None
+        print_decompilation_result(dec)
+        text = dec.codegen.text
+
+        void_ptrs = re.findall(r"^\s*void\* (\w+);", text, re.MULTILINE)
+        assert void_ptrs, text
+        for name in void_ptrs:
+            assert re.search(rf"(?<![\w.>]){name}\[", text) is None, f"{name} is void* and must not be subscripted"
+        m = re.search(r"util_strlen\(\*\(long long \*\)\(\(char \*\)(\w+) \+ 8\)\)", text)
+        assert m is not None, text
+        assert m.group(1) in void_ptrs

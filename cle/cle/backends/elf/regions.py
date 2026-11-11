@@ -44,9 +44,11 @@ class ELFSection(Section):
     SHF_ALLOC = 0x2
     SHF_EXECINSTR = 0x4
     SHF_STRINGS = 0x20
+    SHF_TLS = 0x400
     SHT_NULL = "SHT_NULL"
+    SHT_NOBITS = "SHT_NOBITS"
 
-    def __init__(self, readelf_sec, remap_offset=0):
+    def __init__(self, readelf_sec, remap_offset=0, occupies_memory=True):
         super().__init__(
             maybedecode(readelf_sec.name),
             readelf_sec.header.sh_offset,
@@ -61,6 +63,7 @@ class ELFSection(Section):
         self.info = readelf_sec.header.sh_info
         self.align = readelf_sec.header.sh_addralign
         self.remap_offset = remap_offset
+        self._occupies_memory = occupies_memory
 
     @property
     def is_readable(self):
@@ -76,7 +79,7 @@ class ELFSection(Section):
 
     @property
     def occupies_memory(self):
-        return self.flags & self.SHF_ALLOC != 0 and self.memsize > 0
+        return self._occupies_memory and self.flags & self.SHF_ALLOC != 0 and self.memsize > 0
 
     @property
     def is_executable(self):
