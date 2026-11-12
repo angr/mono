@@ -12,9 +12,9 @@ import os
 import re
 import unittest
 
-from tests.common import bin_location
+from tests.common import bin_location, load_project_with_scoped_cfg
 
-from .test_go_decompiler import GoDecompilationTarget, TargetChecks
+from .test_go_decompiler import GoDecompilationTarget, TargetChecks, go_func_addrs
 
 test_location = os.path.join(bin_location, "tests")
 
@@ -109,10 +109,10 @@ class TestGoCorpusLinuxAmd64(CorpusChecks, GoDecompilationTarget):
 
 
 class TestGoCorpusLinuxAmd64Equality(CorpusChecks, GoDecompilationTarget):
-    """Compiler-generated equality functions, all func(p, q unsafe.Pointer) bool."""
+    """Compiler-generated equality functions: func(p, q unsafe.Pointer) bool, the pointees left to type inference."""
 
     BINARY = AGE_KEYGEN
-    FUNCS = ("type:.eq.M16I", "type:.eq.SS", "type:.eq.EM112")
+    FUNCS = ("type:.eq.M16I", "type:.eq.SS", "type:.eq.EM112", "type:.eq.GGGGGGM2", "type:.eq.[4M32]")
 
     @staticmethod
     def values(expr: str) -> int:
@@ -129,8 +129,22 @@ class TestGoCorpusLinuxAmd64Equality(CorpusChecks, GoDecompilationTarget):
         for name in self.FUNCS:
             returns = re.findall(r"^\s+return (.+)$", self.body(self.texts[name]), re.MULTILINE)
             assert returns and all(self.values(r) == 1 for r in returns), self.texts[name]
-        for name in ("type:.eq.M16I", "type:.eq.SS"):
             assert self.header(self.texts[name]).endswith(") bool {"), self.texts[name]
+
+    def check_pointer_parameters(self):
+        # type inference may name what the parameters point to, but never make them numbers: the loop of [4M32] only
+        # adds offsets to them
+        for name in self.FUNCS:
+            header = self.header(self.texts[name])
+            params = header[len(f"func {name}(") :].split(")", 1)[0].split(", ")
+            assert all(re.fullmatch(r"\w+ (unsafe\.Pointer|\*\S+)", param) for param in params), header
+
+    def check_float_fields_compare_as_floats(self):
+        # GGGGGGM2 compares six float64 fields with ucomisd. With both parameters pinned to unsafe.Pointer they printed
+        # as int64 loads, and comparing the bits makes +0.0 and -0.0 unequal
+        text = self.texts["type:.eq.GGGGGGM2"]
+        body = self.body(text)
+        assert "int64" not in body and ".field_28" in body, text
 
 
 class TestGoCorpusLinuxAmd64MethodValues(CorpusChecks, GoDecompilationTarget):
@@ -274,6 +288,59 @@ class TestGoCorpusLinuxAmd64Stdlib(CorpusChecks, GoDecompilationTarget):
         # the descriptors of the type switch ahead of it print as names, not as their first field
         assert "&go:itab.*crypto/internal/fips140/sha256.Digest,hash.Hash" in text, text
         assert ".Inter" not in text and ".Size_" not in text, text
+
+
+class TestGoCorpusLinuxAmd64StringOrder(unittest.TestCase):
+    """
+    ``cmpstring(a, b) < 0`` folds into ``a < b``, and the operands stay strings: two string elements of a slice, not
+    their 16-byte headers compared as integers. ``insertionSortOrdered`` uses the comparison as a value,
+    ``siftDownOrdered`` as an ``if`` condition. In ``medianOrdered`` type inference reads the string prototype the fold
+    puts on the comparison and types the slice parameter ``*string``.
+    """
+
+    def test_string_comparisons(self):
+        binary = os.path.join(test_location, "x86_64", "go", "age")
+        names = (
+            "slices.insertionSortOrdered[go.shape.string]",
+            "slices.siftDownOrdered[go.shape.string]",
+            "slices.medianOrdered[go.shape.string]",
+        )
+        # cmpstring tail-jumps to cmpbody, which the call tree does not reach: without it cmpstring never returns
+        addrs = go_func_addrs(binary, *names, "cmpbody")
+        proj, cfg = load_project_with_scoped_cfg(
+            binary,
+            addrs[names[0]],
+            extra_func_addrs=[addrs[names[1]], addrs[names[2]], addrs["cmpbody"]],
+            call_tree_depth=1,
+        )
+        texts = {}
+        for name in names:
+            dec = proj.analyses.Decompiler(addrs[name], cfg=cfg.model, flavor="go")
+            assert not dec.errors, dec.errors
+            assert dec.codegen is not None
+            text = dec.codegen.text
+            assert text is not None
+            assert not re.search(r"\*\(\*u?int128\)\([^\n]*\) [<>]=? ", text), text
+            texts[name] = text
+        for name in names[:2]:
+            assert re.search(r"\*\(\*string\)\([^\n]*\) [<>]=? \*\(\*string\)\(", texts[name]), texts[name]
+        header = next(line for line in texts[names[2]].splitlines() if line.startswith("func "))
+        assert "*string" in header and "uint128" not in header, texts[names[2]]
+
+
+class TestGoCorpusLinuxAmd64SharedSwitchDefault(CorpusChecks, GoDecompilationTarget):
+    """Two lowered switches whose defaults reach one panic block."""
+
+    BINARY = AGE_KEYGEN
+    FUNCS = ("crypto/internal/fips140/sha512.(*Digest).Reset",)
+
+    def check_labels_are_unique(self):
+        # LoweredSwitchSimplifier gives each switch its own copy of the shared default block; each copy's label must
+        # be its own, and every goto must name a defined label
+        text = self.texts["crypto/internal/fips140/sha512.(*Digest).Reset"]
+        labels = re.findall(r"^(LABEL_\w+):$", text, re.MULTILINE)
+        assert len(labels) == len(set(labels)), text
+        assert set(re.findall(r"\bgoto (LABEL_\w+)", text)) <= set(labels), text
 
 
 class TestGoCorpusDarwinArm64(CorpusChecks, GoDecompilationTarget):
