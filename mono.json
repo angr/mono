@@ -68,9 +68,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "bf79c5ee075d0e551293b0fbf9f615ceb3498505",
-      "committed_at": "2026-11-11T16:40:28-07:00",
-      "subject": "Mach-O: Load relocatable objects that map nothing (#878)",
+      "commit": "dceeec879a3dda167c1bccc21224b734a5fd5fe1",
+      "committed_at": "2026-11-12T12:54:59-07:00",
+      "subject": "ELFCore: Parse core notes without pyelftools (#889)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,13 +123,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-12T07:24:08+00:00",
+  "imported_at": "2026-11-12T22:34:40+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "ce099d47c6b8aec58a28aa2dc39d8b9717b0452c",
-      "committed_at": "2026-11-11T16:40:14-07:00",
-      "subject": "Add a Mach-O relocatable object that maps nothing (#264)",
+      "commit": "92ef86fe98f4e8e76a7cee50ad90395c2d0c6a00",
+      "committed_at": "2026-11-12T11:18:08Z",
+      "subject": "Add ARM64 and ARMNT PE test binaries with exception tables.",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
