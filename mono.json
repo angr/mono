@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "bbdd957c4e5ee9c3f6262f18350b2a13809bc4ad",
-      "committed_at": "2026-11-10T11:30:22Z",
-      "subject": "Update version to 10.0.7.dev0 [ci skip]",
+      "commit": "940c50a23765c509d3dc7434b4a1729a8de18707",
+      "committed_at": "2026-11-11T10:15:40-07:00",
+      "subject": "SimEngineLightAIL: put some safeguards in place in case of typos (#7779)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -60,17 +60,17 @@
     },
     "claripy": {
       "upstream": "https://github.com/angr/claripy",
-      "commit": "6aad5d40ab7b2a800bda2ad7a5e53cbe10afb199",
-      "committed_at": "2026-10-26T08:58:32-07:00",
-      "subject": "Bump certifi from 2025.11.12 to 2026.10.19 (#751)",
+      "commit": "7f18316ee5b76ce45904925052bd437124ad104a",
+      "committed_at": "2026-11-11T11:14:33-07:00",
+      "subject": "Bump soupsieve from 2.8.4 to 2.9 (#746)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "faf26a1a6c9f06d6a9a8e3a967f0def7c91a5446",
-      "committed_at": "2026-11-10T11:30:31Z",
-      "subject": "Update version to 10.0.7.dev0 [ci skip]",
+      "commit": "bf79c5ee075d0e551293b0fbf9f615ceb3498505",
+      "committed_at": "2026-11-11T16:40:28-07:00",
+      "subject": "Mach-O: Load relocatable objects that map nothing (#878)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -87,9 +87,9 @@
     },
     "pypcode": {
       "upstream": "https://github.com/angr/pypcode",
-      "commit": "44d0f58f96865fea3bc6fc7d797fe8bd1e2cfbfa",
-      "committed_at": "2026-11-02T15:48:16-07:00",
-      "subject": "v4.1.1.dev0",
+      "commit": "f30f236271df9c98e619ae226af1aab4c75d425f",
+      "committed_at": "2026-11-11T12:35:32-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -123,13 +123,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-10T14:35:11+00:00",
+  "imported_at": "2026-11-12T07:24:08+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "972124e25839618eeffa1bb333213a12bf80f840",
-      "committed_at": "2026-11-10T11:30:29Z",
-      "subject": "Update version to 10.0.7.dev0 [ci skip]",
+      "commit": "ce099d47c6b8aec58a28aa2dc39d8b9717b0452c",
+      "committed_at": "2026-11-11T16:40:14-07:00",
+      "subject": "Add a Mach-O relocatable object that maps nothing (#264)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
