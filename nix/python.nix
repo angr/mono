@@ -57,7 +57,21 @@ self: super: {
 
   inherit z3-solver;
 
+  pycparser = import ./pycparser.nix {
+    inherit lib;
+    pythonPackages = self;
+    previous = super.pycparser;
+    angrSource = sources.angr;
+  };
+
+  # This upstream test is explicitly marked as requiring Internet access,
+  # which the Nix build sandbox does not provide.
+  curio = super.curio.overridePythonAttrs (old: {
+    disabledTests = (old.disabledTests or [ ]) ++ [ "test_errors" ];
+  });
+
   monoPinned.z3-solver = z3-solver;
+  monoPinned.pycparser = self.pycparser;
 
   # ------------------------------------------------------------ archinfo --
   #
