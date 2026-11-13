@@ -173,7 +173,7 @@ def install(
     # does not is a ratchet that disagrees with the one it ports.
     install_one(
         "pytest", "pytest-xdist", "pytest-timeout", "pytest-split",
-        # Windows and macOS only in effect; see run_suite.
+        # In effect wherever a suite does not fork; see isolation().
         "pytest-rerunfailures",
         *(["pytest-cov", "coverage[toml]"] if coverage else []),
         "pytest-forked", "sortedcontainers-stubs>=2.4.3", "types-pefile",
@@ -376,6 +376,70 @@ def coverage_rcfile(name: str, module: str, results: Path) -> Path:
     return rcfile
 
 
+def forks(config: dict) -> bool:
+    """Whether this suite runs each test in its own process here.
+
+    pytest-forked needs fork(2); Windows has none. macOS has it and must not
+    use it here: forking a process that has started a JVM (jpype, for pysoot)
+    or touched CoreFoundation aborts, and angr's macOS shards died on
+    `Fatal Python error: Aborted` until this. Upstream agrees -- its nightly
+    runs Windows and macOS as `pytest -n auto --splits N --group M` with no
+    --forked at all, and only the Linux container lane forks.
+    """
+    return bool(config.get("forked")) and os.name != "nt" and sys.platform != "darwin"
+
+
+def isolation(config: dict) -> list[str]:
+    """What keeps one faulting test from failing the whole job.
+
+    Every suite gets one of two protections, and deciding both here is what
+    stops it getting neither. `--forked` puts each test in its own process, so
+    a segfault is that test's failure and nothing else's. A suite that does not
+    fork runs many tests per xdist worker, and a fault takes the worker down
+    with whatever it was running -- so there the crashed test is retried
+    instead.
+
+    Which one it gets used to be chosen by platform, and forking is what
+    decides it. Read as a platform, it left the two suites ci/suites.json marks
+    `forked: false` -- angr-management and pysoot -- with neither protection on
+    Linux, which is where every red of this kind has landed.
+
+    What lands there is not noise, and this is not a claim that it is.
+    angr/angr-management#1729 is an open, dated regression: a worker segfaults
+    in `ProjectOpenTestCase.setUp`, four times since 2026-09-02 and never
+    before, in that repository's own CI as well as here. So this retry hides a
+    real crash, deliberately, and only until #1729 is fixed -- a rollup
+    carrying two hundred pull requests is worth more than the fourth report of
+    a bug that already has an issue. Read the reruns as a stopgap for #1729,
+    not as a verdict that these crashes are noise.
+
+    What it does not hide is a failure raised inside a test.
+    pytest-rerunfailures reschedules a crashed worker from
+    `pytest_handlecrashitem`, which spends the --reruns budget and never
+    consults --only-rerun; the two regexes below therefore decide only in-test
+    failures, and an assertion matches neither and fails on its first attempt.
+    A fault that repeats still fails all three attempts and still reds the job,
+    and pytest prints the reruns it did in the summary line either way.
+    """
+    if forks(config):
+        return ["--forked"]
+    return [
+        # angr's native engines crash an xdist worker every so often --
+        # `worker 'gw2' crashed while running test_veritesting_a`, one
+        # failure in 1356 -- and upstream's own nightly fails the same way on
+        # the same tests.
+        "--reruns", "2",
+        # Both shapes the instability takes. A crashed xdist worker is
+        # reported as "worker 'gwN' crashed"; unicorn faulting inside the
+        # process comes back as an OSError naming an access violation, and
+        # one of those cascades through every later test the worker picks up
+        # -- the same shard gave 36 failures, then 1, then 35 across three
+        # runs.
+        "--only-rerun", "crashed",
+        "--only-rerun", "access violation",
+    ]
+
+
 def run_suite(
     name: str, shard: int, of: int, workers: str, coverage: bool = False
 ) -> int:
@@ -424,37 +488,7 @@ def run_suite(
         workers = "2"
     if workers not in ("0", "1"):
         args += ["-n", workers]
-    if sys.platform in ("win32", "darwin"):
-        # angr's native engines crash an xdist worker every so often on these
-        # two platforms -- `worker 'gw2' crashed while running
-        # test_veritesting_a`, one failure in 1356 -- and upstream's own
-        # nightly fails the same way on the same tests. A rerun distinguishes
-        # that from a real failure, which fails every attempt, instead of
-        # deselecting a test that passes nearly always. Linux does not need
-        # it and does not get it.
-        args += [
-            "--reruns", "2",
-            # Both shapes the instability takes. A crashed xdist worker is
-            # reported as "worker 'gwN' crashed"; unicorn faulting inside the
-            # process comes back as an OSError naming an access violation,
-            # and one of those cascades through every later test the worker
-            # picks up -- the same shard gave 36 failures, then 1, then 35
-            # across three runs. A real failure still fails all three
-            # attempts, which is how test_similarity_fauxware was identified
-            # as deterministic rather than flaky.
-            "--only-rerun", "crashed",
-            "--only-rerun", "access violation",
-        ]
-
-    if config.get("forked") and os.name != "nt" and sys.platform != "darwin":
-        # pytest-forked needs fork(2); Windows has none. macOS has it and
-        # must not use it here: forking a process that has started a JVM
-        # (jpype, for pysoot) or touched CoreFoundation aborts, and angr's
-        # macOS shards died on `Fatal Python error: Aborted` until this.
-        # Upstream agrees -- its nightly runs Windows and macOS as
-        # `pytest -n auto --splits N --group M` with no --forked at all, and
-        # only the Linux container lane forks.
-        args += ["--forked"]
+    args += isolation(config)
     for test, reason in excluded:
         print(f"{name}: EXCLUDED {test}\n    {reason}", flush=True)
         args += ["--deselect", test]
