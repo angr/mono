@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "940c50a23765c509d3dc7434b4a1729a8de18707",
-      "committed_at": "2026-11-11T10:15:40-07:00",
-      "subject": "SimEngineLightAIL: put some safeguards in place in case of typos (#7779)",
+      "commit": "81084450315a130502c3b478a06a223d9f9058de",
+      "committed_at": "2026-11-13T14:47:17-07:00",
+      "subject": "clarirs: fix annotations inheritance type issue (#7786)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "a56c84dd3e39786662203f8a886ae352fb51c60a",
-      "committed_at": "2026-11-10T11:30:25Z",
-      "subject": "Update version to 10.0.7.dev0 [ci skip]",
+      "commit": "940ef9a89ec76ebddba96feea882f9e312c8aa86",
+      "committed_at": "2026-11-13T19:33:44Z",
+      "subject": "Update version to 10.0.8.dev0 [ci skip]",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -52,9 +52,9 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "d5c6ad1b1b07beda46727405139dbf87f275b157",
-      "committed_at": "2026-11-10T11:30:27Z",
-      "subject": "Update version to 10.0.7.dev0 [ci skip]",
+      "commit": "5c08c87876dacd65bf5253b8f0c2235c02c80791",
+      "committed_at": "2026-11-13T19:33:46Z",
+      "subject": "Update version to 10.0.8.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -68,9 +68,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "dceeec879a3dda167c1bccc21224b734a5fd5fe1",
-      "committed_at": "2026-11-12T12:54:59-07:00",
-      "subject": "ELFCore: Parse core notes without pyelftools (#889)",
+      "commit": "49cc2f7cb0e7f80153e7881b68d7f02257affc5d",
+      "committed_at": "2026-11-13T19:33:49Z",
+      "subject": "Update version to 10.0.8.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -103,9 +103,9 @@
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "f2bb8fe1a7eca297766fd74b7b345d5fc1624bc3",
-      "committed_at": "2026-11-10T11:30:33Z",
-      "subject": "Update version to 10.0.7.dev0 [ci skip]",
+      "commit": "75f59ab6c048bbc210f0e9d3a147b595df5d1cba",
+      "committed_at": "2026-11-13T19:33:50Z",
+      "subject": "Update version to 10.0.8.dev0 [ci skip]",
       "excluded": [
         ".gitmodules"
       ],
@@ -123,13 +123,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-12T22:34:40+00:00",
+  "imported_at": "2026-11-13T22:41:26+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "92ef86fe98f4e8e76a7cee50ad90395c2d0c6a00",
-      "committed_at": "2026-11-12T11:18:08Z",
-      "subject": "Add ARM64 and ARMNT PE test binaries with exception tables.",
+      "commit": "42dad96c852788f83aecba922981103eded4c95b",
+      "committed_at": "2026-11-13T19:33:47Z",
+      "subject": "Update version to 10.0.8.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
