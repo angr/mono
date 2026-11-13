@@ -518,7 +518,7 @@ jobs:
         env:
           BASE: ${{ github.base_ref || 'main' }}
         run: .venv-native/bin/python ci/lint.py --base "origin/$BASE"
-      - name: pyright badness ratchet
+      - name: pyright error ratchet
         env:
           BASE: ${{ github.base_ref || 'main' }}
         run: |
