@@ -428,10 +428,10 @@ def run_suite(
         # angr's native engines crash an xdist worker every so often on these
         # two platforms -- `worker 'gw2' crashed while running
         # test_veritesting_a`, one failure in 1356 -- and upstream's own
-        # nightly fails the same way on the same tests. A rerun distinguishes
-        # that from a real failure, which fails every attempt, instead of
-        # deselecting a test that passes nearly always. Linux does not need
-        # it and does not get it.
+        # nightly fails the same way on the same tests. A rerun tells a
+        # one-off from a failure that repeats, instead of deselecting a test
+        # that passes nearly always. Linux does not need it and does not get
+        # it.
         args += [
             "--reruns", "2",
             # Both shapes the instability takes. A crashed xdist worker is
@@ -439,9 +439,18 @@ def run_suite(
             # process comes back as an OSError naming an access violation,
             # and one of those cascades through every later test the worker
             # picks up -- the same shard gave 36 failures, then 1, then 35
-            # across three runs. A real failure still fails all three
-            # attempts, which is how test_similarity_fauxware was identified
-            # as deterministic rather than flaky.
+            # across three runs.
+            #
+            # These regexes decide only failures raised inside a test. A
+            # crashed worker never reaches them -- xdist's crashitem hook
+            # reschedules it on the --reruns budget alone -- so before
+            # reading anything into "it failed every attempt", check that
+            # the runner would have retried that failure at all. One
+            # matching neither regex is hard-failed on its first attempt and
+            # prints the same single FAILED line.
+            # That is how test_similarity_fauxware got read wrong: its
+            # AngrIncongruencyError matches neither, so the "3 rerun" beside
+            # it in that shard's summary was three segfaulted workers.
             "--only-rerun", "crashed",
             "--only-rerun", "access violation",
         ]
