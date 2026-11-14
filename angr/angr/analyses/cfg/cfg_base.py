@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 import archinfo
+import capstone
 import networkx
 import pyvex
 from archinfo.arch_arm import get_real_address_if_arm, is_arm_arch
@@ -27,7 +28,7 @@ from cle import (
     TLSObject,
 )
 from cle.backends import NamedRegion
-from sortedcontainers import SortedDict
+from sortedcontainers import SortedDict, SortedSet
 
 from angr.analyses.analysis import Analysis
 from angr.analyses.stack_pointer_tracker import StackPointerTracker
@@ -142,6 +143,7 @@ class CFGBase(Analysis):
             raise ValueError(f"Unsupported context sensitivity level {context_sensitivity_level}")
 
         self._binary = binary if binary is not None else self.project.loader.main_object
+        self._symbol_binaries = [self._binary]
         if self._binary.is_outer:
             # this is an "outer" object (e.g., an archive); we switch to the inner object automatically
             if not self._binary.child_objects:
@@ -153,7 +155,10 @@ class CFGBase(Analysis):
                     self._binary,
                     self._binary.child_objects[0],
                 )
-            self._binary = self._binary.child_objects[0]
+            outer_binary = self._binary
+            self._binary = outer_binary.child_objects[0]
+            # a universal binary's slices for another architecture cannot seed this CFG
+            self._symbol_binaries = [obj for obj in outer_binary.child_objects if obj.arch == self._binary.arch]
         self._force_segment = force_segment
         self._base_state = base_state
         self._detect_tail_calls = detect_tail_calls
@@ -179,7 +184,9 @@ class CFGBase(Analysis):
         # IndirectJump object that describe all indirect exits found in the binary
         # stores as a map between addresses and IndirectJump objects
         self.indirect_jumps: dict[int, IndirectJump] = {}
-        self._indirect_jumps_to_resolve = set()
+        # a sorted set, not a set: resolving one indirect jump builds blocks and occupies bytes that the next
+        # resolver reads, so the order they come out of here decides the CFG. IndirectJump orders by address.
+        self._indirect_jumps_to_resolve: SortedSet = SortedSet()
         # indirect jumps whose resolution was postponed because the data references that bound an unbounded jump
         # table were not collected yet. only used when _defer_unbounded_jumptables is enabled (CFGFast).
         self._deferred_indirect_jumps: set[IndirectJump] = set()
@@ -239,6 +246,9 @@ class CFGBase(Analysis):
         self._functions_without_jobs: dict[int | SootMethodDescriptor, None] = {}
         # addresses of functions that have been completely recovered (i.e. all of its blocks are identified) so far
         self._completed_functions = set()
+        # addresses of instructions that Capstone decodes and the lifter could not translate. A block that reaches one
+        # stops before it, so the block's function may have code that was not recovered.
+        self._unlifted_instruction_addrs: set[int] = set()
 
         # TODO: A segment tree to speed up CFG node lookups
         self._node_lookup_index = None
@@ -247,6 +257,11 @@ class CFGBase(Analysis):
         self._function_addresses_from_symbols = self._load_func_addrs_from_symbols()
         self._function_addresses_from_eh_frame = self._load_func_addrs_from_eh_frame()
         self._function_addr_and_names_from_hints = self._load_func_addr_and_names_from_hints()
+        # the linker's Mach-O function-start table. ld64 also lists data atoms in it, so an entry is weaker evidence of
+        # code than a function symbol.
+        self._function_addresses_from_macho_starts = {
+            hint.addr for hint in self._binary.function_hints if hint.source == FunctionHintSource.MACHO_FUNCTION_STARTS
+        }
 
         # Cache if an object has executable sections or not
         self._object_to_executable_sections = {}
@@ -809,9 +824,11 @@ class CFGBase(Analysis):
                         max_mapped_addr = segment.min_addr + min(segment.memsize, segment.filesize)
                         tpl = (segment.min_addr, max_mapped_addr)
                         segments.append(tpl)
-                if (not b.sections and segments) or force_segment:
-                    # Use segments directly when force_segment is True or when the ELF has no section headers
-                    # at all.
+                # Regions.max_addr is None exactly when no region in the container is mapped into memory.
+                sections_mapped = b.sections.max_addr is not None
+                if (not sections_mapped and segments) or force_segment:
+                    # Use segments directly when force_segment is True or when the ELF's sections map nothing,
+                    # which includes an ELF with no section headers at all.
                     memory_regions += segments
                 elif sections and segments:
                     # are there executable segments with no sections inside?
@@ -1063,7 +1080,7 @@ class CFGBase(Analysis):
         :rtype:  set
         """
 
-        return {sym.rebased_addr for sym in self._binary.symbols if sym.is_function}
+        return {sym.rebased_addr for obj in self._symbol_binaries for sym in obj.symbols if sym.is_function}
 
     def _load_func_addrs_from_eh_frame(self):
         """
@@ -1093,6 +1110,13 @@ class CFGBase(Analysis):
                 addrs_and_names.add((function_hint.addr, function_hint.name))
         return addrs_and_names
 
+    def _is_declared_function(self, addr: int) -> bool:
+        """
+        Check whether the binary itself says that a function starts at addr, in its symbol table or in a Mach-O
+        function-start table.
+        """
+        return addr in self._function_addresses_from_symbols or addr in self._function_addresses_from_macho_starts
+
     #
     # Analyze function features
     #
@@ -1108,6 +1132,12 @@ class CFGBase(Analysis):
            be added to it), and it does not have a ret or any equivalent instruction.
 
         A function returns if any of its block contains a ret instruction or any equivalence.
+
+        A function that the binary declares (see _is_declared_function) and that has a block ending at a valid
+        instruction the lifter could not translate is never completely recovered. Its status stays undetermined until
+        all functions are treated as completed, and it is then assumed to return, like a function that lies outside the
+        analyzed regions. Undeclared code gets no such allowance, because data decoded as code also disassembles to
+        valid instructions that the lifter lacks.
 
         :param Function func:   The function to work on.
         :param bool all_funcs_completed:    Whether we treat all functions as completed functions or not.
@@ -1199,6 +1229,12 @@ class CFGBase(Analysis):
             if target_func.returning is None:
                 # the returning status of at least one of the target functions is not decided yet.
                 bail_out = True
+
+        if self._is_declared_function(func.addr) and any(
+            block_addr + func.get_block_size(block_addr) in self._unlifted_instruction_addrs
+            for block_addr in func.block_addrs_set
+        ):
+            return True if all_funcs_completed else None
 
         if bail_out:
             # We cannot determine at this point. bail out
@@ -1927,6 +1963,8 @@ class CFGBase(Analysis):
                     and block.size > 0
                     and len(block.instruction_addrs) == 2
                     and block.vex.jumpkind == "Ijk_Boring"
+                    # push ordinal; jmp _resolve
+                    and self._pushes_a_relocation_ordinal(block)
                 )
             except SimError:
                 # catch any exceptions that may raise during VEX block lifting
@@ -2860,6 +2898,28 @@ class CFGBase(Analysis):
                 for stmt in vex.statements
             )
         return False
+
+    @staticmethod
+    def _pushes_a_relocation_ordinal(block) -> bool:
+        """
+        Check if the block is the `push <ordinal>; jmp _resolve` body of a lazy-binding PLT stub.
+
+        The two-instruction test in _remove_dummy_plt_stubs is written for that shape, but on its own it
+        only counts instructions, so any two-instruction tail call matches it. A thunk that transforms an
+        argument before jumping to an imported function has the same shape and is a real function with
+        real callers.
+
+        Only the push is checked here. That the block then leaves is the caller's
+        `block.vex.jumpkind == "Ijk_Boring"` condition.
+
+        :param block:   The block instance.
+        :return: True if the block is two instructions and the first pushes an immediate.
+        """
+        insns = block.capstone.insns
+        if len(insns) != 2 or insns[0].mnemonic != "push":
+            return False
+        operands = insns[0].operands
+        return len(operands) == 1 and operands[0].type == capstone.x86.X86_OP_IMM
 
     @staticmethod
     def _is_noop_block(arch: archinfo.Arch, block) -> bool:
