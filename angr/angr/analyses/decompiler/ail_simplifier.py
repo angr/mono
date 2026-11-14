@@ -71,6 +71,7 @@ from .block_walkers import HasCallExprWalker, HasCallNotification
 from .ccall_rewriters import CCALL_REWRITERS
 from .counters.expression_counters import SingleExpressionCounter
 from .dirty_rewriters import DIRTY_REWRITERS
+from .dirty_rewriters.rewriter_base import DirtyRewriterBase
 from .expression_narrower import EffectiveSizeExtractor, ExpressionNarrower, ExprNarrowingInfo
 from .stackarg_offset_manager import StackArgOffsetManager
 
@@ -2304,12 +2305,14 @@ class AILSimplifier(Analysis):
             # Instead of discarding the reaching-definitions cache and recomputing it from scratch on every iteration,
             # incrementally update it: removed statements were replaced in place by NoOp placeholders, so statement
             # indices are stable and we only need to drop the removed vvar definitions and their now-eliminated uses.
+            # When the update cannot keep the model exact, it declines, and the model is rebuilt instead.
             if self._reaching_definitions is not None and changed_block_keys:
                 edited_blocks = [
                     block for block in self.func_graph.nodes() if (block.addr, block.idx) in changed_block_keys
                 ]
-                self._reaching_definitions.update_after_block_edits(edited_blocks)
-                if _VERIFY_INCREMENTAL_RD:
+                if not self._reaching_definitions.update_after_block_edits(edited_blocks):
+                    self._clear_reaching_definitions_cache()
+                elif _VERIFY_INCREMENTAL_RD:
                     self._verify_incremental_reaching_definitions()
             # propagation results are no longer reliable after removing statements
             self._propagator = None
@@ -2933,9 +2936,8 @@ class AILSimplifier(Analysis):
     #
 
     def _rewrite_dirty_calls(self):
-        rewriter_cls = DIRTY_REWRITERS.get(self.project.arch.name, None)
-        if rewriter_cls is None:
-            return False
+        arch_rewriter_cls = DIRTY_REWRITERS.get(self.project.arch.name, None)
+        rewriter_cls = arch_rewriter_cls if arch_rewriter_cls is not None else DirtyRewriterBase
 
         walker = AILBlockRewriter(update_block=False)
 
@@ -3026,7 +3028,10 @@ class AILSimplifier(Analysis):
             return new_expr
 
         walker.expr_handlers[DirtyExpression] = _handle_DirtyExpression
-        walker.expr_handlers[Reinterpret] = _handle_Reinterpret
+        if arch_rewriter_cls is not None:
+            # the x87 helper rewrites leave these Reinterprets behind, so the cleanup stays with the architectures that
+            # have them
+            walker.expr_handlers[Reinterpret] = _handle_Reinterpret
         walker.stmt_handlers[DirtyStatement] = _handle_DirtyStatement
 
         updated = False

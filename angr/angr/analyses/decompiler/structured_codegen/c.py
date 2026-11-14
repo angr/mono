@@ -150,6 +150,10 @@ _FP_TYPES_BY_BITS: dict[int, type[SimTypeFloat]] = {
     80: SimTypeLongDouble,
     128: SimTypeFloat128,
 }
+# integer operations whose result can wrap when C computes them in a narrower type
+_WRAPPING_OPS = frozenset({"Add", "Sub", "Mul", "Shl"})
+# operations whose low n result bits depend only on the low n bits of their operands
+_LOW_BITS_OPS = frozenset({"Add", "Sub", "Mul", "And", "Or", "Xor"})
 
 
 def _reinterpretation_cancels(var_type: SimType | None, wanted: SimType | None, bits: int) -> bool:
@@ -238,6 +242,75 @@ def int_operand_signedness(expr: CExpression) -> bool | None:
     return None if ws is None else ws[1]
 
 
+def signed_constant(expr: CExpression) -> int | None:
+    """The value of an integer constant read as signed at its type's width; None for any other expression."""
+    if not isinstance(expr, CConstant) or not isinstance(expr.value, int):
+        return None
+    ws = int_width_and_signedness(unpack_typeref(expr.type))
+    if ws is not None and expr.value >= 1 << (ws[0] - 1):
+        return expr.value - (1 << ws[0])
+    return expr.value
+
+
+def c_operand_type(expr: CExpression) -> SimType | None:
+    """
+    The type C computes an integer expression in: an integer narrower than int is promoted to int, an operation takes
+    the type of its operands as C converts them (a shift its left operand's, a negation its operand's, a comparison
+    int), and a constant whose value read as signed fits in 32 bits is taken as an int or unsigned int literal, whatever
+    its width in the AIL. A constant printed in hex or as a decimal above INT_MAX can be wider in C, so this can only
+    keep a cast that is not needed, in whatever format the constant is shown.
+    """
+    ty = expr.type
+    ws = int_width_and_signedness(unpack_typeref(ty))
+    if ws is None:
+        return ty
+    int_bits = expr.codegen.project.arch.sizeof.get("int", 32)
+    value = signed_constant(expr)
+    if value is not None:
+        if -(1 << (int_bits - 1)) <= value < 1 << (int_bits - 1):
+            return expr.codegen.default_simtype_from_bits(int_bits, signed=True)
+        if 0 <= value < 1 << int_bits:
+            return expr.codegen.default_simtype_from_bits(int_bits, signed=False)
+        return ty
+    if (isinstance(expr, CBinaryOp) and expr.op.startswith(("Cmp", "Logical"))) or (
+        isinstance(expr, CUnaryOp) and expr.op == "Not"
+    ):
+        return expr.codegen.default_simtype_from_bits(int_bits, signed=True)
+    if isinstance(expr, CUnaryOp) and expr.op in {"Neg", "BitwiseNeg"}:
+        return c_operand_type(expr.operand)
+    if isinstance(expr, CBinaryOp) and expr.op in {"Shl", "Shr", "Sar"}:
+        return c_operand_type(expr.lhs)
+    if isinstance(expr, CBinaryOp) and expr.op in _LOW_BITS_OPS | {"Div", "Mod"}:
+        lhs, rhs = c_operand_type(expr.lhs), c_operand_type(expr.rhs)
+        if lhs is not None and rhs is not None:
+            return CBinaryOp.compute_common_type(expr.op, lhs, rhs)
+    if ws[0] < int_bits:
+        return expr.codegen.default_simtype_from_bits(int_bits, signed=True)
+    return ty
+
+
+def int_value_bits(expr: CExpression) -> int | None:
+    """
+    An upper bound on the bits the magnitude of an integer expression needs: a constant's value read as signed, one bit
+    for a comparison or logical operator, for an & the narrowest constant side that is not negative, for any other
+    operation the width of the type C computes it in, and otherwise its type's width. None when the expression is not
+    an integer.
+    """
+    value = signed_constant(expr)
+    if value is not None:
+        return abs(value).bit_length()
+    if (isinstance(expr, CBinaryOp) and expr.op.startswith(("Cmp", "Logical"))) or (
+        isinstance(expr, CUnaryOp) and expr.op == "Not"
+    ):
+        return 1
+    if isinstance(expr, CBinaryOp) and expr.op == "And":
+        masks = [v for v in (signed_constant(expr.lhs), signed_constant(expr.rhs)) if v is not None and v >= 0]
+        if masks:
+            return min(v.bit_length() for v in masks)
+    ws = int_width_and_signedness(unpack_typeref(c_operand_type(expr) if isinstance(expr, CBinaryOp) else expr.type))
+    return None if ws is None else ws[0]
+
+
 def is_sign_fixing_cast(cast: CTypeCast) -> bool:
     """A same-width integer cast whose operand C reads with the other signedness, e.g. (long long)x for unsigned x."""
     s = int_width_and_signedness(cast.src_type)
@@ -261,6 +334,36 @@ def qualifies_for_implicit_cast(ty1, ty2):
         return ty1.size is not None and ty2.size is not None and ty1.size <= ty2.size
 
     return False
+
+
+def assignment_needs_cast(cast: CTypeCast, dst_ty: SimType) -> bool:
+    """
+    Whether C needs the cast when its operand is assigned, passed or returned as a value of type dst_ty (C11 6.5.16.1).
+    Without a cast, C converts only between two integers, from a null pointer constant to a pointer, or between two
+    pointers when either points to void or both point to the same type. Pointers to integers that differ only in
+    signedness count as pointing to the same type, because GCC and Clang accept that conversion with only a
+    -Wpointer-sign warning. A pointer to an array is printed as the array itself, which converts as a pointer to its
+    element, so it is compared through the element type. A cast to a pointer to an array is printed as a cast to the
+    array, which C rejects, so it is never kept.
+    """
+    src_ty, cast_ty = cast.src_type, cast.dst_type
+    if isinstance(cast_ty, SimTypePointer) and isinstance(unpack_typeref(cast_ty.pts_to), SimTypeArray):
+        return False
+    if isinstance(dst_ty, SimTypePointer) and isinstance(cast.expr, CConstant) and cast.expr.value == 0:
+        return False
+    if not isinstance(src_ty, SimTypePointer) or not isinstance(dst_ty, SimTypePointer):
+        return isinstance(src_ty, SimTypePointer) or isinstance(dst_ty, SimTypePointer)
+    src_pointee, dst_pointee = (unpack_typeref(ty.pts_to) for ty in (src_ty, dst_ty))
+    src_pointee, dst_pointee = (
+        unpack_typeref(ty.elem_type) if isinstance(ty, SimTypeArray) else ty for ty in (src_pointee, dst_pointee)
+    )
+    if isinstance(src_pointee, (SimTypeChar, SimTypeInt)) and type(src_pointee) is type(dst_pointee):
+        return False
+    return not (
+        isinstance(src_pointee, SimTypeBottom)
+        or isinstance(dst_pointee, SimTypeBottom)
+        or type_equals(src_pointee, dst_pointee)
+    )
 
 
 def c_return_type(returnty: SimType) -> SimType:
@@ -896,6 +999,28 @@ class CFunction(CConstruct, FunctionNode):  # pylint:disable=abstract-method
 
         return unified_to_var_and_types
 
+    def local_variable_types(self, variable: SimVariable) -> list[SimType]:
+        """The types of a local variable in the order its declaration lists them; it is declared with the first."""
+        # sort by the following:
+        #   * if it's a a non-basic type
+        #   * the number of occurrences
+        #   * the repr of the type itself
+        # TODO: The type selection should actually happen during variable unification
+        count = Counter(var_type for _, var_type in self.unified_local_vars[variable])
+        return sorted(count, key=lambda x: (isinstance(x, (SimTypeChar, SimTypeInt, SimTypeFloat)), count[x], repr(x)))
+
+    def declared_type(self, cvar: CVariable) -> SimType | None:
+        """The declared type of the parameter or local variable that cvar accesses, or None for any other variable."""
+        for arg_type, arg in zip(self.functy.args or (), self.arg_list):
+            if isinstance(arg, CVariable) and (arg.unified_variable or arg.variable) in (
+                cvar.variable,
+                cvar.unified_variable,
+            ):
+                return arg_type
+        unified = self.variable_manager.unified_variable(cvar.variable)
+        variable = unified if unified is not None else cvar.variable
+        return self.local_variable_types(variable)[0] if variable in self.unified_local_vars else None
+
     def variable_list_repr_chunks(self, indent=0):
         indent_str = self.indent_str(indent)
 
@@ -913,18 +1038,7 @@ class CFunction(CConstruct, FunctionNode):  # pylint:disable=abstract-method
                 continue
 
             name = variable_display_name(variable)
-
-            # sort by the following:
-            #   * if it's a a non-basic type
-            #   * the number of occurrences
-            #   * the repr of the type itself
-            # TODO: The type selection should actually happen during variable unification
-            vartypes = [x[1] for x in cvar_and_vartypes]
-            count = Counter(vartypes)
-            vartypes = sorted(
-                count.copy(),
-                key=lambda x, ct=count: (isinstance(x, (SimTypeChar, SimTypeInt, SimTypeFloat)), ct[x], repr(x)),
-            )
+            vartypes = self.local_variable_types(variable)
 
             vla_dim = self.codegen._array_length_cexprs.get(variable)
 
@@ -1277,15 +1391,37 @@ class CStatements(CStatement):
         self.addr = addr if addr is not None else first_stmt_addr(statements)
 
     def c_repr_chunks(self, indent=0, asexpr=False):
+        return self._c_repr_chunks(indent=indent, asexpr=asexpr, terminate_trailing_label=True)
+
+    def _c_repr_chunks(self, indent=0, asexpr=False, *, terminate_trailing_label):
         indent_str = self.indent_str(indent)
         if self.codegen.display_block_addrs:
             yield indent_str, None
             yield f"/* Block {hex(self.addr) if self.addr is not None else 'unknown'} */", None
             yield "\n", None
         for stmt in self.statements:
-            yield from stmt.c_repr_chunks(indent=indent, asexpr=asexpr)
+            if isinstance(stmt, CStatements):
+                # CStatements may be a transparent sequence nested inside another sequence. A label at the end of
+                # the inner sequence still labels the next statement in the outer sequence.
+                yield from stmt._c_repr_chunks(indent=indent, asexpr=asexpr, terminate_trailing_label=False)
+            else:
+                yield from stmt.c_repr_chunks(indent=indent, asexpr=asexpr)
             if asexpr:
                 yield ", ", None
+        if not asexpr and terminate_trailing_label and isinstance(self._last_nonempty_statement(), CLabel):
+            # A C label prefixes a statement; it is not a complete statement itself. Finish it only at the boundary
+            # of the enclosing sequence, after looking through transparent nested sequences.
+            yield indent_str, None
+            yield ";\n", None
+
+    def _last_nonempty_statement(self) -> CStatement | None:
+        for stmt in reversed(self.statements):
+            if isinstance(stmt, CStatements):
+                stmt = stmt._last_nonempty_statement()
+                if stmt is None:
+                    continue
+            return stmt
+        return None
 
 
 class CAILBlock(CStatement):
@@ -2504,9 +2640,7 @@ class CUnaryOp(CExpression, UnaryOpNode):
         yield ")", paren
 
 
-_NON_ASSOCIATIVE_OPS = frozenset(
-    {"Sub", "Div", "Shl", "Shr", "Sar", "CmpEQ", "CmpNE", "CmpLE", "CmpLT", "CmpGT", "CmpGE"}
-)
+_ASSOCIATIVE_OPS = frozenset({"Add", "Mul", "And", "Or", "Xor", "LogicalAnd", "LogicalOr"})
 
 
 class CBinaryOp(CExpression, BinaryOpNode):
@@ -2615,10 +2749,10 @@ class CBinaryOp(CExpression, BinaryOpNode):
             ["Xor"],
             ["And"],
             ["CmpEQ", "CmpNE"],
-            ["CmpLE", "CmpLT", "CmpGT", "CmpGE"],
+            ["CmpLE", "CmpLT", "CmpGT", "CmpGE", "CmpLEs", "CmpLTs", "CmpGTs", "CmpGEs"],
             ["Shl", "Shr", "Sar"],
             ["Add", "Sub"],
-            ["Mul", "Div"],
+            ["Mul", "Mull", "Div", "Mod"],
             ["SBorrow", "SCarry", "Carry"],
             # highest precedence
         ]
@@ -2684,6 +2818,18 @@ class CBinaryOp(CExpression, BinaryOpNode):
     # Handlers
     #
 
+    def _rhs_needs_parens(self) -> bool:
+        # C binary operators group left to right, so an equal-precedence rhs keeps its parentheses unless regrouping
+        # is a no-op: the same associative operator (float + and * are not associative)
+        rhs = self.rhs
+        if not isinstance(rhs, CBinaryOp):
+            return False
+        if self.op_precedence != rhs.op_precedence:
+            return self.op_precedence > rhs.op_precedence
+        if rhs.op != self.op or self.op not in _ASSOCIATIVE_OPS:
+            return True
+        return self.op in ("Add", "Mul") and isinstance(unpack_typeref(self.type), SimTypeFloat)
+
     def _c_repr_chunks(self, op):
         # lhs
         if isinstance(self.lhs, CBinaryOp) and self.op_precedence > self.lhs.op_precedence:
@@ -2698,10 +2844,7 @@ class CBinaryOp(CExpression, BinaryOpNode):
         yield op, self
 
         # rhs
-        # a same-precedence rhs needs parentheses when the operator is not associative: a - (b - c), a < (b < c)
-        if isinstance(self.rhs, CBinaryOp) and self.op_precedence > self.rhs.op_precedence - (
-            1 if self.op in _NON_ASSOCIATIVE_OPS else 0
-        ):
+        if self._rhs_needs_parens():
             paren = CClosingObject("(")
             yield "(", paren
             yield from self._try_c_repr_chunks(self.rhs)
@@ -2775,7 +2918,7 @@ class CBinaryOp(CExpression, BinaryOpNode):
             yield from self._try_c_repr_chunks(self.lhs)
             yield ")", paren
             yield " >> ", self
-            if isinstance(self.rhs, CBinaryOp) and self.op_precedence > self.rhs.op_precedence:
+            if self._rhs_needs_parens():
                 paren2 = CClosingObject("(")
                 yield "(", paren2
                 yield from self._try_c_repr_chunks(self.rhs)
@@ -4204,6 +4347,74 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
             return cexpr
         return CReinterpret(ty, fp_cls(), cexpr, codegen=self)
 
+    def _fp_operand_view(self, cexpr: CExpression, operand: Expr.Expression, scalar: bool = True) -> CExpression:
+        """
+        An FP operation reads its operand as a floating-point value. When the operand's C expression has an integer
+        type of the operand's width, view its bits as the FP type of that width instead of letting C convert the
+        integer value: a dereference reads through an FP pointer, an integer truncation of an FP value of that width
+        is replaced by the FP value, and anything else goes through CReinterpret. An integer truncation of an FP value
+        of another width keeps its cast, as no view of the converted value can restore the bits. A vector operand only
+        gets the variable view of _fp_view_of_int_lvalue, as the FP type of its width is not a vector type. Constants
+        are left to _fp_constant.
+        """
+        bits = operand.bits
+        if not scalar:
+            return self._fp_view_of_int_lvalue(cexpr, bits)
+        if isinstance(cexpr, CConstant) or cexpr.type is None:
+            return cexpr
+        ty = unpack_typeref(cexpr.type)
+        if not isinstance(ty, (SimTypeInt, SimTypeChar, SimTypeNum)) or ty.size != bits:
+            return cexpr
+        fp_cls = _FP_TYPES_BY_BITS.get(bits)
+        if fp_cls is None:
+            return cexpr
+        truncation = is_lsb_extract(operand) or (
+            isinstance(operand, Expr.Convert)
+            and operand.from_type == operand.to_type == Expr.ConvertType.TYPE_INT
+            and operand.from_bits >= operand.to_bits
+        )
+        if (
+            truncation
+            and isinstance(cexpr, CTypeCast)
+            and (inner := self._as_declared(cexpr.expr)).type is not None
+            and isinstance(inner_ty := unpack_typeref(inner.type), SimTypeFloat)
+        ):
+            # an integer truncation of an FP value, e.g. the low 32 bits of xmm0 after a call returning float. The C
+            # cast converts the value and no view of its result can restore the bits, so only an FP value of the
+            # operand's width can replace the cast.
+            return inner if inner_ty.size == bits else cexpr
+        if isinstance(cexpr, CUnaryOp) and cexpr.op == "Dereference":
+            ptr = cexpr.operand
+            if isinstance(ptr, CTypeCast) and isinstance(unpack_typeref(ptr.dst_type), SimTypePointer):
+                ptr = ptr.expr
+            if ptr.type is not None:
+                fp_ptr = SimTypePointer(fp_cls()).with_arch(self.project.arch)
+                return CUnaryOp(
+                    "Dereference", CTypeCast(ptr.type, fp_ptr, ptr, codegen=self), tags=cexpr.tags, codegen=self
+                )
+        return CReinterpret(ty, fp_cls(), cexpr, codegen=self)
+
+    def _as_declared(self, cexpr: CExpression) -> CExpression:
+        """
+        cexpr with the type the output declares for it. Only function arguments are retyped: the header declares an
+        argument with the prototype's type, which variable typing does not always agree with, e.g. a float argument
+        whose register variable is typed unsigned long long.
+        """
+        if isinstance(cexpr, CVariable) and self._func_args and self._func.prototype is not None:
+            var = cexpr.unified_variable or cexpr.variable
+            unified = self.kb.dec_variables[self._func.addr].unified_variable
+            for arg, arg_ty in zip(self._func_args, self._func.prototype.args):
+                if (unified(arg) or arg) == var and arg_ty != cexpr.type:
+                    return CVariable(
+                        cexpr.variable,
+                        unified_variable=cexpr.unified_variable,
+                        variable_type=arg_ty,
+                        vvar_id=cexpr.vvar_id,
+                        tags=cexpr.tags,
+                        codegen=self,
+                    )
+        return cexpr
+
     def _assign_converted(self, cdst: CExpression, csrc: CExpression, cast_other: bool = True, **kwargs) -> CAssignment:
         """
         dst = src where the C types differ. An FP value and an integer of the same width are the same bits in a
@@ -4405,8 +4616,9 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
                     )
                 return CUnaryOp("Dereference", expr, codegen=self)
 
-        stride = 1 if base_type.size is None else base_type.size // self.project.arch.byte_width or 1
-        index, remainder = divmod(offset, stride)
+        # a pointee with no size, such as void, has no elements to index, so the whole offset is in bytes
+        stride = None if base_type.size is None else base_type.size // self.project.arch.byte_width or 1
+        index, remainder = (0, offset) if stride is None else divmod(offset, stride)
         if index != 0:
             index = CConstant(index, SimTypeInt(), codegen=self)
             kernel = expr
@@ -5730,11 +5942,9 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
 
         if expr.floating_point:
             scalar = expr.vector_count is None
-            lhs = self._fp_view_of_int_lvalue(self._fp_constant(lhs, expr.operands[0], scalar), expr.operands[0].bits)
+            lhs = self._fp_operand_view(self._fp_constant(lhs, expr.operands[0], scalar), expr.operands[0], scalar)
             if expr.op != "Scale":  # ldexp's exponent operand is an integer
-                rhs = self._fp_view_of_int_lvalue(
-                    self._fp_constant(rhs, expr.operands[1], scalar), expr.operands[1].bits
-                )
+                rhs = self._fp_operand_view(self._fp_constant(rhs, expr.operands[1], scalar), expr.operands[1], scalar)
         else:
             # an integer operation on an FP-typed operand works on its bit pattern
             lhs = self._fp_operand_bits(lhs, expr.operands[0].bits)
@@ -5798,7 +6008,7 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
 
         child = self._handle(expr.operand)
         if expr.from_type == Expr.ConvertType.TYPE_FP:
-            child = self._fp_view_of_int_lvalue(child, expr.operand.bits)
+            child = self._fp_operand_view(child, expr.operand)
         if expr.from_bits == 1 and expr.to_bits > 1 and isinstance(child, CBinaryOp) and child.op == "CmpNE":
             # a bool used as an integer value: `x != 0` must not be shortened to `x`
             child._cstyle_null_cmp = False
@@ -5866,9 +6076,11 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
             and child.type is not None
         ):
             # this is a problem. sign-extension only happens when the SOURCE of the cast is signed
-            # a child whose type has no size (e.g., a function or a bottom type) is as wide as the conversion says
-            child_bits = child.type.size if child.type.size is not None else expr.from_bits
-            child_ty = self.default_simtype_from_bits(child_bits, expr.is_signed)
+            # child.type.size is None for a SimTypeBottom and 0 for a struct that reached us with no
+            # fields, and neither can be the width of an integer cast. The AIL conversion carries the
+            # source width, so fall back to it whenever the rendered type does not supply one.
+            child_size = child.type.size
+            child_ty = self.default_simtype_from_bits(child_size or expr.from_bits, expr.is_signed)
             child = CTypeCast(None, child_ty, child, codegen=self)
 
         return CTypeCast(None, dst_type.with_arch(self.project.arch), child, tags=expr.tags, codegen=self)
@@ -6278,15 +6490,36 @@ class CStructuredCodeWalker:
 
 
 class MakeTypecastsImplicit(CStructuredCodeWalker):
+    def __init__(self):
+        # the constructs from the function down to the one being handled
+        self._path: list[CConstruct] = []
+
+    def handle(self, obj):
+        self._path.append(obj)
+        try:
+            return super().handle(obj)
+        finally:
+            self._path.pop()
+
     @classmethod
-    def collapse(cls, dst_ty: SimType, child: CExpression) -> CExpression:
+    def collapse(cls, dst_ty: SimType, child: CExpression, assigned_to: SimType | None = None) -> CExpression:
+        """
+        Return child without the casts that do not change its value once it is converted to dst_ty.
+
+        :param assigned_to: The type child is assigned, passed or returned as; for an assigned variable, the type it is
+                            declared with. A cast that C needs for that conversion (see assignment_needs_cast) is kept.
+        """
         result = child
         if isinstance(child, CTypeCast):
             intermediate_ty = child.dst_type
             start_ty = child.src_type
 
-            # step 1: collapse pointer-integer casts of the same size
-            if qualifies_for_simple_cast(intermediate_ty, dst_ty) and qualifies_for_simple_cast(start_ty, dst_ty):
+            # step 1: collapse casts between integers and pointers of the same size, unless an assignment needs the cast
+            if (
+                qualifies_for_simple_cast(intermediate_ty, dst_ty)
+                and qualifies_for_simple_cast(start_ty, dst_ty)
+                and not (assigned_to is not None and assignment_needs_cast(child, assigned_to))
+            ):
                 result = child.expr
             # step 2: collapse integer conversions which are redundant
             if (
@@ -6306,22 +6539,28 @@ class MakeTypecastsImplicit(CStructuredCodeWalker):
 
         if result is not child:
             # TODO this is not the best since it prohibits things like the BinaryOp optimizer from working incrementally
-            return cls.collapse(dst_ty, result)
+            return cls.collapse(dst_ty, result, assigned_to=assigned_to)
         return result
 
     def handle_CAssignment(self, obj):
-        obj.rhs = self.collapse(obj.lhs.type, obj.rhs)
+        lhs_type = obj.lhs.type
+        assigned_to = lhs_type
+        if isinstance(obj.lhs, CVariable):
+            assert obj.codegen.cfunc is not None
+            assigned_to = obj.codegen.cfunc.declared_type(obj.lhs) or lhs_type
+        obj.rhs = self.collapse(lhs_type, obj.rhs, assigned_to=assigned_to)
         return super().handle_CAssignment(obj)
 
     def handle_CFunctionCall(self, obj: CFunctionCall):
         prototype_args = [] if obj.prototype is None else obj.prototype.args
         for i, (c_arg, arg_ty) in enumerate(zip(obj.args, prototype_args)):
-            obj.args[i] = self.collapse(arg_ty, c_arg)
+            obj.args[i] = self.collapse(arg_ty, c_arg, assigned_to=arg_ty)
         return super().handle_CFunctionCall(obj)
 
     def handle_CReturn(self, obj: CReturn):
         assert obj.codegen._func.prototype is not None
-        obj.retval = self.collapse(obj.codegen._func.prototype.returnty, obj.retval)
+        returnty = obj.codegen._func.prototype.returnty
+        obj.retval = self.collapse(returnty, obj.retval, assigned_to=returnty)
         return super().handle_CReturn(obj)
 
     @staticmethod
@@ -6343,14 +6582,119 @@ class MakeTypecastsImplicit(CStructuredCodeWalker):
             return self._collapse_cast(operand, under_fp_cast=False)
         return self.handle(operand)
 
+    def _bits_read(self) -> int | None:
+        """
+        How many low bits of the expression being handled its consumers read, or None for all of them. A narrowing cast,
+        an & with a constant mask, and the type the value is assigned, passed or returned as each set a limit, also when
+        the expression reaches them only through operations whose low result bits depend only on the low bits of their
+        operands.
+        """
+        bits = None
+        for child, parent in zip(reversed(self._path), reversed(self._path[:-1])):
+            stored_as = None
+            if isinstance(parent, CReturn) and parent.codegen._func.prototype is not None:
+                stored_as = parent.codegen._func.prototype.returnty
+            elif isinstance(parent, CAssignment) and child is not parent.lhs:
+                stored_as = parent.lhs.type
+            elif isinstance(parent, CFunctionCall) and parent.prototype is not None:
+                index = next((i for i, arg in enumerate(parent.args) if self._passes(arg, child)), None)
+                if index is not None and index < len(parent.prototype.args):
+                    stored_as = parent.prototype.args[index]
+            if stored_as is not None:
+                ws = int_width_and_signedness(unpack_typeref(stored_as))
+                if ws is not None:
+                    bits = ws[0] if bits is None else min(bits, ws[0])
+                break
+            if isinstance(parent, CTypeCast):
+                src = int_width_and_signedness(unpack_typeref(child.type)) if isinstance(child, CExpression) else None
+                dst = int_width_and_signedness(unpack_typeref(parent.dst_type))
+                if src is None or dst is None or dst[0] > src[0]:
+                    break
+                if dst[0] < src[0]:
+                    bits = dst[0] if bits is None else min(bits, dst[0])
+            elif isinstance(parent, CBinaryOp) and (
+                parent.op in _LOW_BITS_OPS or (parent.op == "Shl" and child is parent.lhs)
+            ):
+                other = parent.rhs if child is parent.lhs else parent.lhs
+                if (
+                    parent.op == "And"
+                    and isinstance(other, CConstant)
+                    and isinstance(other.value, int)
+                    and other.value > 0
+                ):
+                    mask_bits = other.value.bit_length()
+                    bits = mask_bits if bits is None else min(bits, mask_bits)
+            elif not (isinstance(parent, CUnaryOp) and parent.op in {"Neg", "BitwiseNeg"}):
+                break
+        return bits
+
+    @staticmethod
+    def _fits(obj: CBinaryOp, bits: int, signed: bool) -> bool:
+        # whether the operation's result provably fits in a C type of this width and signedness
+        lhs, rhs = int_value_bits(obj.lhs), int_value_bits(obj.rhs)
+        if lhs is None or rhs is None:
+            return False
+        shift = signed_constant(obj.rhs)
+        constants = [v for v in (signed_constant(obj.lhs), shift) if v is not None]
+        if not signed and (obj.op == "Sub" or any(v < 0 for v in constants)):
+            return False
+        if obj.op == "Mul":
+            needed = lhs + rhs
+        elif obj.op in {"Add", "Sub"}:
+            needed = max(lhs, rhs) + 1
+        elif obj.op == "Shl" and shift is not None:
+            needed = lhs + shift
+        else:
+            return False
+        return needed < bits
+
+    @staticmethod
+    def _passes(arg: CExpression, child: CConstruct) -> bool:
+        # whether an argument is the child, or casts it: a handler may hand on the argument's operand
+        while arg is not child and isinstance(arg, CTypeCast):
+            arg = arg.expr
+        return arg is child
+
+    def _wraps(self, obj: CBinaryOp) -> bool:
+        # whether C would compute the operation in a narrower type than the operation's, where its result can wrap, and
+        # a consumer reads the bits beyond that type
+        ws = int_width_and_signedness(unpack_typeref(obj.common_type))
+        c_ws = int_width_and_signedness(unpack_typeref(c_operand_type(obj)))
+        if ws is None or c_ws is None or c_ws[0] >= ws[0] or self._fits(obj, *c_ws):
+            return False
+        bits = self._bits_read()
+        return bits is None or bits > c_ws[0]
+
+    @staticmethod
+    def _is_dropped_sign_extension(operand: CExpression, handled: CExpression) -> bool:
+        # zero extensions stay dropped: the AIL also holds 64-bit operations on zero-extended operands that the machine
+        # computes in 32 bits, and for those C's 32-bit arithmetic is right
+        if not isinstance(operand, CTypeCast) or handled is not operand.expr:
+            return False
+        src = int_width_and_signedness(unpack_typeref(operand.expr.type))
+        dst = int_width_and_signedness(unpack_typeref(operand.dst_type))
+        return src is not None and dst is not None and src[0] < dst[0] and src[1]
+
     def handle_CBinaryOp(self, obj: CBinaryOp):
+        keep_lhs = keep_rhs = False
         if obj.signed is not None:
             obj.lhs = self._handle_compare_operand(obj, obj.lhs)
             obj.rhs = self._handle_compare_operand(obj, obj.rhs)
         else:
+            lhs, rhs = obj.lhs, obj.rhs
             obj = super().handle_CBinaryOp(obj)
+            if obj.op in _WRAPPING_OPS:
+                # handling an operand drops its integer widening; put a sign extension back where the result would
+                # otherwise overflow
+                keep_lhs = self._is_dropped_sign_extension(lhs, obj.lhs) and self._wraps(obj)
+                if keep_lhs:
+                    obj.lhs = lhs
+                # a shift has its left operand's type, so a cast on its amount changes nothing
+                keep_rhs = obj.op != "Shl" and self._is_dropped_sign_extension(rhs, obj.rhs) and self._wraps(obj)
+                if keep_rhs:
+                    obj.rhs = rhs
         while True:
-            new_lhs = self.collapse(obj.common_type, obj.lhs)
+            new_lhs = obj.lhs if keep_lhs else self.collapse(obj.common_type, obj.lhs)
             assert obj.rhs.type is not None and new_lhs.type is not None
             if (
                 new_lhs is not obj.lhs
@@ -6359,7 +6703,7 @@ class MakeTypecastsImplicit(CStructuredCodeWalker):
             ):
                 obj.lhs = new_lhs
             else:
-                new_rhs = self.collapse(obj.common_type, obj.rhs)
+                new_rhs = obj.rhs if keep_rhs else self.collapse(obj.common_type, obj.rhs)
                 assert new_rhs.type is not None and obj.lhs.type is not None
                 if (
                     new_rhs is not obj.rhs
