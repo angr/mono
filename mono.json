@@ -68,9 +68,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "49cc2f7cb0e7f80153e7881b68d7f02257affc5d",
-      "committed_at": "2026-11-13T19:33:49Z",
-      "subject": "Update version to 10.0.8.dev0 [ci skip]",
+      "commit": "ea4eae935e2f6ebb5d7bc03c3e8c6f5c6c37aa4d",
+      "committed_at": "2026-11-14T13:15:45-07:00",
+      "subject": "ELF: fix DWARF 5 source file lookups (#879)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,7 +123,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-13T22:41:26+00:00",
+  "imported_at": "2026-11-15T01:33:36+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
