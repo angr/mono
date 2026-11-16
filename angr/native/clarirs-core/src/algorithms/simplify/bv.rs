@@ -154,7 +154,7 @@ pub(crate) fn simplify_bv<'c>(
                                             (shl_val.to_u64(), lshr_val.to_u64())
                                         {
                                             let bitwidth = a.size() as u64;
-                                            if lshift.checked_add(rshift) == Some(bitwidth)
+                                            if lshift + rshift == bitwidth
                                                 && (bitwidth == 32 || bitwidth == 64)
                                             {
                                                 let mask_big = mask_val.to_biguint();

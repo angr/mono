@@ -14,8 +14,8 @@ import archinfo
 
 import angr
 from angr.analyses import Decompiler
-from angr.analyses.calling_convention import FactCollector
-from angr.analyses.calling_convention.utils import is_sane_register_variable
+from angr.analyses.calling_convention import CallingConventionAnalysis, FactCollector
+from angr.analyses.calling_convention.utils import is_sane_register_variable, msvc_x86_xmm_arg_regs
 from angr.analyses.complete_calling_conventions import (
     DEAD_WORKER_GRACE_PERIOD,
     CallingConventionAnalysisMode,
@@ -28,12 +28,14 @@ from angr.calling_conventions import (
     SimCCMicrosoftAMD64NoStructReturn,
     SimCCMicrosoftCdecl,
     SimCCMicrosoftFastcall,
+    SimCCS390X,
     SimCCStdcall,
     SimCCSystemVAMD64,
     SimFunctionArgument,
     SimRegArg,
     SimStackArg,
 )
+from angr.codenode import BlockNode
 from angr.errors import AngrRuntimeError
 from angr.sim_type import (
     SimTypeBottom,
@@ -69,6 +71,28 @@ def _reg_names(locs: list[SimFunctionArgument]) -> list[str]:
         assert isinstance(loc, SimRegArg), loc
         names.append(loc.reg_name)
     return names
+
+
+def _decompiled_text(proj: angr.Project, addr: int, cfg) -> str:
+    codegen = proj.analyses[Decompiler].prep()(proj.kb.functions[addr], cfg=cfg.model).codegen
+    assert codegen is not None and codegen.text is not None
+    return codegen.text
+
+
+def _call_args(text: str, callee: str) -> list[str]:
+    """The top-level arguments of the first call to ``callee`` in decompiled text."""
+    start = text.index(callee + "(") + len(callee) + 1
+    depth = 0
+    args = [""]
+    for ch in text[start:]:
+        if ch == ")" and depth == 0:
+            break
+        if ch == "," and depth == 0:
+            args.append("")
+            continue
+        depth += {"(": 1, ")": -1}.get(ch, 0)
+        args[-1] += ch
+    return [arg.strip() for arg in args if arg.strip()]
 
 
 # pylint: disable=missing-class-docstring
@@ -130,6 +154,50 @@ class TestCallingConventionAnalysis(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_s390x_plt_without_cfg_jumpout(self):
+        binary_path = os.path.join(test_location, "s390x", "fauxware")
+        project = angr.Project(binary_path, auto_load_libs=False)
+        cfg = project.analyses.CFGFast(normalize=True, data_references=True)
+
+        puts = cfg.functions.function(name="puts", plt=True)
+        assert puts is not None
+        assert len(puts.jumpout_sites) == 0
+
+        cca = project.analyses.CallingConvention(puts, cfg=cfg.model)
+        assert isinstance(cca.cc, SimCCS390X)
+        assert cca.prototype is not None
+        assert len(cca.prototype.args) == 1
+        assert isinstance(cca.prototype.returnty, SimTypeInt)
+        assert cca.proto_from_symbol
+
+        plt_name = project.loader.find_plt_stub_name(puts.addr)
+        assert plt_name == "puts"
+        symbol = project.loader.find_symbol(plt_name)
+        assert symbol is not None
+        hooker = project.hooked_by(symbol.rebased_addr)
+        assert hooker is not None
+        hooker.cc = None
+
+        cca_with_default_cc = project.analyses.CallingConvention(puts, cfg=cfg.model)
+        assert isinstance(cca_with_default_cc.cc, SimCCS390X)
+        assert cca_with_default_cc.prototype is not None
+        assert cca_with_default_cc.proto_from_symbol
+
+        binary_path = os.path.join(test_location, "s390x", "simcc")
+        project = angr.Project(binary_path, auto_load_libs=False)
+        cfg = project.analyses.CFGFast(normalize=True, data_references=True)
+
+        printf_chk = cfg.functions.function(name="__printf_chk", plt=True)
+        assert printf_chk is not None
+        assert len(printf_chk.jumpout_sites) == 0
+
+        cca = project.analyses.CallingConvention(printf_chk, cfg=cfg.model)
+        assert isinstance(cca.cc, SimCCS390X)
+        assert cca.prototype is not None
+        assert len(cca.prototype.args) == 2
+        assert cca.prototype.variadic
+        assert cca.proto_from_symbol
 
     @requires_binaries_private
     def test_cgc_binary1(self):
@@ -982,6 +1050,96 @@ class TestCallingConventionAnalysis(unittest.TestCase):
             assert type(thunk.calling_convention) is SimCCStdcall
             assert thunk.prototype is not None and len(thunk.prototype.args) == arg_count
 
+    def test_ret_site_outside_the_local_graph(self):
+        # Two functions whose tails overlap share the ret instruction: the block holding it belongs to
+        # the other function, so the transition into it leaves this one. Function.normalize() splits
+        # our block at that boundary and moves its return-site flag onto the shared block, which the
+        # local transition graph does not contain. Guessing the return type must survive that.
+        binary_path = os.path.join(test_location, "x86_64", "fauxware")
+        proj = angr.Project(binary_path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+        func = cfg.functions[0x4007E0]  # __libc_csu_init
+        ret_block = func.ret_sites[0]
+        assert ret_block in func.graph
+
+        insn_addrs = proj.factory.block(ret_block.addr, size=ret_block.size).instruction_addrs
+        shared = BlockNode(insn_addrs[-1], ret_block.addr + ret_block.size - insn_addrs[-1])
+        entered_from = BlockNode(insn_addrs[-2], insn_addrs[-1] - insn_addrs[-2])
+        func.transit_to(entered_from, shared, outside=True, ins_addr=entered_from.addr)
+        func.normalize()
+        assert func.ret_sites == [shared]
+        assert shared not in func.graph
+
+        cca = proj.analyses.CallingConvention(func, cfg=cfg.model, analyze_callsites=False, collect_facts=True)
+        assert cca.prototype is not None
+
+    def test_callsite_args_exclude_indirect_call_target_register(self):
+        # each call jumps through the argument register after its last argument
+        cases = [
+            # BZ2_decompress: (strm->bzalloc)(strm->opaque, n, 1) through rcx
+            (
+                os.path.join(test_location, "x86_64", "decompiler", "decbench_bzip2_O2_noinline"),
+                0x40AE60,
+                [(0x40B133, 0x40B14E), (0x40C83E, 0x40C855)],
+                ["rdi", "rsi", "rdx"],
+            ),
+            # a three-argument call through r9 on Windows x64
+            (
+                os.path.join(
+                    test_location,
+                    "x86_64",
+                    "windows",
+                    "2ac79168ca17bfdbf70b591dc681114afc29f09aba0df978c3a7db6ed69a3b59",
+                ),
+                0x180011F4C,
+                [(0x180011F9F, 0x180011FA8)],
+                ["rcx", "rdx", "r8"],
+            ),
+        ]
+        for binary_path, caller_addr, callsites, expected_regs in cases:
+            proj, _ = load_project_with_scoped_cfg(binary_path, caller_addr, run_ccc=False)
+            for block_addr, call_insn_addr in callsites:
+                cca = proj.analyses.CallingConvention(
+                    None,
+                    analyze_callsites=True,
+                    caller_func_addr=caller_addr,
+                    callsite_block_addr=block_addr,
+                    callsite_insn_addr=call_insn_addr,
+                )
+                assert cca.cc is not None and cca.prototype is not None
+                assert _reg_names(cca.cc.arg_locs(cca.prototype)) == expected_regs, hex(call_insn_addr)
+
+    def test_callsite_args_after_indirect_call_target_register_are_kept(self):
+        # blx r1 after setting r0, the 64-bit pair r2:r3 and stack arguments: r1 is the register ARM skips before a
+        # 64-bit argument, and the compiler keeps the call target there
+        binary_path = os.path.join(test_location, "armel", "btrfs.ko")
+        proj, _ = load_project_with_scoped_cfg(binary_path, 0x457964, run_ccc=False)
+        cca = proj.analyses.CallingConvention(
+            None,
+            analyze_callsites=True,
+            caller_func_addr=0x457964,
+            callsite_block_addr=0x457A58,
+            callsite_insn_addr=0x457A74,
+        )
+        assert cca.cc is not None and cca.prototype is not None
+        locs = cca.cc.arg_locs(cca.prototype)
+        assert {"r0", "r2", "r3"} <= {loc.reg_name for loc in locs if isinstance(loc, SimRegArg)}
+        assert any(isinstance(loc, SimStackArg) for loc in locs)
+
+    def test_call_target_reg_on_riscv(self):
+        # the RISC-V lifter writes the target of c.jalr a5 (at 0x409406) to pc and jumps through pc
+        binary_path = os.path.join(test_location, "riscv", "borgbackup2-chunker.cpython-312-riscv64-linux-gnu.so")
+        proj, _ = load_project_with_scoped_cfg(binary_path, 0x4093E0, run_ccc=False)
+        cca = proj.analyses.CallingConvention(
+            None,
+            analyze_callsites=True,
+            caller_func_addr=0x4093E0,
+            callsite_block_addr=0x4093FE,
+            callsite_insn_addr=0x409406,
+        )
+        block = proj.kb.functions[0x4093E0].get_node(0x4093FE)
+        assert cca._call_target_reg_offset(block) == proj.arch.registers["a5"][0]  # pylint:disable=protected-access
+
     def test_amd64_mixed_int_fp_args_follow_library_prototype(self):
         # int and FP argument registers are separate sequences on SysV amd64; local functions named after libm
         # functions take their parameter order from the library prototype
@@ -1025,6 +1183,96 @@ class TestCallingConventionAnalysis(unittest.TestCase):
         assert func.prototype is not None
         assert _reg_names(func.calling_convention.arg_locs(func.prototype)) == ["rcx", "rdx"]
         assert isinstance(func.prototype.returnty, SimTypePointer)
+
+    def test_x86_msvc_whole_program_xmm_args(self):
+        # MSVC /GL + /LTCG passes a floating-point argument at position i of an internal function in xmm<i> and returns
+        # doubles in xmm0; tests_src/msvc_ltcg_xmm_args.c in the binaries repository
+        binary_path = os.path.join(test_location, "i386", "windows", "msvc_ltcg_xmm_args.exe")
+        proj = angr.Project(binary_path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+        proj.analyses.CompleteCallingConventions(workers=0)
+
+        expected = {
+            0x401000: ["ecx", "xmm1"],  # stats_add(stats_t *s, double v)
+            0x401020: ["xmm0", "xmm1", "xmm2"],  # lerp(double a, double b, double t)
+            # stride (always 2) is folded into store_scaled and never passed
+            0x401030: ["ecx", "xmm2", "xmm3"],  # store_scaled(int index, int stride, double scale, double bias)
+            0x401060: ["ecx"],  # mean(const stats_t *s)
+            0x401080: ["ecx"],  # spread(const stats_t *s) reads xmm0 only after mean returns in it
+            0x4010B0: ["xmm0"],  # floor_clamped(float f) reads f only through a full copy of xmm0
+            0x401120: [],  # entry
+        }
+        for addr, regs in expected.items():
+            func = proj.kb.functions[addr]
+            assert func.calling_convention is not None and func.prototype is not None, func.name
+            assert _reg_names(func.calling_convention.arg_locs(func.prototype)) == regs, (func.name, func.prototype)
+        lerp, floor_clamped = proj.kb.functions[0x401020].prototype, proj.kb.functions[0x4010B0].prototype
+        assert lerp is not None and all(isinstance(ty, SimTypeDouble) for ty in lerp.args)
+        assert floor_clamped is not None and [type(ty) for ty in floor_clamped.args] == [SimTypeFloat]
+        # add_pair(int a, int b) is __cdecl; a double its callee takes in xmm1 must not merge a and b into one double
+        add_pair = proj.kb.functions[0x4010F0].prototype
+        assert add_pair is not None and [type(ty) for ty in add_pair.args] == [SimTypeInt, SimTypeInt], add_pair
+        text = _decompiled_text(proj, 0x4010F0, cfg)
+        params = _call_args(text, "void sub_4010f0")
+        assert len(params) == 2 and not any("double" in param for param in params), text
+        # xmm7 holds no argument: only xmm0-xmm5 do, and no caller of stats_add writes xmm7
+        assert msvc_x86_xmm_arg_regs(proj) == [f"xmm{i}" for i in range(6)]
+        cca = proj.analyses[CallingConventionAnalysis].prep()(
+            proj.kb.functions[0x401000], input_args=[SimRegArg("ecx", 4), SimRegArg("xmm1", 8), SimRegArg("xmm7", 8)]
+        )
+        assert cca.cc is not None and cca.prototype is not None
+        assert _reg_names(cca.cc.arg_locs(cca.prototype)) == ["ecx", "xmm1"]
+        facts = proj.analyses[FactCollector].prep()(proj.kb.functions[0x401080])
+        assert facts.input_args is not None
+        assert not [arg for arg in facts.input_args if isinstance(arg, SimRegArg) and arg.reg_name.startswith("xmm")]
+
+        text = _decompiled_text(proj, 0x401120, cfg)
+        assert len(_call_args(text, "sub_401000")) == 2, text
+        assert len(_call_args(text, "sub_401020")) == 3, text
+        assert len(_call_args(text, "sub_401030")) == 3, text
+
+    def test_x86_msvc_xmm_args_leave_no_stack_placeholders(self):
+        # sub_43b265 stores xmm2 and xmm3 through edi and jumps to a shared tail that ends in a plain ret, popping no
+        # arguments. The positions below xmm2 that it never reads must not become stack arguments, or every caller
+        # expects a cleanup that never happens
+        binary_path = os.path.join(
+            test_location, "i386", "windows", "a71a3c3b922705cb5e2d8aa9c74f5c73c47fb27f10b1327eb2bb054d99a14397"
+        )
+        proj = angr.Project(binary_path, auto_load_libs=False)
+        # only this function's bytes: the tail it jumps to pops the registers of the function it was split from
+        cfg = proj.analyses.CFGFast(
+            normalize=True,
+            regions=[(0x43B265, 0x43B26E)],
+            function_starts=[0x43B265],
+            start_at_entry=False,
+            force_complete_scan=False,
+            symbols=False,
+            function_prologues=False,
+        )
+        proj.analyses.CompleteCallingConventions(cfg=cfg.model)
+        func = proj.kb.functions[0x43B265]
+        assert func.calling_convention is not None and func.prototype is not None
+        assert _reg_names(func.calling_convention.arg_locs(func.prototype)) == ["xmm2", "xmm3"]
+
+    def test_x86_msvc_xmm_arg_callers_load_register(self):
+        # pylint: disable=protected-access
+        # when a function has callers, an xmm register it reads stays an argument only if most of the sites that call
+        # it load the register shortly before the call
+        binary_path = os.path.join(test_location, "i386", "windows", "msvc_ltcg_xmm_args.exe")
+        proj = angr.Project(binary_path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+        proj.analyses.CompleteCallingConventions()
+        cca = proj.analyses[CallingConventionAnalysis].prep()(proj.kb.functions[0x401030], cfg=cfg.model)
+        # the entry point loads xmm2 in the block that calls store_scaled, and xmm3 in the block before, ahead of the
+        # call to lerp; it never writes xmm5
+        assert cca._callers_load_register("xmm2")
+        assert cca._callers_load_register("xmm3")
+        assert not cca._callers_load_register("xmm5")
+        # the entry point and add_pair both load xmm1 before calling stats_add
+        cca = proj.analyses[CallingConventionAnalysis].prep()(proj.kb.functions[0x401000], cfg=cfg.model)
+        sites = cca._caller_sites(0x401000)
+        assert sites is not None and len(sites) == 2
+        assert cca._callers_load_register("xmm1")
 
 
 if __name__ == "__main__":
