@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "81084450315a130502c3b478a06a223d9f9058de",
-      "committed_at": "2026-11-13T14:47:17-07:00",
-      "subject": "clarirs: fix annotations inheritance type issue (#7786)",
+      "commit": "fc720ef8ebea21680d0432dcb3adb5ad24b2b14a",
+      "committed_at": "2026-11-16T08:29:13-07:00",
+      "subject": "clarirs: Check the rotate-mask shift sum for overflow (#7795)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -68,9 +68,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "49cc2f7cb0e7f80153e7881b68d7f02257affc5d",
-      "committed_at": "2026-11-13T19:33:49Z",
-      "subject": "Update version to 10.0.8.dev0 [ci skip]",
+      "commit": "ea4eae935e2f6ebb5d7bc03c3e8c6f5c6c37aa4d",
+      "committed_at": "2026-11-14T13:15:45-07:00",
+      "subject": "ELF: fix DWARF 5 source file lookups (#879)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,7 +123,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-13T22:41:26+00:00",
+  "imported_at": "2026-11-16T15:40:39+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
