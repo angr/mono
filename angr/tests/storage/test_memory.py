@@ -2,12 +2,13 @@
 # pylint: disable=missing-class-docstring,no-self-use,line-too-long
 from __future__ import annotations
 
+import os
 import time
 import unittest
 
 from archinfo import ArchAMD64
 
-from angr import SIM_PROCEDURES, SimState, claripy
+from angr import SIM_PROCEDURES, Project, SimState, claripy
 from angr import options as o
 from angr.claripy.annotation import UninitializedAnnotation
 from angr.errors import SimMemoryError
@@ -25,7 +26,7 @@ from angr.storage.memory_mixins import (
 )
 from angr.storage.memory_mixins.paged_memory.pages.multi_values import MultiValues
 from angr.storage.memory_mixins.paged_memory.pages.symbolic_bitmap import SymbolicBitmap
-from tests.common import minimal_project
+from tests.common import bin_location, minimal_project
 
 
 class UltraPageMemory(
@@ -494,6 +495,31 @@ class TestMemory(unittest.TestCase):
         assert not s.solver.symbolic(expr)
         assert s.solver.eval(expr) == 0x00000031
 
+    def test_partial_instruction_pointer_read_then_whole_register(self):
+        proj = Project(os.path.join(bin_location, "tests", "x86_64", "fauxware"), auto_load_libs=False)
+        ip_offset, ip_size = proj.arch.registers["ip"]
+
+        # A read that covers part of the instruction pointer fills only what it covers, so the
+        # bytes above it are still missing when the next read asks for the whole register.
+        for size in range(1, ip_size + 1):
+            with self.subTest(size=size):
+                s = SimState(project=proj)
+                assert s.registers.load(ip_offset, size).size() == size * proj.arch.byte_width
+                assert s.registers.load("ip").size() == ip_size * proj.arch.byte_width
+
+    def test_instruction_pointer_wider_than_the_address_space(self):
+        # MIPS n32 keeps the 64-bit MIPS64 register file behind 32-bit pointers, so its instruction
+        # pointer is 8 bytes wide while arch.bits is 32.
+        proj = Project(os.path.join(bin_location, "tests", "mipsn32", "n32_be_static"), auto_load_libs=False)
+        ip_bits = proj.arch.registers["ip"][1] * proj.arch.byte_width
+        assert ip_bits > proj.arch.bits
+
+        s = SimState(project=proj)
+        assert s.registers.load("ip").size() == ip_bits
+        assert s.registers.load("ip").size() == ip_bits
+        # Asking a fresh state where it is reads the whole register through the solver.
+        assert SimState(project=proj).addr == 0
+
     def test_fullpage_write(self):
         s = SimState(project=minimal_project("AMD64"))
         a = claripy.BVV(b"A" * 0x2000)
@@ -860,6 +886,16 @@ class TestMemory(unittest.TestCase):
         mv = s.memory.concrete_load(0x100000 + 0xFFA, 400)
         assert len(mv) == 400, "Loading data across non-physically adjacent pages failed for ultra pages."
         assert mv == (b"\x01" * 6) + (b"\x02" * 394)
+
+    def test_symbolic_load_past_object_end(self):
+        state = SimState(project=minimal_project("AMD64"), mode="symbolic")
+        value = claripy.BVS("value", 32)
+        state.memory.store(0x20000, value, endness="Iend_BE")
+
+        result = state.memory.load(0x20003, 4, endness="Iend_BE")
+
+        assert result.size() == 32
+        assert state.solver.is_true(result.get_byte(0) == value.get_byte(3))
 
     def test_hex_dump(self):
         s = SimState(project=minimal_project("AMD64"))
