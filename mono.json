@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "940ef9a89ec76ebddba96feea882f9e312c8aa86",
-      "committed_at": "2026-11-13T19:33:44Z",
-      "subject": "Update version to 10.0.8.dev0 [ci skip]",
+      "commit": "a2bac0c8230e2afa0306215f4eb0da2a5b82787b",
+      "committed_at": "2026-11-17T10:20:47-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#1761)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -123,7 +123,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-17T15:28:03+00:00",
+  "imported_at": "2026-11-17T18:02:49+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
