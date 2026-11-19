@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "605ea9233f4b2b200cff33ed43ddbc0294e6050e",
-      "committed_at": "2026-11-17T07:02:59-07:00",
-      "subject": "ailment: Use serde derive macros instead of hand impls (#7808)",
+      "commit": "80c962c99a8d487e75acdfba7a2bcf01a5abfb93",
+      "committed_at": "2026-11-18T12:01:07-07:00",
+      "subject": "unicorn: test fauxware for armhf in unicorn engine (#7814)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "940ef9a89ec76ebddba96feea882f9e312c8aa86",
-      "committed_at": "2026-11-13T19:33:44Z",
-      "subject": "Update version to 10.0.8.dev0 [ci skip]",
+      "commit": "a2bac0c8230e2afa0306215f4eb0da2a5b82787b",
+      "committed_at": "2026-11-17T10:20:47-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#1761)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -60,9 +60,9 @@
     },
     "claripy": {
       "upstream": "https://github.com/angr/claripy",
-      "commit": "7f18316ee5b76ce45904925052bd437124ad104a",
-      "committed_at": "2026-11-11T11:14:33-07:00",
-      "subject": "Bump soupsieve from 2.8.4 to 2.9 (#746)",
+      "commit": "26baf5b5036a6a7f87d702f0e7888f96459c82a9",
+      "committed_at": "2026-11-17T14:06:23-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#753)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -123,7 +123,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-17T15:28:03+00:00",
+  "imported_at": "2026-11-19T09:22:09+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
