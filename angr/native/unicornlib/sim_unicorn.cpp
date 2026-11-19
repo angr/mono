@@ -201,7 +201,7 @@ void State::stop(stop_t reason, bool do_commit) {
 bool State::step(address_t current_address, int32_t size, bool check_stop_points) {
         bool result = false;
 	if (track_bbls) {
-		bbl_addrs.push_back(current_address);
+		bbl_addrs.push_back(to_angr_block_address(current_address));
 	}
 	if (track_stack) {
 		stack_pointers.push_back(get_stack_pointer());
@@ -342,7 +342,9 @@ void State::commit() {
 		}
 		blocks_with_symbolic_stmts.emplace_back(curr_block_details);
 	}
-	if (curr_block_details.block_addr == trace_last_block_addr) {
+	// The last block of the trace may or may not have the THUMB bit set
+	address_t thumb_bit = (arch == UC_ARCH_ARM) ? 1 : 0;
+	if ((curr_block_details.block_addr | thumb_bit) == (trace_last_block_addr | thumb_bit)) {
 		trace_last_block_curr_count += 1;
 	}
 	// Update details of concrete writes to re-execute
@@ -1709,7 +1711,7 @@ VEXLiftResult* State::lift_block(address_t block_address, int32_t block_size) {
 		const int post_slack = 8;
 		std::unique_ptr<uint8_t[]> instructions(new uint8_t[pre_slack + block_size + post_slack]);
 		std::memset(instructions.get(), 0, pre_slack + block_size + post_slack);
-		uc_mem_read(this->uc, block_address, instructions.get() + pre_slack, block_size);
+		uc_mem_read(this->uc, block_address & ~1ULL, instructions.get() + pre_slack, block_size);
 		lift_address = block_address | 1;
 		insn_start = instructions.get() + pre_slack + 1;
 		return vex_lift(vex_guest, vex_archinfo, insn_start, lift_address, 99, block_size,
@@ -2158,6 +2160,7 @@ void State::propagate_taint_of_one_stmt(const vex_stmt_taint_entry_t &vex_stmt_t
 	}
 	is_stmt_symbolic = false;
 	vex_stmt_details = compute_vex_stmt_details(vex_stmt_taint_entry);
+	auto ite_cond_taint_status = get_final_taint_status(vex_stmt_taint_entry.ite_cond_entity_list);
 	if (taint_sink.entity_type == TAINT_ENTITY_MEM) {
 		vex_stmt_details.has_memory_write = true;
 		auto addr_taint_status = get_final_taint_status(taint_sink.mem_ref_entity_list);
@@ -2172,6 +2175,9 @@ void State::propagate_taint_of_one_stmt(const vex_stmt_taint_entry_t &vex_stmt_t
 			}
 		}
 		auto sink_taint_status = get_final_taint_status(taint_srcs);
+		if (sink_taint_status == TAINT_STATUS_CONCRETE) {
+			sink_taint_status = ite_cond_taint_status;
+		}
 		if (sink_taint_status == TAINT_STATUS_DEPENDS_ON_READ_FROM_SYMBOLIC_ADDR) {
 			if (handle_symbolic_addrs) {
 				is_stmt_symbolic = true;
@@ -2197,6 +2203,9 @@ void State::propagate_taint_of_one_stmt(const vex_stmt_taint_entry_t &vex_stmt_t
 	}
 	else if ((taint_sink.entity_type != TAINT_ENTITY_NONE) || vex_stmt_taint_entry.is_exit) {
 		taint_status_result_t final_taint_status = get_final_taint_status(taint_srcs);
+		if (final_taint_status == TAINT_STATUS_CONCRETE) {
+			final_taint_status = ite_cond_taint_status;
+		}
 		if (final_taint_status == TAINT_STATUS_DEPENDS_ON_READ_FROM_SYMBOLIC_ADDR) {
 			if (handle_symbolic_addrs) {
 				is_stmt_symbolic = true;
@@ -2229,7 +2238,6 @@ void State::propagate_taint_of_one_stmt(const vex_stmt_taint_entry_t &vex_stmt_t
 			mark_register_concrete(taint_sink.reg_offset, taint_sink.value_size);
 		}
 	}
-	auto ite_cond_taint_status = get_final_taint_status(vex_stmt_taint_entry.ite_cond_entity_list);
 	if (ite_cond_taint_status != TAINT_STATUS_CONCRETE) {
 		is_stmt_symbolic = true;
 	}
@@ -2433,7 +2441,7 @@ bool State::is_block_next_target_symbolic() const {
 }
 
 void State::set_curr_block_details(address_t block_address, int32_t block_size) {
-	curr_block_details.block_addr = block_address;
+	curr_block_details.block_addr = to_angr_block_address(block_address);
 	curr_block_details.block_size = block_size;
 	return;
 }
