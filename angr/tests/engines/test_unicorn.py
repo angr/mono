@@ -191,7 +191,13 @@ class TestUnicorn(unittest.TestCase):
         self._run_longinit("x86_64")
 
     def test_fauxware_arm(self):
-        p = angr.Project(os.path.join(test_location, "armel", "fauxware"), auto_load_libs=False)
+        self._run_fauxware_arm("armel")
+
+    def test_fauxware_armhf(self):
+        self._run_fauxware_arm("armhf")
+
+    def _run_fauxware_arm(self, arch):
+        p = angr.Project(os.path.join(test_location, arch, "fauxware"), auto_load_libs=False)
         s_unicorn = p.factory.entry_state(add_options=so.unicorn)  # unicorn
         pg = p.factory.simulation_manager(s_unicorn)
         pg.explore()
@@ -465,6 +471,27 @@ class TestUnicorn(unittest.TestCase):
         assert len(pg_explore_avoid.avoid) == 1
         assert pg_explore_avoid.avoid[0].addr == addr
 
+    def test_thumb_block_addrs(self):
+        """
+        Test if the addresses of THUMB blocks executed in unicorn engine have the THUMB bit set.
+        """
+
+        code = """
+            movs r0, #5
+            b next
+        next:
+            adds r0, #1
+            b last
+        last:
+            adds r0, #1
+        """
+        p = angr.load_shellcode(code, "armel", load_address=0x10000, thumb=True)
+        state = p.factory.blank_state(addr=0x10001, add_options=so.unicorn)
+        state.unicorn.max_steps = 2
+        successors = state.step()
+        assert successors.description.startswith("Unicorn")
+        assert successors.successors[0].history.recent_bbl_addrs == [0x10001, 0x10005]
+
     def test_single_step(self):
         p = angr.Project(os.path.join(test_location, "i386", "uc_stop"), auto_load_libs=False)
 
@@ -502,6 +529,30 @@ class TestUnicorn(unittest.TestCase):
                 break
 
         assert result == b"FLAG{l00ps_4r3_t00_34sy_r1gh7??}"
+
+    def test_symbolic_condition_of_select(self):
+        """
+        Test if a value selected using a symbolic condition is symbolic even if the values to select from are concrete.
+        """
+
+        code = """
+            mov rax, 1
+            mov rbx, 2
+            cmp rdi, 5
+            cmove rax, rbx
+            jmp next
+        next:
+            nop
+        """
+        p = angr.load_shellcode(code, "amd64", load_address=0x400000)
+        state = p.factory.blank_state(addr=0x400000, add_options=so.unicorn)
+        state.regs.rdi = claripy.BVS("x", 64)
+        state.unicorn.max_steps = 1
+        successors = state.step()
+        assert successors.description.startswith("Unicorn")
+        succ = successors.successors[0]
+        assert succ.solver.eval_one(succ.regs.rax, extra_constraints=[succ.regs.rdi == 5]) == 2
+        assert succ.solver.eval_one(succ.regs.rax, extra_constraints=[succ.regs.rdi == 6]) == 1
 
     def test_symbolic_flags_thunk_preserved_on_setup(self):
         """
@@ -575,6 +626,24 @@ class TestUnicorn(unittest.TestCase):
             before = state.copy()
             state.unicorn.setup_flags()
             assert not state.solver.satisfiable(extra_constraints=[state.regs.flags != before.regs.flags])
+
+    def test_thumb_pc_synced_on_stop(self):
+        """
+        Test if the state is still in THUMB mode after unicorn engine stops.
+        """
+
+        code = """
+            movs r0, #5
+            b next
+        next:
+            adds r0, #1
+        """
+        p = angr.load_shellcode(code, "armel", load_address=0x10000, thumb=True)
+        state = p.factory.blank_state(addr=0x10001, add_options=so.unicorn)
+        state.unicorn.max_steps = 1
+        successors = state.step()
+        assert successors.description.startswith("Unicorn")
+        assert successors.successors[0].addr == 0x10005
 
     def test_vex_archinfo_ctypes_mirror_matches_native(self):
         """
