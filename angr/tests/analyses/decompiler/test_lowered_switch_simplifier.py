@@ -7,10 +7,17 @@ __package__ = __package__ or "tests.analyses.decompiler"  # pylint:disable=redef
 import os
 import re
 import unittest
+from typing import Any, cast
 
 import angr
+from angr.ailment import Block, Manager
+from angr.ailment.expression import Register
+from angr.analyses.decompiler import Decompiler
 from angr.analyses.decompiler.optimization_passes import LoweredSwitchSimplifier
 from angr.analyses.decompiler.presets import DECOMPILATION_PRESETS
+from angr.analyses.decompiler.structurer_nodes import IncompleteSwitchCaseHeadStatement
+from angr.analyses.decompiler.variable_map import VariableMap
+from angr.sim_variable import SimRegisterVariable
 from tests.common import bin_location, load_project_with_scoped_cfg
 
 test_location = os.path.join(bin_location, "tests")
@@ -56,6 +63,38 @@ SWITCH_TREE_CODE = bytes.fromhex(
 
 
 class TestLoweredSwitchSimplifier(unittest.TestCase):
+    def test_incomplete_switch_head_deep_copy_contract(self):
+        manager = Manager()
+        manager.variable_map = VariableMap()
+        switch_variable = Register(manager.next_atom(), 8, 64)
+        case_addrs = [(Block(0x400000, 4), 1, 0x400010, 0, 0x400020)]
+        statement = IncompleteSwitchCaseHeadStatement(
+            manager.next_atom(),
+            switch_variable,
+            case_addrs,
+            peephole_optimized=True,
+            ins_addr=0x400000,
+        )
+        variable = SimRegisterVariable(8, 8, ident="reg_1")
+        manager.variable_map.set_variable(statement, variable, 4)
+        manager.variable_map.set_variable(switch_variable, variable, 0)
+
+        copied = Block(0x400000, 4, statements=cast(Any, [statement])).deep_copy(manager).statements[0]
+
+        assert isinstance(copied, IncompleteSwitchCaseHeadStatement)
+        assert copied.idx != statement.idx
+        assert copied.switch_variable is not statement.switch_variable
+        assert copied.switch_variable.idx != statement.switch_variable.idx
+        assert copied.case_addrs == statement.case_addrs
+        assert copied.case_addrs is not statement.case_addrs
+        copied.case_addrs.append((Block(0x400030, 4), "default", 0x400040, 0, 0x400050))
+        assert len(statement.case_addrs) == 1
+        assert copied.tags == statement.tags
+        assert not copied.peephole_optimized
+        assert manager.variable_map.variable(copied) is variable
+        assert manager.variable_map.variable_offset(copied) == 4
+        assert manager.variable_map.variable(copied.switch_variable) is variable
+
     def test_sorted_o0_chain_with_dead_gt_branches(self):
         # human_fstype() from coreutils stat at -O0: a sparse 130-case switch lowered into a sorted chain where gcc
         # emits one "eq" node and one "gt" node per case, and every "gt" node jumps to the default. the "gt" node
@@ -80,6 +119,27 @@ class TestLoweredSwitchSimplifier(unittest.TestCase):
         assert "default:" in text and "if (" not in text, text
         for value in (0xFF534D42, 0x2F, 0x33):
             assert re.search(rf"case {value}:\n\s+return ", text), text
+
+    def test_replaced_shared_case_head(self):
+        bin_path = os.path.join(test_location, "x86_64", "decompiler", "lowered_switch_shared_head.o")
+        project = angr.Project(bin_path, auto_load_libs=False)
+        cfg = project.analyses.CFGFast(normalize=True, data_references=True)
+        passes = DECOMPILATION_PRESETS["full"].get_optimization_passes(
+            "AMD64", "linux", additional_opts=[LoweredSwitchSimplifier]
+        )
+
+        decompilation = project.analyses[Decompiler].prep(fail_fast=True)(
+            cfg.functions["shared_switch"],
+            cfg=cfg.model,
+            optimization_passes=passes,
+        )
+
+        self.assertFalse(decompilation.errors)
+        self.assertIsNotNone(decompilation.codegen)
+        assert decompilation.codegen is not None
+        self.assertIsNotNone(decompilation.codegen.text)
+        assert decompilation.codegen.text is not None
+        self.assertEqual(decompilation.codegen.text.count("switch ("), 4)
 
     def test_comparison_chain_with_back_edges_terminates(self):
         proj = angr.load_shellcode(CHAR_SCAN_LOOP_CODE, "AMD64", load_address=0x4A7F32)
@@ -127,9 +187,11 @@ class TestLoweredSwitchSimplifier(unittest.TestCase):
         assert dec.codegen is not None and dec.codegen.text is not None
         assert "switch (" in dec.codegen.text
 
-    def test_orphaned_chain_is_removed_entirely(self):
-        # the same shape at -O2, where the orphaned chain is long enough that stopping at the immediate
-        # successors leaves nodes unreachable from the function entry and the structurer gives up on them.
+    def test_branch_through_a_comparison_of_another_variable_is_kept(self):
+        # string_modifier_check() of file 5.45, inlined into parse(), switches on m->type. its comparison tree
+        # sends 18 and 19 (FILE_BESTRING16 and FILE_LESTRING16) to a test of m->str_flags rather than to a case
+        # body, and that branch warns "no modifiers allowed for 16-bit strings". a switch with no case for the
+        # branch must not replace the tree, or the warning is deleted along with the comparison nodes.
         proj, cfg = load_project_with_scoped_cfg(
             os.path.join(test_location, "x86_64", "file_gcc13.3.0_O2"), 0x4091D0, window=0x3000
         )
@@ -139,6 +201,7 @@ class TestLoweredSwitchSimplifier(unittest.TestCase):
         assert not dec.errors
         assert dec.codegen is not None and dec.codegen.text is not None
         assert "switch (" in dec.codegen.text
+        assert "no modifiers allowed for 16-bit strings" in dec.codegen.text
 
     def test_floating_point_comparisons_are_not_switch_cases(self):
         # each function tests one float against +inf and then -inf, with a distinct body per test. switch case
