@@ -11,6 +11,8 @@ import unittest
 from collections import OrderedDict
 from unittest import mock
 
+import networkx
+
 import angr
 from angr.ailment.expression import VirtualVariable, VirtualVariableCategory
 from angr.angrdb import AngrDB
@@ -149,6 +151,30 @@ class TestVariableManager(unittest.TestCase):
         vmi.make_phi_node(0x400000, SimStackVariable(-16, 8, ident="is_2"), SimStackVariable(-16, 8, ident="is_3"))
         assert vmi.same_offset_stack_vvarids() == {1, 2, 3}
 
+    def test_unify_variables_with_a_global_phi_subvariable(self):
+        p = angr.Project(os.path.join(test_location, "x86_64", "fauxware"), auto_load_libs=False)
+        varman = p.kb.variables.get_function_manager(0x400000)
+
+        first = SimRegisterVariable(16, 8, ident=varman.next_variable_ident("register"))
+        second = SimRegisterVariable(16, 8, ident=varman.next_variable_ident("register"))
+        for variable in (first, second):
+            varman.add_variable("register", variable.reg, variable)
+
+        global_manager = p.kb.variables["global"]
+        global_ = SimMemoryVariable(0xBA3B648F, 4, ident=global_manager.next_variable_ident("global"))
+        global_manager.set_variable("global", global_.addr, global_)
+
+        phi = varman.make_phi_node(0x400100, first, second)
+        assert isinstance(phi, SimRegisterVariable)
+        assert varman.make_phi_node(0x400100, first, global_) is phi
+        assert global_ in varman.get_phi_subvariables(phi)
+        assert global_ not in varman.get_variables()
+
+        varman.unify_variables(interference=networkx.Graph())
+
+        assert varman.unified_variable(global_) is None
+        assert varman.unified_variable(first) is not None
+
     def test_combo_register_variable_serialization_roundtrip(self):
         # a SimComboRegisterVariable (a value spanning several registers) survives serialize()/parse() as a regular,
         # a phi, and a unified variable, with all of its register offsets
@@ -257,6 +283,26 @@ class TestVariableManager(unittest.TestCase):
 
         check_supersede(vmi)
         check_supersede(vmi2)
+
+    def test_record_equal_variable_from_another_function(self):
+        # _ensure_variable_existence() records a one-byte temporary for a stack slot whose address is taken, reading the
+        # variable back out of a claripy annotation, and claripy can hand back an equal annotation from another
+        # function's analysis (SimStackVariable equality ignores the region). _post_analysis() later drops the
+        # temporary through rebind_variable_records(), which re-points records by identity, so the manager must record
+        # its own variable or the other function's stays linked to the atom.
+        p = angr.Project(os.path.join(test_location, "x86_64", "fauxware"), auto_load_libs=False)
+        func_addr, other_addr = 0x400000, 0x400100
+        vmi = p.kb.variables.get_function_manager(func_addr)
+        tmp = SimStackVariable(0, 1, base="bp", ident="is_1", region=func_addr)
+        vmi.add_variable("stack", 0, tmp)
+        atom = VirtualVariable(1, 1, 64, VirtualVariableCategory.STACK, oident=0)
+        other = SimStackVariable(0, 1, base="bp", ident="is_1", region=other_addr)
+        vmi.record_variable(CodeLocation(func_addr, 1, ins_addr=func_addr), other, None, atom=atom)
+
+        real = SimStackVariable(0, 8, base="bp", ident="is_2", region=func_addr)
+        vmi.add_variable("stack", 0, real)
+        vmi.rebind_variable_records(tmp, real)
+        assert [v for v, _ in vmi.find_variables_by_atom(func_addr, 1, atom)] == [real]
 
     def test_flavor_roundtrip(self):
         p = angr.load_shellcode(b"\x90", arch="AMD64")
