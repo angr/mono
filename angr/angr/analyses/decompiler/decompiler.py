@@ -53,7 +53,7 @@ from .structured_codegen.rust import RustStructuredCodeGenerator
 from .structurer_nodes import SequenceNode
 from .structuring import DEFAULT_STRUCTURER, PhoenixStructurer, RecursiveStructurer
 from .structuring.phoenix import MultiStmtExprMode
-from .utils import remove_edges_in_ailgraph
+from .utils import remove_edges_in_ailgraph, type_fits_variable
 from .variable_map import VariableMap
 
 if TYPE_CHECKING:
@@ -748,6 +748,12 @@ class Decompiler(Analysis):
                     binop_depth_cutoff=self.expr_collapse_depth,
                     notes=self.notes,
                     **self.options_to_params(self.options_by_class["codegen"]),
+                    **(
+                        {"func_prototype": clinic.decompiled_prototype}
+                        if clinic.hidden_result_pointer_upgraded
+                        and issubclass(self._codegen_cls, CStructuredCodeGenerator)
+                        else {}
+                    ),
                 )
 
         self.seq_node = seq_node
@@ -1059,6 +1065,8 @@ class Decompiler(Analysis):
             func_proto = self.func.get_prototype(self._flavor)
             if (
                 not self.func.is_prototype_groundtruth_for(self._flavor)
+                # an upgraded prototype may no longer match the decompiled arguments
+                and not (self.clinic is not None and self.clinic.hidden_result_pointer_upgraded)
                 and func_proto is not None
                 and func_proto.args
                 and isinstance(codegen, CStructuredCodeGenerator)
@@ -1072,7 +1080,8 @@ class Decompiler(Analysis):
                         break
                     var = arg.variable
                     new_type = var_manager.get_variable_type(var)
-                    if new_type is not None:
+                    if new_type is not None and type_fits_variable(new_type, var, self.project.arch):
+                        # resilience: reject types that are wider than the variable itself
                         new_args[i] = new_type
                 if new_args != list(func_proto.args):
                     func_proto = func_proto.copy()

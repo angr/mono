@@ -9,6 +9,8 @@ mod test_bool;
 mod test_bv;
 #[cfg(test)]
 mod test_float;
+#[cfg(test)]
+mod test_string;
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, atomic::Ordering};
@@ -59,9 +61,18 @@ struct SimplifyState<'c> {
 
 impl<'c> SimplifyState<'c> {
     fn new(expr: AstRef<'c>) -> Self {
+        // A child that is already its own simplified form is filled in up front.
+        let children = expr
+            .child_iter()
+            .map(|child| {
+                (!child.has_blocking_annotations
+                    && child.simplified.load(Ordering::Relaxed) == child.hash())
+                .then_some(child)
+            })
+            .collect();
         Self {
-            expr: expr.clone(),
-            children: vec![None; expr.child_iter().count()],
+            expr,
+            children,
             missed: Vec::new(),
         }
     }
@@ -127,18 +138,19 @@ fn simplify<'c>(
             state.children[idx] = results.pop();
         }
 
-        let blocked = state
-            .expr
-            .annotations()
-            .iter()
-            .any(|a| !a.eliminatable() && !a.relocatable())
-            || !state.expr.simplifiable();
+        let blocked = !state.expr.simplifiable()
+            || state
+                .expr
+                .annotations()
+                .iter()
+                .any(|a| a.blocks_simplification());
         let should_simplify = !respect_annotations || !blocked;
         if should_simplify {
             // Reuse the inline-cached simplified form if present (`0` = none;
             // a dropped node resolves to a miss via the AST cache).
             let cached = match state.expr.simplified.load(Ordering::Relaxed) {
                 0 => None,
+                hash if hash == state.expr.hash() => Some(state.expr.clone()),
                 hash => state.expr.context().ast_cache.get(&hash),
             };
             let inner_result = match cached {
@@ -152,30 +164,51 @@ fn simplify<'c>(
             };
             match inner_result {
                 Ok(result) => {
-                    let mut new_annotations: BTreeSet<Annotation> = result
-                        .annotations()
-                        .iter()
-                        .filter(|a| !a.relocatable())
-                        .cloned()
-                        .collect();
-                    new_annotations.extend(
-                        state
-                            .expr
+                    // The result keeps its own non-relocatable annotations and takes over
+                    // the relocatable ones of the node it replaces. Only rebuild the node
+                    // when that changes its annotation set.
+                    let annotated = if Arc::ptr_eq(&result, &state.expr)
+                        || (result.annotations().is_empty() && state.expr.annotations().is_empty())
+                    {
+                        result
+                    } else {
+                        let mut new_annotations: BTreeSet<Arc<Annotation>> = result
                             .annotations()
                             .iter()
-                            .filter(|a| a.relocatable())
-                            .cloned(),
-                    );
-                    let annotated = state
-                        .expr
-                        .context()
-                        .make_ast_exact(result.op().clone(), new_annotations)?;
+                            .filter(|a| !a.relocatable())
+                            .cloned()
+                            .collect();
+                        new_annotations.extend(
+                            state
+                                .expr
+                                .annotations()
+                                .iter()
+                                .filter(|a| a.relocatable())
+                                .cloned(),
+                        );
+                        if new_annotations == *result.annotations() {
+                            result
+                        } else {
+                            state
+                                .expr
+                                .context()
+                                .make_ast_exact(result.op().clone(), new_annotations)?
+                        }
+                    };
 
                     // Cache the simplified form for shared sub-exprs.
                     state
                         .expr
                         .simplified
                         .store(annotated.as_ref().hash(), Ordering::Relaxed);
+                    if !annotated.has_blocking_annotations {
+                        let _ = annotated.simplified.compare_exchange(
+                            0,
+                            annotated.hash(),
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
+                    }
 
                     keep_alive.push(annotated.clone());
                     keep_alive.push(state.expr);
@@ -200,7 +233,7 @@ fn simplify<'c>(
                 Err(SimplifyError::ReRun(new_ast)) => {
                     // Forward the rewritten node's relocatable annotations onto the
                     // rewritten expression so they are not dropped across the rerun.
-                    let relocatable_annotations: Vec<Annotation> = state
+                    let relocatable_annotations: Vec<Arc<Annotation>> = state
                         .expr
                         .annotations()
                         .iter()
@@ -230,4 +263,39 @@ fn simplify<'c>(
     results
         .pop()
         .ok_or_else(|| ClarirsError::InvalidArguments("No result produced".to_string()))
+}
+
+/// Simplifies an ITE of any sort with the rewrites every sort shares.
+fn simplify_ite<'c>(state: &SimplifyState<'c>) -> Result<AstRef<'c>, SimplifyError<'c>> {
+    let ctx = state.expr.context();
+    let cond = state.get_child_simplified(0)?;
+
+    // Rewrites that need at most one branch simplified.
+    match cond.op() {
+        AstOp::BoolV(true) => return state.get_child_simplified(1),
+        AstOp::BoolV(false) => return state.get_child_simplified(2),
+        _ if state.get_child_available(1) == state.get_child_available(2) => {
+            return state.get_child_simplified(1);
+        }
+        // If(!c, a, b) -> If(c, b, a)
+        AstOp::Not(inner) => {
+            return state.rerun(ctx.ite(
+                inner,
+                state.get_child_available(2),
+                state.get_child_available(1),
+            )?);
+        }
+        _ => {}
+    }
+
+    let then_ = state.get_child_simplified(1)?;
+    let else_ = state.get_child_simplified(2)?;
+    match (then_.op(), else_.op()) {
+        _ if then_ == else_ => Ok(then_),
+        // If(c, If(c, a, b), d) -> If(c, a, d) and If(c, d, If(c, a, b)) -> If(c, d, b), as
+        // claripy's If() constructor does: the inner branch not selected under c is dead.
+        (AstOp::ITE(c, a, _), _) if *c == cond => state.rerun(ctx.ite(&cond, a, &else_)?),
+        (_, AstOp::ITE(c, _, b)) if *c == cond => state.rerun(ctx.ite(&cond, &then_, b)?),
+        _ => Ok(ctx.ite(cond, then_, else_)?),
+    }
 }

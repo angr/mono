@@ -46,7 +46,9 @@ pub(crate) fn simplify_float<'c>(
             let lhs = state.get_child_simplified(0)?;
             let rhs = state.get_child_simplified(1)?;
             match (lhs.op(), rhs.op()) {
-                (AstOp::FPV(float1), AstOp::FPV(float2)) => Ok(ctx.fpv(*float1 + *float2)?),
+                (AstOp::FPV(float1), AstOp::FPV(float2)) => {
+                    Ok(ctx.fpv(float1.add_rm(float2, *fprm)?)?)
+                }
                 _ => Ok(ctx.fp_add(lhs, rhs, *fprm)?),
             }
         }
@@ -54,7 +56,9 @@ pub(crate) fn simplify_float<'c>(
             let lhs = state.get_child_simplified(0)?;
             let rhs = state.get_child_simplified(1)?;
             match (lhs.op(), rhs.op()) {
-                (AstOp::FPV(float1), AstOp::FPV(float2)) => Ok(ctx.fpv(*float1 - *float2)?),
+                (AstOp::FPV(float1), AstOp::FPV(float2)) => {
+                    Ok(ctx.fpv(float1.sub_rm(float2, *fprm)?)?)
+                }
                 _ => Ok(ctx.fp_sub(lhs, rhs, *fprm)?),
             }
         }
@@ -62,7 +66,9 @@ pub(crate) fn simplify_float<'c>(
             let lhs = state.get_child_simplified(0)?;
             let rhs = state.get_child_simplified(1)?;
             match (lhs.op(), rhs.op()) {
-                (AstOp::FPV(float1), AstOp::FPV(float2)) => Ok(ctx.fpv(*float1 * *float2)?),
+                (AstOp::FPV(float1), AstOp::FPV(float2)) => {
+                    Ok(ctx.fpv(float1.mul_rm(float2, *fprm)?)?)
+                }
                 _ => Ok(ctx.fp_mul(lhs, rhs, *fprm)?),
             }
         }
@@ -70,15 +76,57 @@ pub(crate) fn simplify_float<'c>(
             let lhs = state.get_child_simplified(0)?;
             let rhs = state.get_child_simplified(1)?;
             match (lhs.op(), rhs.op()) {
-                (AstOp::FPV(float1), AstOp::FPV(float2)) => Ok(ctx.fpv(*float1 / *float2)?),
+                (AstOp::FPV(float1), AstOp::FPV(float2)) => {
+                    Ok(ctx.fpv(float1.div_rm(float2, *fprm)?)?)
+                }
                 _ => Ok(ctx.fp_div(lhs, rhs, *fprm)?),
             }
         }
         AstOp::FpSqrt(_, fprm) => {
             let inner = state.get_child_simplified(0)?;
             match inner.op() {
-                AstOp::FPV(float_val) => Ok(ctx.fpv(float_val.sqrt())?),
+                AstOp::FPV(float_val) => Ok(ctx.fpv(float_val.sqrt(*fprm))?),
                 _ => Ok(ctx.fp_sqrt(inner, *fprm)?),
+            }
+        }
+        AstOp::FpMin(..) => {
+            let (arc, arc1) = (
+                state.get_child_simplified(0)?,
+                state.get_child_simplified(1)?,
+            );
+            match (arc.op(), arc1.op()) {
+                (AstOp::FPV(float1), AstOp::FPV(float2)) => Ok(ctx.fpv(float1.min(float2))?),
+                _ => Ok(ctx.fp_min(arc, arc1)?),
+            }
+        }
+        AstOp::FpMax(..) => {
+            let (arc, arc1) = (
+                state.get_child_simplified(0)?,
+                state.get_child_simplified(1)?,
+            );
+            match (arc.op(), arc1.op()) {
+                (AstOp::FPV(float1), AstOp::FPV(float2)) => Ok(ctx.fpv(float1.max(float2))?),
+                _ => Ok(ctx.fp_max(arc, arc1)?),
+            }
+        }
+        AstOp::FpFma(.., fprm) => {
+            let (a, b, c) = (
+                state.get_child_simplified(0)?,
+                state.get_child_simplified(1)?,
+                state.get_child_simplified(2)?,
+            );
+            match (a.op(), b.op(), c.op()) {
+                (AstOp::FPV(fa), AstOp::FPV(fb), AstOp::FPV(fc)) => {
+                    Ok(ctx.fpv(fa.mul_add(fb, fc, *fprm)?)?)
+                }
+                _ => Ok(ctx.fp_fma(a, b, c, *fprm)?),
+            }
+        }
+        AstOp::FpRoundToIntegral(_, fprm) => {
+            let arc = state.get_child_simplified(0)?;
+            match arc.op() {
+                AstOp::FPV(float) => Ok(ctx.fpv(float.round_to_integral(*fprm))?),
+                _ => Ok(ctx.fp_round_to_integral(arc, *fprm)?),
             }
         }
         AstOp::FpToFp(_, fsort, fprm) => {
@@ -158,30 +206,7 @@ pub(crate) fn simplify_float<'c>(
                 _ => Ok(ctx.bv_to_fp_unsigned(inner, *fsort, *fprm)?),
             }
         }
-        AstOp::ITE(..) => {
-            let if_ = state.get_child_simplified(0)?;
-            let then_ = state.get_child_simplified(1)?;
-            let else_ = state.get_child_simplified(2)?;
-
-            // If both branches are identical, return either one
-            if then_ == else_ {
-                return Ok(then_.clone());
-            }
-
-            match if_.op() {
-                // If the condition is a concrete boolean value, return the appropriate branch
-                AstOp::BoolV(value) => {
-                    if *value {
-                        Ok(then_.clone())
-                    } else {
-                        Ok(else_.clone())
-                    }
-                }
-                // If the condition has a Not at the top level, invert the branches
-                AstOp::Not(inner) => Ok(ctx.ite(inner, else_, then_)?),
-                _ => Ok(ctx.ite(if_, then_, else_)?),
-            }
-        }
+        AstOp::ITE(..) => super::simplify_ite(state),
         _ => unreachable!("non-float op dispatched to simplify_float"),
     }
 }

@@ -10,7 +10,15 @@ from collections import OrderedDict
 
 import angr
 from angr import default_cc
-from angr.sim_type import SimStruct, SimTypeArray, SimTypeChar, SimTypeFunction, SimTypeInt, SimTypePointer
+from angr.sim_type import (
+    SimStruct,
+    SimTypeArray,
+    SimTypeChar,
+    SimTypeFunction,
+    SimTypeInt,
+    SimTypeLongLong,
+    SimTypePointer,
+)
 from tests.common import WORKER, bin_location, print_decompilation_result
 
 test_location = os.path.join(bin_location, "tests")
@@ -132,6 +140,88 @@ class TestDecompilerTypes(unittest.TestCase):
         assert dec.codegen is not None and dec.codegen.text is not None
         print_decompilation_result(new_dec)
         assert f"int {var2.name};" in new_dec.codegen.text
+
+    def test_prototype_ignores_arg_types_wider_than_the_arg(self):
+        bin_path = os.path.join(test_location, "i386", "fauxware")
+        proj = angr.Project(bin_path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+        func = proj.kb.functions["authenticate"]
+        dec = proj.analyses.Decompiler(func, cfg=cfg.model)
+        assert dec.clinic is not None
+
+        arg0 = dec.clinic.arg_list[0]
+        assert arg0.size == 4
+        big = SimStruct({"a": SimTypeInt(), "pad": SimTypeArray(SimTypeChar(), 4000)}, name="big").with_arch(proj.arch)
+        proj.kb.dec_variables[func.addr].set_variable_type(arg0, big)
+        dec.clinic._make_function_prototype(dec.clinic.arg_list)
+
+        assert func.prototype is not None
+        assert func.prototype.args[0].with_arch(proj.arch).size == 32
+
+    def test_arg_stored_into_struct_first_member_stays_scalar_in_prototype(self):
+        # caller(long x) stores x into the first member of a stack struct S and passes &s to callee(struct S *)
+        bin_path = os.path.join(test_location, "x86_64", "decompiler", "struct_ref_first_member")
+        proj = angr.Project(bin_path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+        proj.analyses.CompleteCallingConventions(recover_variables=False)
+        arch = proj.arch
+        callee, caller, top = (proj.kb.functions[name] for name in ("callee", "caller", "top"))
+        struct = SimStruct(
+            {"a": SimTypeLongLong(), "b": SimTypeLongLong(), "c": SimTypeLongLong(), "d": SimTypeLongLong()}, name="S"
+        ).with_arch(arch)
+        callee.prototype = SimTypeFunction([SimTypePointer(struct)], SimTypeLongLong()).with_arch(arch)
+
+        # the stack slot holding x is only S.a: x (and rdi) must stay scalar, while the stack object is still an S
+        dec = proj.analyses.Decompiler(caller, cfg=cfg.model, fail_fast=True)
+        assert dec.codegen is not None and dec.codegen.text is not None
+        print_decompilation_result(dec)
+        proto = caller.prototype
+        assert proto is not None and len(proto.args) == 1
+        assert not isinstance(proto.args[0], SimStruct)
+        assert proto.args[0].with_arch(arch).size == 64
+        assert re.search(r"\bS v\d+;", dec.codegen.text) is not None
+        assert re.search(r"callee\(&v\d+\)", dec.codegen.text) is not None
+        # the stores write the struct's members
+        assert re.search(r"\bv\d+\.a = a0;", dec.codegen.text) is not None, dec.codegen.text
+        for member, value in (("b", 0), ("c", 1), ("d", 2)):
+            assert re.search(rf"\bv\d+\.{member} = {value};", dec.codegen.text) is not None, dec.codegen.text
+        assert len(re.findall(r"^\s+\S+ v\d+;  // \[bp", dec.codegen.text, re.MULTILINE)) == 1, dec.codegen.text
+
+        dec = proj.analyses.Decompiler(top, cfg=cfg.model, fail_fast=True)
+        assert dec.codegen is not None and dec.codegen.text is not None
+        assert "caller(a0 + 1)" in dec.codegen.text
+
+    def test_struct_first_member_accessed_around_call_stays_scalar(self):
+        # reread() reads s.a back after callee(&s); loop() writes s.a before callee(&s) in a loop
+        bin_path = os.path.join(test_location, "x86_64", "decompiler", "struct_ref_after_call")
+        proj = angr.Project(bin_path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+        proj.analyses.CompleteCallingConventions(recover_variables=False)
+        arch = proj.arch
+        struct = SimStruct(
+            {"a": SimTypeLongLong(), "b": SimTypeLongLong(), "c": SimTypeLongLong(), "d": SimTypeLongLong()}, name="S"
+        ).with_arch(arch)
+        callee = proj.kb.functions["callee"]
+        callee.prototype = SimTypeFunction([SimTypePointer(struct)], SimTypeLongLong()).with_arch(arch)
+
+        for name in ("reread", "loop"):
+            func = proj.kb.functions[name]
+            dec = proj.analyses.Decompiler(func, cfg=cfg.model, fail_fast=True)
+            assert dec.codegen is not None and dec.codegen.text is not None
+            print_decompilation_result(dec)
+            proto = func.prototype
+            assert proto is not None and proto.returnty is not None
+            for ty in (proto.returnty, *proto.args):
+                assert not isinstance(ty, SimStruct), name
+                assert ty.with_arch(arch).size == 64, name
+            # only the stack object is an S
+            assert len(re.findall(r"^\s+S \w+;", dec.codegen.text, re.MULTILINE)) == 1, name
+            if name == "reread":
+                # the read after the call reads the struct's first member
+                assert re.search(r"return v\d+\.a;", dec.codegen.text) is not None
+            else:
+                # the write in the loop writes the struct's first member
+                assert re.search(r"\bv\d+\.a = \w+;", dec.codegen.text) is not None, dec.codegen.text
 
     def test_mutually_recursive_known_structs_are_defined_once(self):
         # a known struct is rendered as defined: one typedef per name, with the recursive references intact

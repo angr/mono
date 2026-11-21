@@ -179,26 +179,14 @@ impl<'c> AstExtZ3<'c> for AstRef<'c> {
                                 Z3_mk_false(z3_ctx)
                             }
                             .try_into()?,
-                            // Equality (any sort): floats use fp.eq, everything else structural =.
-                            AstOp::Eq(a, _) => {
-                                if a.ast_type().is_float() {
-                                    binop!(z3_ctx, children, Z3_mk_fpa_eq)
-                                } else {
-                                    binop!(z3_ctx, children, Z3_mk_eq)
-                                }
-                            }
-                            AstOp::Neq(a, _) => {
-                                if a.ast_type().is_float() {
-                                    // IEEE inequality. Z3's `distinct` on floats is object
-                                    // identity (NaN would equal NaN, +0 would differ from -0),
-                                    // so emit not(fp.eq) instead.
-                                    let eq = binop!(z3_ctx, children, Z3_mk_fpa_eq);
-                                    Z3_mk_not(z3_ctx, *eq).try_into()?
-                                } else {
-                                    let a = child(children, 0)?;
-                                    let b = child(children, 1)?;
-                                    Z3_mk_distinct(z3_ctx, 2, [**a, **b].as_ptr()).try_into()?
-                                }
+                            // Equality (any sort) is Z3's `=`/`distinct`. On floats that is
+                            // identity of the value (NaN equals NaN, +0 differs from -0);
+                            // IEEE equality is `FpEq` below.
+                            AstOp::Eq(..) => binop!(z3_ctx, children, Z3_mk_eq),
+                            AstOp::Neq(..) => {
+                                let a = child(children, 0)?;
+                                let b = child(children, 1)?;
+                                Z3_mk_distinct(z3_ctx, 2, [**a, **b].as_ptr()).try_into()?
                             }
                             AstOp::ULT(..) => binop!(z3_ctx, children, Z3_mk_bvult),
                             AstOp::ULE(..) => binop!(z3_ctx, children, Z3_mk_bvule),
@@ -208,6 +196,7 @@ impl<'c> AstExtZ3<'c> for AstRef<'c> {
                             AstOp::SLE(..) => binop!(z3_ctx, children, Z3_mk_bvsle),
                             AstOp::SGT(..) => binop!(z3_ctx, children, Z3_mk_bvsgt),
                             AstOp::SGE(..) => binop!(z3_ctx, children, Z3_mk_bvsge),
+                            AstOp::FpEq(..) => binop!(z3_ctx, children, Z3_mk_fpa_eq),
                             AstOp::FpLt(..) => binop!(z3_ctx, children, Z3_mk_fpa_lt),
                             AstOp::FpLeq(..) => binop!(z3_ctx, children, Z3_mk_fpa_leq),
                             AstOp::FpGt(..) => binop!(z3_ctx, children, Z3_mk_fpa_gt),
@@ -436,6 +425,23 @@ impl<'c> AstExtZ3<'c> for AstRef<'c> {
                                     **child(children, 0)?,
                                 ))?
                             }
+                            AstOp::FpMin(..) => binop!(z3_ctx, children, Z3_mk_fpa_min),
+                            AstOp::FpMax(..) => binop!(z3_ctx, children, Z3_mk_fpa_max),
+                            AstOp::FpFma(.., rm) => {
+                                let rm_ast = fprm_to_z3(*rm)?;
+                                let a = child(children, 0)?;
+                                let b = child(children, 1)?;
+                                let c = child(children, 2)?;
+                                RcAst::try_from(Z3_mk_fpa_fma(z3_ctx, *rm_ast, **a, **b, **c))?
+                            }
+                            AstOp::FpRoundToIntegral(_, rm) => {
+                                let rm_ast = fprm_to_z3(*rm)?;
+                                RcAst::try_from(Z3_mk_fpa_round_to_integral(
+                                    z3_ctx,
+                                    *rm_ast,
+                                    **child(children, 0)?,
+                                ))?
+                            }
                             AstOp::FpToFp(_, sort, rm) => {
                                 let rm_ast = fprm_to_z3(*rm)?;
                                 RcAst::try_from(Z3_mk_fpa_to_fp_float(
@@ -498,9 +504,14 @@ impl<'c> AstExtZ3<'c> for AstRef<'c> {
                                 RcAst::try_from(Z3_mk_string(z3_ctx, cstr.as_ptr()))?
                             }
                             AstOp::StrConcat(..) => {
-                                let a = child(children, 0)?;
-                                let b = child(children, 1)?;
-                                RcAst::try_from(Z3_mk_seq_concat(z3_ctx, 2, [**a, **b].as_ptr()))?
+                                let z3_args = (0..children.len())
+                                    .map(|i| child(children, i).map(|c| **c))
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                RcAst::try_from(Z3_mk_seq_concat(
+                                    z3_ctx,
+                                    z3_args.len() as u32,
+                                    z3_args.as_ptr(),
+                                ))?
                             }
                             AstOp::StrSubstr(..) => {
                                 let a = child(children, 0)?;
@@ -860,11 +871,32 @@ impl<'c> AstExtZ3<'c> for AstRef<'c> {
                                 Z3_fpa_get_ebits(z3_ctx, sort),
                                 Z3_fpa_get_sbits(z3_ctx, sort) - 1,
                             );
-                            let val = Z3_get_numeral_double(z3_ctx, *ast);
                             if fsort == FSort::f32() {
-                                ctx.fpv(Float::F32(val as f32))
+                                // Z3_get_numeral_double misreads an f32 subnormal
+                                let (mut sign, mut exponent, mut significand) = (false, 0i64, 0u64);
+                                if !(Z3_fpa_get_numeral_sign(z3_ctx, *ast, &mut sign)
+                                    && Z3_fpa_get_numeral_exponent_int64(
+                                        z3_ctx,
+                                        *ast,
+                                        &mut exponent,
+                                        true,
+                                    )
+                                    && Z3_fpa_get_numeral_significand_uint64(
+                                        z3_ctx,
+                                        *ast,
+                                        &mut significand,
+                                    ))
+                                {
+                                    return Err(ClarirsError::ConversionError(
+                                        "expected a numeral".to_string(),
+                                    ));
+                                }
+                                let bits = (sign as u32) << 31
+                                    | (exponent as u32) << 23
+                                    | significand as u32;
+                                ctx.fpv(Float::F32(f32::from_bits(bits)))
                             } else {
-                                ctx.fpv(Float::F64(val))
+                                ctx.fpv(Float::F64(Z3_get_numeral_double(z3_ctx, *ast)))
                             }
                         }
                         DeclKind::FpaNan => {
@@ -898,6 +930,27 @@ impl<'c> AstExtZ3<'c> for AstRef<'c> {
                         DeclKind::FpaSqrt => {
                             let rm = parse_fprm_from_z3(z3_ctx, *arg(0)?)?;
                             ctx.fp_sqrt(AstRef::from_z3(ctx, arg(1)?)?, rm)
+                        }
+                        DeclKind::FpaMin => ctx.fp_min(
+                            AstRef::from_z3(ctx, arg(0)?)?,
+                            AstRef::from_z3(ctx, arg(1)?)?,
+                        ),
+                        DeclKind::FpaMax => ctx.fp_max(
+                            AstRef::from_z3(ctx, arg(0)?)?,
+                            AstRef::from_z3(ctx, arg(1)?)?,
+                        ),
+                        DeclKind::FpaFma => {
+                            let rm = parse_fprm_from_z3(z3_ctx, *arg(0)?)?;
+                            ctx.fp_fma(
+                                AstRef::from_z3(ctx, arg(1)?)?,
+                                AstRef::from_z3(ctx, arg(2)?)?,
+                                AstRef::from_z3(ctx, arg(3)?)?,
+                                rm,
+                            )
+                        }
+                        DeclKind::FpaRoundToIntegral => {
+                            let rm = parse_fprm_from_z3(z3_ctx, *arg(0)?)?;
+                            ctx.fp_round_to_integral(AstRef::from_z3(ctx, arg(1)?)?, rm)
                         }
                         DeclKind::FpaToFp => {
                             let sort = require(Z3_get_sort(z3_ctx, *ast))?;
@@ -983,10 +1036,14 @@ impl<'c> AstExtZ3<'c> for AstRef<'c> {
                         }
 
                         // Strings
-                        DeclKind::SeqConcat => ctx.str_concat(
-                            AstRef::from_z3(ctx, arg(0)?)?,
-                            AstRef::from_z3(ctx, arg(1)?)?,
-                        ),
+                        DeclKind::SeqConcat => {
+                            let num_args = Z3_get_app_num_args(z3_ctx, app);
+                            let mut args = Vec::with_capacity(num_args as usize);
+                            for i in 0..num_args {
+                                args.push(AstRef::from_z3(ctx, arg(i)?)?);
+                            }
+                            ctx.str_concat(args)
+                        }
                         DeclKind::SeqExtract => {
                             let a = AstRef::from_z3(ctx, arg(0)?)?;
                             let offset_bv = RcAst::try_from(Z3_mk_int2bv(z3_ctx, 64, *arg(1)?))?;

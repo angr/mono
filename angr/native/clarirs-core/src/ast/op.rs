@@ -51,8 +51,6 @@ pub enum AstOp<'c> {
     ITE(AstRef<'c>, AstRef<'c>, AstRef<'c>),
 
     // Equality (any sort) and bitvector comparisons (all produce a bool).
-    // `Eq`/`Neq` apply to any sort; for floats they have IEEE `fp.eq`
-    // semantics, otherwise they are structural.
     Eq(AstRef<'c>, AstRef<'c>),
     Neq(AstRef<'c>, AstRef<'c>),
     ULT(AstRef<'c>, AstRef<'c>),
@@ -65,6 +63,7 @@ pub enum AstOp<'c> {
     SGE(AstRef<'c>, AstRef<'c>),
 
     // Float comparisons (produce a bool)
+    FpEq(AstRef<'c>, AstRef<'c>),
     FpLt(AstRef<'c>, AstRef<'c>),
     FpLeq(AstRef<'c>, AstRef<'c>),
     FpGt(AstRef<'c>, AstRef<'c>),
@@ -122,6 +121,13 @@ pub enum AstOp<'c> {
     FpMul(AstRef<'c>, AstRef<'c>, FPRM),
     FpDiv(AstRef<'c>, AstRef<'c>, FPRM),
     FpSqrt(AstRef<'c>, FPRM),
+    /// SMT-LIB `fp.min` / `fp.max`: a NaN operand yields the other.
+    FpMin(AstRef<'c>, AstRef<'c>),
+    FpMax(AstRef<'c>, AstRef<'c>),
+    /// Fused multiply-add `a * b + c`, rounded once (SMT-LIB `fp.fma`).
+    FpFma(AstRef<'c>, AstRef<'c>, AstRef<'c>, FPRM),
+    /// Round to an integral value in the same sort (SMT-LIB `fp.roundToIntegral`).
+    FpRoundToIntegral(AstRef<'c>, FPRM),
     /// Transform a float to another float of a different size, preserving the value.
     FpToFp(AstRef<'c>, FSort, FPRM),
     /// Construct a float from sign, exponent, and significand bitvectors
@@ -136,7 +142,7 @@ pub enum AstOp<'c> {
     // String leaves and operations
     StringS(InternedString),
     StringV(String),
-    StrConcat(AstRef<'c>, AstRef<'c>),
+    StrConcat(Vec<AstRef<'c>>),
     StrSubstr(AstRef<'c>, AstRef<'c>, AstRef<'c>),
     StrReplace(AstRef<'c>, AstRef<'c>, AstRef<'c>),
     BVToStr(AstRef<'c>),
@@ -151,7 +157,7 @@ macro_rules! ast_op_arity {
         nary: [$($nary:ident),* $(,)?],
         unary: [$($un:ident $(($($unp:ident),*))?),* $(,)?],
         binary: [$($bin:ident $(($($binp:ident),*))?),* $(,)?],
-        ternary: [$($ter:ident),* $(,)?] $(,)?
+        ternary: [$($ter:ident $(($($terp:ident),*))?),* $(,)?] $(,)?
     ) => {
         impl<'c> AstOp<'c> {
             /// Returns the child AST at the given index, or `None` if out of range.
@@ -166,7 +172,7 @@ macro_rules! ast_op_arity {
                         1 => Some(b.clone()),
                         _ => None,
                     },
-                    $(AstOp::$ter(a, b, c))|* => match index {
+                    $(AstOp::$ter(a, b, c, ..))|* => match index {
                         0 => Some(a.clone()),
                         1 => Some(b.clone()),
                         2 => Some(c.clone()),
@@ -186,17 +192,16 @@ macro_rules! ast_op_arity {
                 }
             }
 
-            /// Returns this operation with `children` substituted for its own,
-            /// without interning, or `None` for a leaf.
-            pub fn with_children(&self, children: &[AstRef<'c>]) -> Option<AstOp<'c>> {
+            /// Returns this operation with `children` substituted for its own
+            pub fn with_children(&self, children: &[AstRef<'c>]) -> AstOp<'c> {
                 let c = |i: usize| children[i].clone();
-                Some(match self {
-                    $(AstOp::$leaf(..))|* => return None,
+                match self {
+                    $(AstOp::$leaf(..))|* => return self.clone(),
                     $(AstOp::$nary(..) => AstOp::$nary(children.to_vec()),)*
                     $(AstOp::$un(_ $($(, $unp)*)?) => AstOp::$un(c(0) $($(, *$unp)*)?),)*
                     $(AstOp::$bin(_, _ $($(, $binp)*)?) => AstOp::$bin(c(0), c(1) $($(, *$binp)*)?),)*
-                    $(AstOp::$ter(..) => AstOp::$ter(c(0), c(1), c(2)),)*
-                })
+                    $(AstOp::$ter(_, _, _ $($(, $terp)*)?) => AstOp::$ter(c(0), c(1), c(2) $($(, *$terp)*)?),)*
+                }
             }
         }
     };
@@ -204,20 +209,21 @@ macro_rules! ast_op_arity {
 
 ast_op_arity! {
     leaf: [BoolS, BoolV, BVS, BVV, FPS, FPV, StringS, StringV],
-    nary: [And, Or, Xor, Add, Mul, Concat, Union, Intersection],
+    nary: [And, Or, Xor, Add, Mul, Concat, Union, Intersection, StrConcat],
     unary: [
         Not, Neg, ByteReverse, ZeroExt(n), SignExt(n), Extract(hi, lo), StrLen, StrToBV,
         FpToIEEEBV, FpToUBV(size, rm), FpToSBV(size, rm), FpNeg, FpAbs, FpSqrt(rm),
+        FpRoundToIntegral(rm),
         FpToFp(sort, rm), BvToFp(sort), BvToFpSigned(sort, rm), BvToFpUnsigned(sort, rm),
         FpIsNan, FpIsInf, StrIsDigit, BVToStr,
     ],
     binary: [
-        Eq, Neq, ULT, ULE, UGT, UGE, SLT, SLE, SGT, SGE, FpLt, FpLeq, FpGt, FpGeq,
+        Eq, Neq, ULT, ULE, UGT, UGE, SLT, SLE, SGT, SGE, FpEq, FpLt, FpLeq, FpGt, FpGeq,
         StrContains, StrPrefixOf, StrSuffixOf, Sub, UDiv, SDiv, URem, SRem, ShL, LShR, AShR,
         RotateLeft, RotateRight, Widen, FpAdd(rm), FpSub(rm), FpMul(rm),
-        FpDiv(rm), StrConcat,
+        FpDiv(rm), FpMin, FpMax,
     ],
-    ternary: [ITE, StrIndexOf, FpFP, StrSubstr, StrReplace],
+    ternary: [ITE, StrIndexOf, FpFP, StrSubstr, StrReplace, FpFma(rm)],
 }
 
 impl<'c> AstOp<'c> {
@@ -294,6 +300,7 @@ impl<'c> AstOp<'c> {
             | AstOp::SLE(..)
             | AstOp::SGT(..)
             | AstOp::SGE(..)
+            | AstOp::FpEq(..)
             | AstOp::FpLt(..)
             | AstOp::FpLeq(..)
             | AstOp::FpGt(..)
@@ -347,7 +354,11 @@ impl<'c> AstOp<'c> {
             | AstOp::FpAdd(a, _, _)
             | AstOp::FpSub(a, _, _)
             | AstOp::FpMul(a, _, _)
-            | AstOp::FpDiv(a, _, _) => a.ast_type(),
+            | AstOp::FpDiv(a, _, _)
+            | AstOp::FpMin(a, _)
+            | AstOp::FpMax(a, _)
+            | AstOp::FpFma(a, _, _, _)
+            | AstOp::FpRoundToIntegral(a, _) => a.ast_type(),
             AstOp::FpToFp(_, sort, _)
             | AstOp::BvToFp(_, sort)
             | AstOp::BvToFpSigned(_, sort, _)
@@ -442,15 +453,24 @@ impl<'c> AstOp<'c> {
             ),
 
             // Binary float operations and comparisons (same sort)
-            AstOp::FpLt(a, b)
+            AstOp::FpEq(a, b)
+            | AstOp::FpLt(a, b)
             | AstOp::FpLeq(a, b)
             | AstOp::FpGt(a, b)
             | AstOp::FpGeq(a, b)
             | AstOp::FpAdd(a, b, _)
             | AstOp::FpSub(a, b, _)
             | AstOp::FpMul(a, b, _)
-            | AstOp::FpDiv(a, b, _) => require(
+            | AstOp::FpDiv(a, b, _)
+            | AstOp::FpMin(a, b)
+            | AstOp::FpMax(a, b) => require(
                 a.ast_type().is_float() && a.ast_type() == b.ast_type(),
+                "float operation requires float operands of the same sort",
+            ),
+            AstOp::FpFma(a, b, c, _) => require(
+                a.ast_type().is_float()
+                    && a.ast_type() == b.ast_type()
+                    && a.ast_type() == c.ast_type(),
                 "float operation requires float operands of the same sort",
             ),
 
@@ -460,6 +480,7 @@ impl<'c> AstOp<'c> {
             | AstOp::FpNeg(a)
             | AstOp::FpAbs(a)
             | AstOp::FpSqrt(a, _)
+            | AstOp::FpRoundToIntegral(a, _)
             | AstOp::FpToFp(a, _, _)
             | AstOp::FpToIEEEBV(a)
             | AstOp::FpToUBV(a, _, _)
@@ -469,13 +490,19 @@ impl<'c> AstOp<'c> {
             ),
 
             // String predicates and operations
-            AstOp::StrContains(a, b)
-            | AstOp::StrPrefixOf(a, b)
-            | AstOp::StrSuffixOf(a, b)
-            | AstOp::StrConcat(a, b) => require(
-                a.ast_type().is_string() && b.ast_type().is_string(),
-                "string operation requires string operands",
-            ),
+            AstOp::StrContains(a, b) | AstOp::StrPrefixOf(a, b) | AstOp::StrSuffixOf(a, b) => {
+                require(
+                    a.ast_type().is_string() && b.ast_type().is_string(),
+                    "string operation requires string operands",
+                )
+            }
+            AstOp::StrConcat(v) => {
+                nonempty(v)?;
+                require(
+                    v.iter().all(|a| a.ast_type().is_string()),
+                    "StrConcat requires string operands",
+                )
+            }
             AstOp::StrIsDigit(a) | AstOp::StrLen(a) | AstOp::StrToBV(a) => require(
                 a.ast_type().is_string(),
                 "string operation requires a string operand",

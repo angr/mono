@@ -5,7 +5,7 @@ import enum
 import logging
 from bisect import bisect_right
 from collections import defaultdict, deque
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
@@ -364,6 +364,48 @@ class RecursiveRefNode(SketchNodeBase):
         return type(other) is RecursiveRefNode and other.target == self.target
 
 
+def _is_nonptr_integer(labels: Sequence[BaseLabel], narrow_bits: int) -> bool:
+    """
+    Determine if the integer type represented by the given labels must be a non-pointer integer type.
+    """
+    for label in reversed(labels):
+        if isinstance(label, ConvertTo):
+            if label.to_bits < narrow_bits:
+                return True
+            continue
+        return isinstance(label, HasField) and label.bits < narrow_bits
+    return False
+
+
+def _is_whole_pointee_field(label: BaseLabel) -> bool:
+    return isinstance(label, HasField) and label.offset == 0 and label.bits == MAX_POINTSTO_BITS
+
+
+def _is_pointee_label_prefix(labels: Sequence[BaseLabel]) -> bool:
+    """
+    Whether labels is a prefix of load.<MAX_POINTSTO_BITS>@0: the only label chain on a pointer constant that
+    Sketch.flatten_typevar folds into the pointee.
+    """
+    if len(labels) > 2:
+        return False
+    if labels and not isinstance(labels[0], Load):
+        return False
+    return len(labels) < 2 or _is_whole_pointee_field(labels[1])
+
+
+def _is_pointee_label_suffix(labels: Sequence[BaseLabel]) -> bool:
+    """
+    Whether labels is a suffix of load.<MAX_POINTSTO_BITS>@0.
+    """
+    if len(labels) == 1:
+        return _is_whole_pointee_field(labels[0])
+    # the empty chain or the whole chain
+    return _is_pointee_label_prefix(labels)
+
+
+_ParentChain = tuple[tuple[SketchNode, BaseLabel], ...]
+
+
 class Sketch:
     """
     Describes the sketch of a type variable.
@@ -483,10 +525,7 @@ class Sketch:
                 )
             )
             and len(derived_typevar.labels) == 2
-            and isinstance(derived_typevar.labels[0], Load)
-            and isinstance(derived_typevar.labels[1], HasField)
-            and derived_typevar.labels[1].offset == 0
-            and derived_typevar.labels[1].bits == MAX_POINTSTO_BITS
+            and _is_pointee_label_prefix(derived_typevar.labels)
         ):
             bt = derived_typevar.type_var.basetype
             assert bt is not None
@@ -879,6 +918,8 @@ class SimpleSolver:
 
     # rounds of offset mirroring in shape inference; each round can only add fields reached through a further offset
     OFFSET_MIRROR_ROUNDS = 4
+    # most sketch nodes unrolled for one type variable before its sketch is built as a DAG instead (see infer_shapes)
+    SKETCH_UNROLL_LIMIT = 10_000
 
     def __init__(
         self,
@@ -926,6 +967,7 @@ class SimpleSolver:
                 self.solution[tv] = sol
 
         self._solution_cache = {}
+        self._mirrored_node_groups_cache: dict[Sketch, list[list[tuple[SketchNode, _ParentChain]]]] = {}
         self.solve()
         for func_tv in list(self._constraints):
             self._convert_arrays(self._constraints[func_tv])
@@ -949,6 +991,7 @@ class SimpleSolver:
         return None
 
     def preprocess(self, func_tv: TypeVariable):
+        self._constraints[func_tv], opaque_sums = self._replace_nonptr_narrow_offsets(self._constraints[func_tv])
         ptr_tvs = self._ptr_tvs_from_constraints(self._constraints[func_tv])
         self._constraints[func_tv] |= self._eq_constraints_from_scalar_offsets(self._constraints[func_tv], ptr_tvs)
         self._constraints[func_tv] = self._remove_alignment_int_ptr_subtyping_constraints(
@@ -966,8 +1009,50 @@ class SimpleSolver:
         self._constraints[func_tv] |= self._discover_equivalence(self._constraints[func_tv])
         new_constraints, replacements = self._handle_equivalence(self._constraints[func_tv])
         self._equivalence |= replacements
+        for tv, opaque in opaque_sums.items():
+            self._equivalence[tv] = replacements.get(opaque, opaque)
         self._constraints[func_tv] = new_constraints
         self._constraints[func_tv] = self._filter_constraints(self._constraints[func_tv])
+
+    def _replace_nonptr_narrow_offsets(
+        self, constraints: set[TypeConstraint]
+    ) -> tuple[set[TypeConstraint], dict[TypeVariable, TypeVariable]]:
+        """
+        Replace each x.+N with a fresh type variable if x cannot be a pointer. This prevents the solver from treating
+        `x` as a pointer later.
+
+        :return: The rewritten constraints, and a dict that maps each rewritten type variable to its replacement.
+        """
+        ptr_bits = min(32, self.bits)
+        fresh_tvs: dict[tuple, TypeVariable] = {}
+        rewritten: dict[TypeVariable, TypeVariable] = {}
+
+        def rewrite(t):
+            if not isinstance(t, DerivedTypeVariable):
+                return t
+            labels = t.labels
+            for i in range(1, len(labels)):
+                if isinstance(labels[i], (AddN, SubN)) and _is_nonptr_integer(labels[:i], ptr_bits):
+                    key = (t.type_var, tuple(labels[: i + 1]))
+                    sum_tv = fresh_tvs.get(key)
+                    if sum_tv is None:
+                        sum_tv = fresh_tvs[key] = TypeVariable()
+                    rest = labels[i + 1 :]
+                    r = rewrite(DerivedTypeVariable(sum_tv, None, labels=list(rest))) if rest else sum_tv
+                    rewritten[t] = r
+                    return r
+            return t
+
+        new_constraints: set[TypeConstraint] = set()
+        for c in constraints:
+            if isinstance(c, Subtype):
+                c = Subtype(rewrite(c.sub_type), rewrite(c.super_type))
+            elif isinstance(c, Equivalence):
+                c = Equivalence(rewrite(c.type_a), rewrite(c.type_b))
+            elif isinstance(c, (Add, Sub)):
+                c = type(c)(rewrite(c.type_0), rewrite(c.type_1), rewrite(c.type_r))
+            new_constraints.add(c)
+        return new_constraints, rewritten
 
     def solve(self):
         """
@@ -1096,7 +1181,7 @@ class SimpleSolver:
             while constraint_subset:
                 _l.debug("Working with %d constraints.", len(constraint_subset))
 
-                # remove constraints that are a <: b where a only appears once; in this case, the solution fo a is
+                # remove constraints that are a <: b where a only appears once; in this case, the solution to a is
                 # entirely determined by the solution of b (which is the upper bound of a)
                 filtered_constraint_subset, ub_subtypes = self._filter_leaf_typevars(constraint_subset, tvs)
                 _l.debug(
@@ -1105,20 +1190,28 @@ class SimpleSolver:
                     len(filtered_constraint_subset),
                 )
 
-                base_constraint_graph = self._generate_constraint_graph(
-                    filtered_constraint_subset, tvs | PRIMITIVE_TYPES
+                primitive_constraints = (
+                    self._constant_bounds_as_primitive_constraints(filtered_constraint_subset, next(iter(tvs)))
+                    if len(tvs) == 1
+                    else None
                 )
-                primitive_constraints = self._generate_primitive_constraints(tvs, base_constraint_graph)
-                if len(tvs) > 1:
-                    primitive_constraints |= self._generate_transitive_subtype_constraints(
-                        tvs, filtered_constraint_subset, primitive_constraints
+                if primitive_constraints is None:
+                    base_constraint_graph = self._generate_constraint_graph(
+                        filtered_constraint_subset, tvs | PRIMITIVE_TYPES
                     )
+                    primitive_constraints = self._generate_primitive_constraints(tvs, base_constraint_graph)
+                    if len(tvs) > 1:
+                        primitive_constraints |= self._generate_transitive_subtype_constraints(
+                            tvs, filtered_constraint_subset, primitive_constraints
+                        )
                 tvs_with_primitive_constraints = set()
                 for primitive_constraint in sorted(primitive_constraints, key=repr):
                     tv = self._typevar_from_primitive_constraint(primitive_constraint)
                     tvs_with_primitive_constraints.add(tv)
                     assert tv is not None, f"Cannot find type variable in primitive constraint {primitive_constraint}"
                     sketches[tv].add_constraint(primitive_constraint)
+                for tv in tvs_with_primitive_constraints:
+                    self._share_mirrored_bounds(sketches[tv])
                 solutions = {}
                 self.determine(
                     sketches, sorted(tvs_with_primitive_constraints, key=lambda x: x.idx), equiv_classes, solutions
@@ -1151,6 +1244,8 @@ class SimpleSolver:
 
         # set the solution for missing type vars to TOP
         pending = sorted(set(sketches).difference(set(self.solution)), key=repr)
+        for tv in pending:
+            self._share_mirrored_bounds(sketches[tv])
         self.determine(sketches, pending, equiv_classes, self.solution)
 
         # set solutions for non-representative type variables
@@ -1168,15 +1263,18 @@ class SimpleSolver:
         Computing sketches from constraint sets. Implements Algorithm E.1 in the retypd paper.
         """
 
+        all_mirrored: set[TypeConstraint] = set()
         for _ in range(self.OFFSET_MIRROR_ROUNDS):
             equivalence_classes, quotient_graph = self.compute_quotient_graph(constraints, typevars)
             mirrored = self._offset_mirror_constraints(quotient_graph) - constraints
             if not mirrored:
                 break
+            all_mirrored |= mirrored
             constraints = constraints | mirrored
         var_classes = {equivalence_classes.get(tv, tv) for tv in typevars}
         pointees = self._offset_pointee_constraints(quotient_graph, var_classes) - constraints
         if pointees:
+            all_mirrored |= pointees
             constraints = constraints | pointees
             equivalence_classes, quotient_graph = self.compute_quotient_graph(constraints, typevars)
 
@@ -1187,17 +1285,220 @@ class SimpleSolver:
                 sketches[rep_tv] = Sketch(self, rep_tv)
 
         sorted_out_edges = {}
+        scc_ids: dict | None = None
         for tv, sketch in sketches.items():
             sketch_node = sketch.lookup(tv)
             graph_node = equivalence_classes.get(tv, None)
             # assert graph_node is not None
-            if graph_node is None or sketch_node is None:
+            if graph_node is None or sketch_node is None or graph_node not in quotient_graph:
                 continue
             assert isinstance(graph_node, TypeVariable)
             assert isinstance(sketch_node, SketchNode)
-            visited = {graph_node: sketch_node}
-            self._get_all_paths(quotient_graph, sketch, graph_node, visited, sorted_out_edges)
-        return equivalence_classes, sketches, constraints
+            if scc_ids is None:
+                scc_ids = {
+                    node: i
+                    for i, scc in enumerate(networkx.strongly_connected_components(quotient_graph))
+                    for node in scc
+                }
+            if (
+                self._unrolled_sketch_size(quotient_graph, graph_node, scc_ids, sorted_out_edges)
+                > self.SKETCH_UNROLL_LIMIT
+            ):
+                # one sketch node per simple path is exponential in the quotient graph (a struct whose fields point
+                # into its own later fields gives 8e8 paths from 36 classes); share one node per class instead
+                self._build_shared_sketch(quotient_graph, sketch, graph_node, sketch_node, sorted_out_edges)
+            else:
+                visited = {graph_node: sketch_node}
+                self._get_all_paths(quotient_graph, sketch, graph_node, visited, sorted_out_edges)
+        # mirrored and pointee fields only shape the sketches. As two-way subtyping between field type variables they put
+        # large cycles into the constraint graph, and enumerating its paths for primitive constraints becomes exponential
+        # (#7729); _share_mirrored_bounds equates the bounds of the mirrored sketch nodes instead.
+        return equivalence_classes, sketches, constraints - all_mirrored
+
+    def _mirrored_node_groups(self, sketch: Sketch) -> list[list[SketchNode]]:
+        """
+        Group the sketch nodes that offset mirroring equates: for x -+n-> y, y.access.@k is x.access.@(k + n), and so
+        are their descendants under the same labels.
+        """
+        graph = sketch.graph
+
+        def resolve(node: SketchNodeBase) -> SketchNode | None:
+            if isinstance(node, RecursiveRefNode):
+                node = sketch.lookup(node.target)
+            return node if isinstance(node, SketchNode) else None
+
+        children_cache: dict[SketchNode, dict] = {}
+
+        def children(node: SketchNode) -> dict:
+            kids = children_cache.get(node)
+            if kids is None:
+                kids = children_cache[node] = {}
+                for dst, keyed in graph.succ[node].items():
+                    for data in keyed.values():
+                        kids.setdefault(data.get("label"), dst)
+            return kids
+
+        def child(node: SketchNode, label) -> SketchNode | None:
+            dst = children(node).get(label)
+            return resolve(dst) if dst is not None else None
+
+        pending: list[tuple[SketchNode, SketchNode]] = []
+        for x in graph.nodes:
+            if not isinstance(x, SketchNode):
+                continue
+            for label, y in children(x).items():
+                if isinstance(label, AddN):
+                    n = label.n
+                elif isinstance(label, SubN):
+                    n = -label.n
+                else:
+                    continue
+                y = resolve(y)
+                if n == 0 or y is None or y is x:
+                    continue
+                for access, y_access in children(y).items():
+                    if not isinstance(access, (Load, Store)):
+                        continue
+                    y_access = resolve(y_access)
+                    x_access = child(x, access)
+                    if y_access is None or x_access is None:
+                        continue
+                    for field, end in children(y_access).items():
+                        if not isinstance(field, HasField) or field.offset + n < 0:
+                            continue
+                        end = resolve(end)
+                        mirrored = child(x_access, HasField(field.bits, field.offset + n, elem_count=field.elem_count))
+                        if end is not None and mirrored is not None and end is not mirrored:
+                            pending.append((mirrored, end))
+
+        # each node object occurs once in the sketch graph, so nodes are compared by identity
+        parent: dict[SketchNode, SketchNode] = {}
+
+        def find(node: SketchNode) -> SketchNode:
+            root = parent.setdefault(node, node)
+            while parent[root] is not root:
+                root = parent[root]
+            while parent[node] is not root:
+                parent[node], node = root, parent[node]
+            return root
+
+        while pending:
+            a, b = pending.pop()
+            root_a, root_b = find(a), find(b)
+            if root_a is root_b:
+                # the fields of a and b were paired when their groups were merged
+                continue
+            parent[root_a] = root_b
+            # equal type variables have equal fields
+            for label, a_child in children(a).items():
+                a_child = resolve(a_child)
+                b_child = child(b, label)
+                if a_child is not None and b_child is not None and a_child is not b_child:
+                    pending.append((a_child, b_child))
+
+        groups: dict[SketchNode, list[SketchNode]] = defaultdict(list)
+        for node in parent:
+            groups[find(node)].append(node)
+        return [group for group in groups.values() if len(group) > 1]
+
+    def _share_mirrored_bounds(self, sketch: Sketch) -> None:
+        """
+        Give the sketch nodes that offset mirroring equates the same bounds, as two-way subtyping between them would,
+        including what composite bounds of their ancestors (a solved struct pointer bounding x, for x.load.@k) say.
+        """
+        groups = self._mirrored_node_groups_cache.get(sketch)
+        if groups is None:
+            node_groups = self._mirrored_node_groups(sketch)
+            chains = self._covariant_parent_chains(sketch, [node for group in node_groups for node in group])
+            groups = self._mirrored_node_groups_cache[sketch] = [
+                [(node, chains[node]) for node in group] for group in node_groups
+            ]
+        for group in groups:
+            lower_bounds, upper_bounds = [], []
+            for node, chain in group:
+                if not isinstance(node.lower_bound, BottomType):
+                    lower_bounds.append(node.lower_bound)
+                if not isinstance(node.upper_bound, TopType):
+                    upper_bounds.append(node.upper_bound)
+                labels: list[BaseLabel] = []
+                for ancestor, label in chain:
+                    labels.append(label)
+                    lower_composite = isinstance(ancestor.lower_bound, (Pointer, Struct))
+                    upper_composite = isinstance(ancestor.upper_bound, (Pointer, Struct))
+                    if not lower_composite and not upper_composite:
+                        continue
+                    suffix = labels[::-1]
+                    if lower_composite and (t := self._type_at(ancestor.lower_bound, suffix)) is not None:
+                        lower_bounds.append(t)
+                    if upper_composite and (t := self._type_at(ancestor.upper_bound, suffix)) is not None:
+                        upper_bounds.append(t)
+            if not lower_bounds and not upper_bounds:
+                continue
+            lower, upper = BottomType(), TopType()
+            for t in lower_bounds:
+                lower = self.join(lower, t)
+            for t in upper_bounds:
+                upper = self.meet(upper, t)
+            for node, _ in group:
+                node.lower_bound = lower
+                node.upper_bound = upper
+
+    @staticmethod
+    def _covariant_parent_chains(sketch: Sketch, nodes: Iterable[SketchNode]) -> dict[SketchNode, _ParentChain]:
+        """
+        For each node, its ancestors (nearest first) that reach it through load and field labels only, each with the
+        label of the edge to the next node down.
+        """
+        pred = sketch.graph.pred
+        chains: dict[SketchNode, _ParentChain] = {}
+
+        def parent_link(node: SketchNode) -> tuple[SketchNode, BaseLabel] | None:
+            parents = pred[node]
+            if len(parents) != 1:
+                return None
+            ((parent, keyed),) = parents.items()
+            if len(keyed) != 1:
+                return None
+            (data,) = keyed.values()
+            label = data.get("label")
+            if not isinstance(label, (Load, HasField)) or not isinstance(parent, SketchNode):
+                return None
+            return parent, label
+
+        for node in nodes:
+            path: list[tuple[SketchNode, tuple[SketchNode, BaseLabel] | None]] = []
+            curr = node
+            tail: _ParentChain = ()
+            while True:
+                if curr in chains:
+                    tail = chains[curr]
+                    break
+                link = parent_link(curr)
+                path.append((curr, link))
+                if link is None:
+                    break
+                curr = link[0]
+            for n, link in reversed(path):
+                tail = () if link is None else (link, *tail)
+                chains[n] = tail
+        return chains
+
+    @staticmethod
+    def _type_at(tc: TypeConstant, labels: Sequence[BaseLabel]) -> TypeConstant | None:
+        """
+        The part of a composite type constant that a chain of load and field labels reaches, or None.
+        """
+        t: TypeConstant | None = tc
+        for label in labels:
+            if isinstance(label, Load) and isinstance(t, Pointer):
+                t = t.basetype
+            elif isinstance(label, HasField) and isinstance(t, Struct):
+                t = t.fields.get(label.offset)
+            else:
+                return None
+            if t is None:
+                return None
+        return t
 
     @staticmethod
     def _offset_mirror_constraints(quotient_graph: networkx.MultiDiGraph) -> set[TypeConstraint]:
@@ -1226,11 +1527,17 @@ class SimpleSolver:
                 continue
             if n == 0 or src == dst:
                 continue
+            src_fields = set(fields_of(src))
             # fields of dst (= src.+n) at k are fields of src at k + n
             for access, field, end in fields_of(dst):
                 if field.offset + n < 0:
                     continue
-                mirrored = dtv(src, access, HasField(field.bits, field.offset + n, elem_count=field.elem_count))
+                mirrored_field = HasField(field.bits, field.offset + n, elem_count=field.elem_count)
+                if (access, mirrored_field, end) in src_fields:
+                    # the quotient graph has this field already; restating it under another representative of src's
+                    # class only kept the mirroring rounds from converging
+                    continue
+                mirrored = dtv(src, access, mirrored_field)
                 if mirrored is not None and not isinstance(end, TypeConstant):
                     new_constraints.add(Subtype(mirrored, end))
                     new_constraints.add(Subtype(end, mirrored))
@@ -1241,10 +1548,12 @@ class SimpleSolver:
         quotient_graph: networkx.MultiDiGraph, var_classes: set[TypeVariable]
     ) -> set[TypeConstraint]:
         """
-        A program variable q = p.+N without accesses of its own points into p's pointee at N. Bind p's fields at or
-        after N to q at (field offset - N) so that q is typed as a pointer. A class reached under several offsets is an
-        element pointer into an array, and gets only the first field it points at. A class reached from several bases
-        is left alone: binding it to fields of both would unify the two bases' fields through it.
+        A program variable q = p.+N without accesses of its own points into p's pointee at N. Bind p's fields from N up
+        to the next offset another interior pointer of p lands on (the sub-object q points at) to q at (field offset -
+        N), so that q is typed as a pointer; if that range has no field, bind the nearest field after N. A class reached
+        under several offsets is an element pointer into an array, and gets only the first field it points at. A class
+        reached from several bases is left alone: binding it to fields of both would unify the two bases' fields
+        through it.
         """
         fields = SimpleSolver._quotient_fields(quotient_graph)
         offsets_into: dict = defaultdict(set)
@@ -1258,11 +1567,15 @@ class SimpleSolver:
                 continue
             if n != 0 and src != dst:
                 offsets_into[dst].add((src, n))
+        offsets_from: dict = defaultdict(set)
+        for dst, edges in offsets_into.items():
+            for src, n in edges:
+                offsets_from[src].add(n)
         new_constraints: set[TypeConstraint] = set()
         for dst, edges in offsets_into.items():
             if dst not in var_classes or fields(dst):
                 continue
-            # a whole-object access (MAX_POINTSTO_BITS at 0) says nothing about what the pointer lands on
+            # a whole-object access (MAX_POINTSTO_BITS at 0) does not indicate what the pointer points at
             typed_fields = {
                 src: [(access, field, end) for access, field, end in fields(src) if field.bits != MAX_POINTSTO_BITS]
                 for src, _ in edges
@@ -1277,6 +1590,15 @@ class SimpleSolver:
             if len(offsets) == 1:
                 n = offsets[0]
                 bound = [(access, field, end) for access, field, end in src_fields if field.offset >= n]
+                # find the next pointer after n if any, and only bind fields before the next pointer.
+                limit = min((m for m in offsets_from[src] if m > n), default=None)
+                if limit is not None:
+                    in_range = [(access, field, end) for access, field, end in bound if field.offset < limit]
+                    if in_range:
+                        bound = in_range
+                    else:
+                        nearest = min((field.offset for _, field, _ in bound), default=None)
+                        bound = [(access, field, end) for access, field, end in bound if field.offset == nearest]
             else:
                 # the element the pointer lands on: the field closest after the nearest of the offsets
                 nearest = min(
@@ -1397,9 +1719,40 @@ class SimpleSolver:
         constraint_graph,
     ) -> set[TypeConstraint]:
         endpoints: set[TypeConstant | TypeVariable | DerivedTypeVariable] = set(non_primitive_endpoints)
-        constraints_0 = self._solve_constraints_between(constraint_graph, endpoints, PRIMITIVE_TYPES)
-        constraints_1 = self._solve_constraints_between(constraint_graph, PRIMITIVE_TYPES, endpoints)
+        # a primitive with labels is useless to Sketch.add_constraint unless flatten_typevar folds it into a pointee;
+        # enumerating such constraints is exponential when the constraint graph has large cycles (issue #7729)
+        constraints_0 = self._solve_constraints_between(
+            constraint_graph, endpoints, PRIMITIVE_TYPES, rhs_labels_ok=_is_pointee_label_suffix
+        )
+        constraints_1 = self._solve_constraints_between(
+            constraint_graph, PRIMITIVE_TYPES, endpoints, lhs_labels_ok=_is_pointee_label_prefix
+        )
         return constraints_0 | constraints_1
+
+    @staticmethod
+    def _constant_bounds_as_primitive_constraints(
+        constraints: set[TypeConstraint], tv: TypeVariable
+    ) -> set[TypeConstraint] | None:
+        """
+        Get all constraints where a type variable is _only_ bounded by a primitive type constant (a <: type_constant or
+        type_constant <: a).
+        """
+        primitive_constraints: set[TypeConstraint] = set()
+        for constraint in constraints:
+            if not isinstance(constraint, Subtype):
+                return None
+            if constraint.sub_type == tv:
+                bound = constraint.super_type
+            elif constraint.super_type == tv:
+                bound = constraint.sub_type
+            else:
+                # constraint does not involve the type variable; abort
+                return None
+            if not isinstance(bound, TypeConstant):
+                return None
+            if SimpleSolver._typevar_inside_set(bound, PRIMITIVE_TYPES):
+                primitive_constraints.add(constraint)
+        return primitive_constraints
 
     @staticmethod
     def _generate_transitive_subtype_constraints(
@@ -1477,6 +1830,31 @@ class SimpleSolver:
                 return constraint.super_type
         return None
 
+    @staticmethod
+    def _sorted_out_edges(graph: networkx.DiGraph, node, sorted_out_edges: dict) -> list:
+        out_edges = sorted_out_edges.get(node)
+        if out_edges is None:
+            # the graph does not change; sort each node's out-edges only once
+            out_edges = sorted_out_edges[node] = sorted(graph.out_edges(node, data=True), key=lambda x: str(x[1]))
+        return out_edges
+
+    def _sketch_child(self, curr_node: SketchNode, label: BaseLabel) -> SketchNode:
+        if isinstance(curr_node.typevar, DerivedTypeVariable):
+            base_typevar = curr_node.typevar.type_var
+            labels = curr_node.typevar.labels
+        elif isinstance(curr_node.typevar, TypeVariable):
+            base_typevar = curr_node.typevar
+            labels = ()
+        else:
+            raise TypeError("Unexpected")
+        labels += (label,)
+        succ_derived_typevar = self.tv_manager.new_dtv_with_merged_labels(
+            base_typevar,
+            labels=labels,
+        )
+        assert not isinstance(succ_derived_typevar, TypeConstant)
+        return SketchNode(succ_derived_typevar)
+
     def _get_all_paths(
         self,
         graph: networkx.DiGraph[TypeVariable | DerivedTypeVariable],
@@ -1485,33 +1863,19 @@ class SimpleSolver:
         visited: dict[TypeVariable | DerivedTypeVariable, SketchNode],
         sorted_out_edges: dict | None = None,
     ):
+        """
+        Unroll the sketch as a tree with one node per simple path from the root.
+        """
         if node not in graph:
             return
         if sorted_out_edges is None:
             sorted_out_edges = {}
-        out_edges = sorted_out_edges.get(node)
-        if out_edges is None:
-            # the graph does not change; sort each node's out-edges only once
-            out_edges = sorted_out_edges[node] = sorted(graph.out_edges(node, data=True), key=lambda x: str(x[1]))
+        out_edges = self._sorted_out_edges(graph, node, sorted_out_edges)
         curr_node = visited[node]
         for _, succ, data in out_edges:
             label = data["label"]
             if succ not in visited:
-                if isinstance(curr_node.typevar, DerivedTypeVariable):
-                    base_typevar = curr_node.typevar.type_var
-                    labels = curr_node.typevar.labels
-                elif isinstance(curr_node.typevar, TypeVariable):
-                    base_typevar = curr_node.typevar
-                    labels = ()
-                else:
-                    raise TypeError("Unexpected")
-                labels += (label,)
-                succ_derived_typevar = self.tv_manager.new_dtv_with_merged_labels(
-                    base_typevar,
-                    labels=labels,
-                )
-                assert not isinstance(succ_derived_typevar, TypeConstant)
-                succ_node = SketchNode(succ_derived_typevar)
+                succ_node = self._sketch_child(curr_node, label)
                 sketch.add_edge(curr_node, succ_node, label)
                 visited[succ] = succ_node
                 self._get_all_paths(graph, sketch, succ, visited, sorted_out_edges)
@@ -1520,6 +1884,75 @@ class SimpleSolver:
                 # a cycle exists
                 ref_node = RecursiveRefNode(visited[succ].typevar)
                 sketch.add_edge(curr_node, ref_node, label)
+
+    def _unrolled_sketch_size(
+        self,
+        graph: networkx.DiGraph[TypeVariable | DerivedTypeVariable],
+        root: TypeVariable,
+        scc_ids: dict,
+        sorted_out_edges: dict,
+    ) -> int:
+        """
+        The number of sketch nodes _get_all_paths would create from root, or SKETCH_UNROLL_LIMIT + 1 if it is larger.
+        A path can only return to nodes of the strongly connected component it is in, so the subtree below a node
+        depends only on the node and the members of its component on the path, which is what is memoized.
+        """
+        limit = self.SKETCH_UNROLL_LIMIT
+        memo: dict[tuple, int] = {}
+
+        def count(node, on_path: frozenset) -> int:
+            key = node, on_path
+            if key in memo:
+                return memo[key]
+            total = 0
+            for _, succ, _ in self._sorted_out_edges(graph, node, sorted_out_edges):
+                if succ in on_path:
+                    continue
+                succ_path = on_path | {succ} if scc_ids[succ] == scc_ids[node] else frozenset((succ,))
+                total += 1 + count(succ, succ_path)
+                if total > limit:
+                    total = limit + 1
+                    break
+            memo[key] = total
+            return total
+
+        return count(root, frozenset((root,)))
+
+    def _build_shared_sketch(
+        self,
+        graph: networkx.DiGraph[TypeVariable | DerivedTypeVariable],
+        sketch: Sketch,
+        root: TypeVariable,
+        root_node: SketchNode,
+        sorted_out_edges: dict,
+    ) -> None:
+        """
+        Build the sketch as a DAG with one node per class reachable from the root, in the same depth-first order as
+        _get_all_paths. Edges that close a cycle on the DFS stack become RecursiveRefNodes, and edges to a finished
+        class point to its existing node, so the sketch unfolds into the same regular tree within acyclic regions.
+        """
+        nodes: dict[TypeVariable | DerivedTypeVariable, SketchNode] = {root: root_node}
+        on_stack = {root}
+        stack = [(root, iter(self._sorted_out_edges(graph, root, sorted_out_edges)))]
+        while stack:
+            node, edges = stack[-1]
+            edge = next(edges, None)
+            if edge is None:
+                stack.pop()
+                on_stack.discard(node)
+                continue
+            _, succ, data = edge
+            label = data["label"]
+            curr_node = nodes[node]
+            if succ in on_stack:
+                sketch.add_edge(curr_node, RecursiveRefNode(nodes[succ].typevar), label)
+            elif succ in nodes:
+                sketch.add_edge(curr_node, nodes[succ], label)
+            else:
+                succ_node = nodes[succ] = self._sketch_child(curr_node, label)
+                sketch.add_edge(curr_node, succ_node, label)
+                on_stack.add(succ)
+                stack.append((succ, iter(self._sorted_out_edges(graph, succ, sorted_out_edges))))
 
     @staticmethod
     def _get_base_and_indirection_level(
@@ -2139,9 +2572,12 @@ class SimpleSolver:
                 elif isinstance(constraint.sub_type, (Int, Float)) and constraint.super_type == tv:
                     if constraint.sub_type.SIZE is not None:
                         tv_sizes[constraint.sub_type.SIZE].add(constraint)
-                elif isinstance(constraint.super_type, (Int, Float)) and constraint.sub_type == tv:
-                    if constraint.super_type.SIZE is not None:
-                        tv_sizes[constraint.super_type.SIZE].add(constraint)
+                elif (
+                    isinstance(constraint.super_type, (Int, Float))
+                    and constraint.sub_type == tv
+                    and constraint.super_type.SIZE is not None
+                ):
+                    tv_sizes[constraint.super_type.SIZE].add(constraint)
 
         to_drop = set()
         for tv_sizes in sizes_by_tv.values():
@@ -2411,6 +2847,8 @@ class SimpleSolver:
         graph: networkx.DiGraph,
         starts: set[TypeConstant | TypeVariable | DerivedTypeVariable],
         ends: set[TypeConstant | TypeVariable | DerivedTypeVariable],
+        lhs_labels_ok: Callable[[tuple], bool] | None = None,
+        rhs_labels_ok: Callable[[tuple], bool] | None = None,
     ) -> set[TypeConstraint]:
         start_nodes = set()
         end_nodes = set()
@@ -2432,7 +2870,9 @@ class SimpleSolver:
 
         dfa_solver = DFAConstraintSolver()
         try:
-            return dfa_solver.generate_constraints_between(graph, start_nodes, end_nodes)
+            return dfa_solver.generate_constraints_between(
+                graph, start_nodes, end_nodes, lhs_labels_ok=lhs_labels_ok, rhs_labels_ok=rhs_labels_ok
+            )
         except EmptyEpsilonNFAError:
             return set()
 

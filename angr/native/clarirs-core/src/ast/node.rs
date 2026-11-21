@@ -15,7 +15,7 @@ use crate::{
 /// [`AstType`] so its sort can be queried in O(1) without inspecting the operation.
 pub struct AstNode<'c> {
     op: AstOp<'c>,
-    annotations: BTreeSet<Annotation>,
+    annotations: BTreeSet<Arc<Annotation>>,
     ast_type: AstType,
     ctx: &'c Context<'c>,
     hash: u64,
@@ -23,6 +23,7 @@ pub struct AstNode<'c> {
     depth: u32,
     symbolic: bool,
     simplifiable: bool,
+    pub(crate) has_blocking_annotations: bool,
     /// Hash of this node's simplified form (`0` = none), resolved via the AST cache.
     pub(crate) simplified: AtomicU64,
 }
@@ -59,7 +60,7 @@ impl<'c> AstNode<'c> {
     pub(crate) fn new(
         ctx: &'c Context<'c>,
         op: AstOp<'c>,
-        annotations: BTreeSet<Annotation>,
+        annotations: BTreeSet<Arc<Annotation>>,
     ) -> Self {
         let ast_type = op.infer_type();
         let variables = op.variables();
@@ -70,11 +71,11 @@ impl<'c> AstNode<'c> {
             || op.is_inherently_symbolic()
             || op.child_iter().any(|c| c.symbolic());
 
-        let simplifiable = (symbolic
-            || !annotations
-                .iter()
-                .any(|a| !a.eliminatable() && !a.relocatable()))
-            && op.child_iter().all(|c| c.simplifiable());
+        let blocking_here = annotations.iter().any(|a| a.blocks_simplification());
+        let simplifiable =
+            (symbolic || !blocking_here) && op.child_iter().all(|c| c.simplifiable());
+        let has_blocking_annotations =
+            blocking_here || op.child_iter().any(|c| c.has_blocking_annotations);
 
         let hash = structural_hash(ast_type, &op, &annotations);
 
@@ -88,6 +89,7 @@ impl<'c> AstNode<'c> {
             annotations,
             symbolic,
             simplifiable,
+            has_blocking_annotations,
             simplified: AtomicU64::new(0),
         }
     }
@@ -104,13 +106,13 @@ impl<'c> AstNode<'c> {
         self.ast_type
     }
 
-    pub fn annotations(&self) -> &BTreeSet<Annotation> {
+    pub fn annotations(&self) -> &BTreeSet<Arc<Annotation>> {
         &self.annotations
     }
 
     pub fn annotate(
         self: Arc<Self>,
-        annotations: impl IntoIterator<Item = Annotation>,
+        annotations: impl IntoIterator<Item = Arc<Annotation>>,
     ) -> Result<Arc<Self>, ClarirsError> {
         let combined: BTreeSet<_> = self
             .annotations()
@@ -118,10 +120,9 @@ impl<'c> AstNode<'c> {
             .cloned()
             .chain(annotations)
             .collect();
-        let simplifiable = self.simplifiable()
-            && !&combined
-                .iter()
-                .any(|a| !a.eliminatable() && !a.relocatable());
+        let blocking_here = combined.iter().any(|a| a.blocks_simplification());
+        let simplifiable = self.simplifiable() && !blocking_here;
+        let has_blocking_annotations = self.has_blocking_annotations || blocking_here;
 
         let hash = structural_hash(self.ast_type, &self.op, &combined);
         // Fast path: skip variable collection/allocation in new
@@ -135,6 +136,7 @@ impl<'c> AstNode<'c> {
             annotations: combined,
             symbolic: self.symbolic,
             simplifiable,
+            has_blocking_annotations,
             simplified: AtomicU64::new(0),
         })
     }

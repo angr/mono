@@ -83,7 +83,8 @@ impl ExtractPyArgs for AstRef<'static> {
             | AstOp::Mul(args)
             | AstOp::Concat(args)
             | AstOp::Union(args)
-            | AstOp::Intersection(args) => args
+            | AstOp::Intersection(args)
+            | AstOp::StrConcat(args) => args
                 .iter()
                 .map(|a| wrap_child(py, a))
                 .collect::<Result<Vec<_>, _>>()?,
@@ -119,6 +120,7 @@ impl ExtractPyArgs for AstRef<'static> {
             | AstOp::SLE(a, b)
             | AstOp::SGT(a, b)
             | AstOp::SGE(a, b)
+            | AstOp::FpEq(a, b)
             | AstOp::FpLt(a, b)
             | AstOp::FpLeq(a, b)
             | AstOp::FpGt(a, b)
@@ -126,7 +128,6 @@ impl ExtractPyArgs for AstRef<'static> {
             | AstOp::StrContains(a, b)
             | AstOp::StrPrefixOf(a, b)
             | AstOp::StrSuffixOf(a, b)
-            | AstOp::StrConcat(a, b)
             | AstOp::Sub(a, b)
             | AstOp::UDiv(a, b)
             | AstOp::SDiv(a, b)
@@ -165,8 +166,17 @@ impl ExtractPyArgs for AstRef<'static> {
                 wrap_child(py, b)?,
                 Bound::new(py, PyRM::from(rm))?.into_any(),
             ],
-            AstOp::FpSqrt(a, rm) => vec![
+            AstOp::FpSqrt(a, rm) | AstOp::FpRoundToIntegral(a, rm) => vec![
                 wrap_child(py, a)?,
+                Bound::new(py, PyRM::from(rm))?.into_any(),
+            ],
+            AstOp::FpMin(a, b) | AstOp::FpMax(a, b) => {
+                vec![wrap_child(py, a)?, wrap_child(py, b)?]
+            }
+            AstOp::FpFma(a, b, c, rm) => vec![
+                wrap_child(py, a)?,
+                wrap_child(py, b)?,
+                wrap_child(py, c)?,
                 Bound::new(py, PyRM::from(rm))?.into_any(),
             ],
         })

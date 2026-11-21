@@ -1,11 +1,10 @@
+use crate::algorithms::replace::Replacements;
 use crate::prelude::*;
-use anyhow::Result;
 use num_bigint::BigUint;
 use smallvec::SmallVec;
-use std::collections::HashMap;
 
 #[test]
-fn test_neg() -> Result<()> {
+fn test_neg() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let table: Vec<(u64, u64)> = vec![
@@ -36,7 +35,7 @@ fn test_neg() -> Result<()> {
 }
 
 #[test]
-fn test_double_negation() -> Result<()> {
+fn test_double_negation() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     // Test with concrete values
@@ -68,7 +67,7 @@ fn test_double_negation() -> Result<()> {
 }
 
 #[test]
-fn test_add() -> Result<()> {
+fn test_add() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let table: Vec<(u64, u64, u64)> = vec![
@@ -104,7 +103,7 @@ fn test_add() -> Result<()> {
 }
 
 #[test]
-fn test_sub() -> Result<()> {
+fn test_sub() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let table: Vec<(u64, u64, u64)> = vec![
@@ -141,7 +140,7 @@ fn test_sub() -> Result<()> {
 }
 
 #[test]
-fn test_mul() -> Result<()> {
+fn test_mul() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let table: Vec<(u64, u64, u64)> = vec![
@@ -179,7 +178,7 @@ fn test_mul() -> Result<()> {
 }
 
 #[test]
-fn test_udiv() -> Result<()> {
+fn test_udiv() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let table: Vec<(u8, u8, u8)> = vec![
@@ -213,7 +212,7 @@ fn test_udiv() -> Result<()> {
 }
 
 #[test]
-fn test_sdiv() -> Result<()> {
+fn test_sdiv() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let table: Vec<(i64, i64, i64)> = vec![
@@ -271,7 +270,7 @@ fn test_sdiv() -> Result<()> {
 }
 
 #[test]
-fn test_urem() -> Result<()> {
+fn test_urem() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let table: Vec<(u64, u64, u64)> = vec![
@@ -314,7 +313,7 @@ fn test_urem() -> Result<()> {
 }
 
 #[test]
-fn test_srem() -> Result<()> {
+fn test_srem() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let table: Vec<(i64, i64, i64)> = vec![
@@ -366,7 +365,7 @@ fn test_srem() -> Result<()> {
 }
 
 #[test]
-fn test_and() -> Result<()> {
+fn test_and() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let table: Vec<(u64, u64, u64)> = vec![
@@ -399,7 +398,7 @@ fn test_and() -> Result<()> {
 }
 
 #[test]
-fn test_or() -> Result<()> {
+fn test_or() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let table: Vec<(u64, u64, u64)> = vec![
@@ -432,7 +431,7 @@ fn test_or() -> Result<()> {
 }
 
 #[test]
-fn test_xor() -> Result<()> {
+fn test_xor() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let table: Vec<(u64, u64, u64)> = vec![
@@ -465,7 +464,7 @@ fn test_xor() -> Result<()> {
 }
 
 #[test]
-fn test_not() -> Result<()> {
+fn test_not() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let table: Vec<(u64, u64)> = vec![
@@ -496,7 +495,7 @@ fn test_not() -> Result<()> {
 }
 
 #[test]
-fn test_shl() -> Result<()> {
+fn test_shl() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let table: Vec<(u64, u64, u64)> = vec![
@@ -510,12 +509,13 @@ fn test_shl() -> Result<()> {
         (2, 3, 16),
         (3, 2, 12),
         (3, 3, 24),
-        // Note: Shifts of u64::MAX cause overflow in the BitVec implementation
-        // This is a pre-existing bug not related to simplification
-        // (u64::MAX, 1, u64::MAX - 1),
-        // (u64::MAX, 2, u64::MAX - 3),
+        (u64::MAX, 1, u64::MAX - 1),
+        (u64::MAX, 2, u64::MAX - 3),
         (42, 1, 84),
         (255, 8, 65280),
+        // Amounts too large for u32 still shift every bit out
+        (1, 1 << 32, 0),
+        (u64::MAX, 1 << 63, 0),
     ];
 
     for (a, b, expected) in table {
@@ -533,11 +533,19 @@ fn test_shl() -> Result<()> {
     let result = ctx.shl(&x, &zero)?.simplify()?;
     assert_eq!(result, x);
 
+    // An amount wider than 64 bits is read by value
+    let x = ctx.bvv(BitVec::from((1, 128)))?;
+    let three = ctx.bvv(BitVec::from((3, 128)))?;
+    assert_eq!(
+        ctx.shl(&x, &three)?.simplify()?,
+        ctx.bvv(BitVec::from((8, 128)))?
+    );
+
     Ok(())
 }
 
 #[test]
-fn test_lshr() -> Result<()> {
+fn test_lshr() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let table: Vec<(u64, u64, u64)> = vec![
@@ -567,6 +575,9 @@ fn test_lshr() -> Result<()> {
         (u64::MAX, 1, u64::MAX >> 1),
         (u64::MAX, 63, 1),
         (u64::MAX, 64, 0),
+        // Amounts too large for u32 still shift every bit out
+        (1, 1 << 32, 0),
+        (u64::MAX, 1 << 63, 0),
     ];
 
     for (a, b, expected) in table {
@@ -588,7 +599,7 @@ fn test_lshr() -> Result<()> {
 }
 
 #[test]
-fn test_lshr_of_shl() -> Result<()> {
+fn test_lshr_of_shl() -> Result<(), ClarirsError> {
     // (lshr (shl x n) m) folds to an extract of x; check the rewrite against
     // concrete evaluation for every (n, m) pair, including n > m, n == m,
     // n < m, and shift amounts that clear the value entirely.
@@ -623,7 +634,7 @@ fn test_lshr_of_shl() -> Result<()> {
 }
 
 #[test]
-fn test_ashr() -> Result<()> {
+fn test_ashr() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let table: Vec<(u64, u64, u64)> = vec![
@@ -653,6 +664,9 @@ fn test_ashr() -> Result<()> {
         (0xFFFFFFFFFFFFFFFF, 1, 0xFFFFFFFFFFFFFFFF),
         (0xFFFFFFFFFFFFFFFF, 63, 0xFFFFFFFFFFFFFFFF),
         (0xFFFFFFFFFFFFFFFF, 64, 0xFFFFFFFFFFFFFFFF),
+        // Amounts too large for u32 still shift every bit out
+        (1, 1 << 32, 0),
+        (0x8000000000000000, 1 << 63, 0xFFFFFFFFFFFFFFFF),
     ];
 
     for (a, b, expected) in table {
@@ -674,7 +688,7 @@ fn test_ashr() -> Result<()> {
 }
 
 #[test]
-fn test_zext() -> Result<()> {
+fn test_zext() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let table = vec![
@@ -708,7 +722,7 @@ fn test_zext() -> Result<()> {
 }
 
 #[test]
-fn test_sext() -> Result<()> {
+fn test_sext() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let table = vec![
@@ -772,7 +786,7 @@ fn test_sext() -> Result<()> {
 }
 
 #[test]
-fn test_byte_reverse() -> Result<()> {
+fn test_byte_reverse() -> Result<(), ClarirsError> {
     let context = Context::new();
 
     let table: Vec<(u64, u64)> = vec![
@@ -827,7 +841,7 @@ fn test_byte_reverse() -> Result<()> {
 }
 
 #[test]
-fn test_rotate_left() -> Result<()> {
+fn test_rotate_left() -> Result<(), ClarirsError> {
     let context = Context::new();
 
     let table: Vec<(u64, u64, u64)> = vec![
@@ -874,7 +888,7 @@ fn test_rotate_left() -> Result<()> {
 }
 
 #[test]
-fn test_rotate_right() -> Result<()> {
+fn test_rotate_right() -> Result<(), ClarirsError> {
     let context = Context::new();
 
     let table: Vec<(u64, u64, u64)> = vec![
@@ -921,7 +935,7 @@ fn test_rotate_right() -> Result<()> {
 }
 
 #[test]
-fn test_extract() -> Result<()> {
+fn test_extract() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     // Whole bitvector, concrete
@@ -943,7 +957,7 @@ fn test_extract() -> Result<()> {
 }
 
 #[test]
-fn test_extract_concat() -> Result<()> {
+fn test_extract_concat() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     // Symbolic test cases
@@ -969,7 +983,7 @@ fn test_extract_concat() -> Result<()> {
 }
 
 #[test]
-fn test_identity_simplifications() -> anyhow::Result<()> {
+fn test_identity_simplifications() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let x = ctx.bvs("x", 64)?;
@@ -1057,7 +1071,7 @@ fn test_identity_simplifications() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_bitvec_not_identities() -> Result<()> {
+fn test_bitvec_not_identities() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let x = ctx.bvs("x", 64)?;
@@ -1083,7 +1097,7 @@ fn test_bitvec_not_identities() -> Result<()> {
 }
 
 #[test]
-fn test_extract_full_width() -> Result<()> {
+fn test_extract_full_width() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     // Test extracting full width of a 32-bit BVS
@@ -1106,7 +1120,7 @@ fn test_extract_full_width() -> Result<()> {
 }
 
 #[test]
-fn test_extract_zeroext() -> Result<()> {
+fn test_extract_zeroext() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     // Test Extract(ZeroExt(x, n), high, low) where high < original_size
@@ -1122,7 +1136,7 @@ fn test_extract_zeroext() -> Result<()> {
 }
 
 #[test]
-fn test_debug_extract_size() -> Result<()> {
+fn test_debug_extract_size() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     let bvs = ctx.bvs("test", 32)?;
@@ -1138,7 +1152,7 @@ fn test_debug_extract_size() -> Result<()> {
 }
 
 #[test]
-fn test_fp_to_sbv_negative_value() -> Result<()> {
+fn test_fp_to_sbv_negative_value() -> Result<(), ClarirsError> {
     let ctx = Context::new();
     let converted = ctx
         .fp_to_sbv(ctx.fpv(Float::from(-3.0_f64))?, 32, FPRM::NearestTiesToEven)?
@@ -1150,12 +1164,10 @@ fn test_fp_to_sbv_negative_value() -> Result<()> {
 /// The concrete fold rounds by the conversion's mode, as `fp.to_sbv` /
 /// `fp.to_ubv` do; it used to truncate whatever the mode.
 #[test]
-fn test_fp_to_bv_rounds_by_mode() -> Result<()> {
+fn test_fp_to_bv_rounds_by_mode() -> Result<(), ClarirsError> {
     let ctx = Context::new();
-    let sbv = |v: f64, rm: FPRM| -> Result<AstRef<'_>> {
-        Ok(ctx
-            .fp_to_sbv(ctx.fpv(Float::from(v))?, 32, rm)?
-            .simplify()?)
+    let sbv = |v: f64, rm: FPRM| -> Result<AstRef<'_>, ClarirsError> {
+        ctx.fp_to_sbv(ctx.fpv(Float::from(v))?, 32, rm)?.simplify()
     };
     let bv32 = |v: u64| ctx.bvv(BitVec::from((v, 32)));
     assert_eq!(sbv(1.5, FPRM::NearestTiesToEven)?, bv32(2)?);
@@ -1174,20 +1186,20 @@ fn test_fp_to_bv_rounds_by_mode() -> Result<()> {
     let wide = ctx
         .fp_to_ubv(ctx.fpv(Float::from(1e30_f64))?, 128, FPRM::TowardZero)?
         .simplify()?;
-    let exact: BigUint = "1000000000000000019884624838656".parse()?;
+    let exact: BigUint = "1000000000000000019884624838656".parse().unwrap();
     assert_eq!(wide, ctx.bvv(BitVec::from((exact, 128)))?);
     Ok(())
 }
 
 #[test]
-fn test_rotate_over_symbolic_rotation_by_constant() -> Result<()> {
+fn test_rotate_over_symbolic_rotation_by_constant() -> Result<(), ClarirsError> {
     let ctx = Context::new();
     let x = ctx.bvs("x", 8)?;
     let s = ctx.bvs("s", 8)?;
     let three = ctx.bvv(BitVec::from((3, 8)))?;
-    let values: HashMap<u64, AstRef<'_>> = [
-        (x.hash(), ctx.bvv(BitVec::from((0b1001_0110, 8)))?),
-        (s.hash(), ctx.bvv(BitVec::from((2, 8)))?),
+    let values: Replacements<'_> = [
+        (x.clone(), ctx.bvv(BitVec::from((0b1001_0110, 8)))?),
+        (s.clone(), ctx.bvv(BitVec::from((2, 8)))?),
     ]
     .into_iter()
     .collect();
@@ -1207,7 +1219,7 @@ fn test_rotate_over_symbolic_rotation_by_constant() -> Result<()> {
 }
 
 #[test]
-fn test_rotate_amount_reduced_unsigned_modulo_width() -> Result<()> {
+fn test_rotate_amount_reduced_unsigned_modulo_width() -> Result<(), ClarirsError> {
     let ctx = Context::new();
 
     // 58 is -6 as a signed 6-bit value, which a signed modulus reads as a
@@ -1232,7 +1244,7 @@ fn test_rotate_amount_reduced_unsigned_modulo_width() -> Result<()> {
 }
 
 #[test]
-fn test_union_intersection_flatten_and_dedup() -> Result<()> {
+fn test_union_intersection_flatten_and_dedup() -> Result<(), ClarirsError> {
     let ctx = Context::new();
     let x = ctx.bvs("x", 32)?;
     let y = ctx.bvs("y", 32)?;
@@ -1263,7 +1275,7 @@ fn test_union_intersection_flatten_and_dedup() -> Result<()> {
 }
 
 #[test]
-fn test_extract_distributes_over_union() -> Result<()> {
+fn test_extract_distributes_over_union() -> Result<(), ClarirsError> {
     let ctx = Context::new();
     let x = ctx.bvs("x", 32)?;
     let union = ctx.union([ctx.bvv(BitVec::from((0x11223344u64, 32)))?, x.clone()])?;
@@ -1293,7 +1305,7 @@ fn test_extract_distributes_over_union() -> Result<()> {
 }
 
 #[test]
-fn test_shared_subterms_simplify_once_per_call() -> Result<()> {
+fn test_shared_subterms_simplify_once_per_call() -> Result<(), ClarirsError> {
     // Each level uses the previous node twice, and rewrites push the extract
     // down through every level, so simplifying a shared subterm once per path
     // to it would take 2^LEVELS work.
@@ -1318,5 +1330,83 @@ fn test_shared_subterms_simplify_once_per_call() -> Result<()> {
             "differs at x = {value:#x}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn test_ite_absorbs_nested_ite_on_same_condition() -> Result<(), ClarirsError> {
+    let ctx = Context::new();
+    let c = ctx.bools("c")?;
+    let a = ctx.bvs("a", 32)?;
+    let b = ctx.bvs("b", 32)?;
+    let d = ctx.bvs("d", 32)?;
+    let inner = ctx.ite(&c, &a, &b)?;
+
+    // If(c, If(c, a, b), d) -> If(c, a, d)
+    assert_eq!(ctx.ite(&c, &inner, &d)?.simplify()?, ctx.ite(&c, &a, &d)?);
+    // If(c, d, If(c, a, b)) -> If(c, d, b)
+    assert_eq!(ctx.ite(&c, &d, &inner)?.simplify()?, ctx.ite(&c, &d, &b)?);
+    // Both sides at once.
+    assert_eq!(
+        ctx.ite(&c, &inner, ctx.ite(&c, &d, &b)?)?.simplify()?,
+        ctx.ite(&c, &a, &b)?
+    );
+    // Absorbing can leave identical branches: If(c, If(c, a, b), a) -> a
+    assert_eq!(ctx.ite(&c, &inner, &a)?.simplify()?, a);
+    // The condition is compared after If(!c, x, y) -> If(c, y, x).
+    assert_eq!(
+        ctx.ite(ctx.not(&c)?, &d, &inner)?.simplify()?,
+        ctx.ite(&c, &a, &d)?
+    );
+    // A different inner condition is left alone.
+    let other = ctx.ite(ctx.bools("c2")?, &a, &b)?;
+    let unrelated = ctx.ite(&c, &other, &d)?;
+    assert_eq!(unrelated.simplify()?, unrelated);
+    Ok(())
+}
+
+#[test]
+fn test_add_of_negative_constant_is_a_sub() -> Result<(), ClarirsError> {
+    let ctx = Context::new();
+    let x = ctx.bvs("x", 32)?;
+    let c = |v: u64| ctx.bvv(BitVec::from((v, 32))).unwrap();
+
+    // x + c with the sign bit of c set is x - (-c), and constants fold into that form
+    assert_eq!(ctx.add(&x, c(0xffff_ffff))?.simplify()?, ctx.sub(&x, c(1))?);
+    assert_eq!(
+        ctx.add(&ctx.sub(&x, c(0x1e8))?, c(0x120))?.simplify()?,
+        ctx.sub(&x, c(0xc8))?
+    );
+    assert_eq!(
+        ctx.add(&ctx.add(&x, c(0x100))?, c(0xffff_ff00))?
+            .simplify()?,
+        x
+    );
+
+    // the smallest signed value is its own negation and stays an Add
+    let min = ctx.add(&x, c(0x8000_0000))?;
+    assert_eq!(min.simplify()?, min);
+
+    // a sum of symbols keeps its constant on the outside
+    let y = ctx.bvs("y", 32)?;
+    assert_eq!(
+        ctx.add_many(vec![x.clone(), y.clone(), c(0xffff_fffe)])?
+            .simplify()?,
+        ctx.sub(&ctx.add(&x, &y)?, c(2))?
+    );
+    Ok(())
+}
+
+#[test]
+fn test_rotate_shift_mask_amounts_overflow() -> Result<(), ClarirsError> {
+    let ctx = Context::new();
+    let x = ctx.bvs("x", 64)?;
+    let shl = ctx.shl(&x, &ctx.bvv(BitVec::from((65u64, 64)))?)?;
+    let lshr = ctx.lshr(&x, &ctx.bvv(BitVec::from((u64::MAX, 64)))?)?;
+    let masked = ctx.and2(
+        &ctx.or2(&shl, &lshr)?,
+        &ctx.bvv(BitVec::from((0xffu64, 64)))?,
+    )?;
+    assert_eq!(masked.simplify()?, masked);
     Ok(())
 }

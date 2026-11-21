@@ -1,6 +1,7 @@
 # pylint:disable=too-many-boolean-expressions,protected-access
 from __future__ import annotations
 
+import bisect
 import contextlib
 import copy
 import enum
@@ -52,6 +53,8 @@ from angr.calling_conventions import (
     CC,
     SimArrayArg,
     SimCC,
+    SimCCMicrosoftAMD64,
+    SimCCMicrosoftAMD64NoStructReturn,
     SimCCUsercall,
     SimComboArg,
     SimFunctionArgument,
@@ -118,7 +121,7 @@ from angr.utils.ail_serialization import (
 from angr.utils.constants import DEFAULT_STATEMENT
 from angr.utils.graph import GraphUtils
 from angr.utils.ssa import is_phi_assignment
-from angr.utils.types import dereference_simtype_by_lib
+from angr.utils.types import dereference_simtype_by_lib, unpack_typeref
 from angr.utils.vex import block_branch_ins_addr
 
 from .ail_simplifier import AILSimplifier
@@ -139,11 +142,12 @@ from .semantic_naming import SemanticNamingOrchestrator
 from .ssailification.ssailification import Ssailification
 from .stack_item import StackItem, StackItemType
 from .stackarg_offset_manager import StackArgOffsetManager
-from .utils import copy_expr_with_tags, update_conditional_jump_target, update_jump_target
+from .utils import copy_expr_with_tags, type_fits_variable, update_conditional_jump_target, update_jump_target
 from .variable_map import VariableMap
 
 if TYPE_CHECKING:
     from angr.knowledge_plugins.cfg import CFGModel
+    from angr.sim_type import SimType
 
     from .decompilation_cache import DecompilationCache
     from .peephole_optimizations import PeepholeOptimizationExprBase, PeepholeOptimizationStmtBase
@@ -469,6 +473,7 @@ class Clinic(Analysis, Serializable):
         static_buffers: dict | None = None,
         flatten_args=False,
         constrain_callee_prototypes: bool = False,
+        upgrade_hidden_ptrarg_to_retval: bool = False,
         semvar_naming: bool = True,
         flavor: str = Flavors.DEFAULT_FLAVOR,
         variable_map: VariableMap | None = None,
@@ -491,6 +496,9 @@ class Clinic(Analysis, Serializable):
         self.func_ret_var = SimVariable(0, "__retvar", "__retvar")
         # True once _recover_and_link_variables has populated kb.dec_variables for this function this run
         self._variables_recovered = False
+        # struct- and array-typed stack variables: stack offset -> (variable, size in bytes)
+        self._stack_complex_types: dict[int, tuple[SimStackVariable, int]] = {}
+        self._stack_complex_type_offsets: list[int] = []
         # VariableMap is a side container that holds variable/variable_offset/custom_string/reference_values and the
         # sibling reference_variable/reference_variable_offset for AIL atoms, keyed by their .idx. It supersedes
         # storing this information directly on AIL Statement/Expression objects.
@@ -573,6 +581,9 @@ class Clinic(Analysis, Serializable):
         self._preserve_vvar_ids: set[int] = set()
         self._type_hints: list[tuple[atoms.VirtualVariable | atoms.MemoryLocation, str]] = []
 
+        # recovered variable-length arrays
+        self._vla_allocas: list[tuple[frozenset[int], ailment.Expr.Load]] = []
+
         # inlining help
         self._sp_shift = sp_shift
         self._max_stack_depth = 0
@@ -596,6 +607,10 @@ class Clinic(Analysis, Serializable):
         self.copied_var_ids: set[int] = set()
 
         self._constrain_callee_prototypes = constrain_callee_prototypes
+        self._upgrade_hidden_ptrarg_to_retval = upgrade_hidden_ptrarg_to_retval
+        #: the prototype that this function was decompiled against.
+        self.decompiled_prototype: SimTypeFunction | None = None
+        self.hidden_result_pointer_upgraded: bool = False
         self._save_unoptimized_graph = save_unoptimized_graph
         # the user's KnownPattern force-enable selection; consumed by the KnownPatternOutliner optimization pass
         self._known_patterns = known_patterns
@@ -1133,6 +1148,10 @@ class Clinic(Analysis, Serializable):
             if stage < self._start_stage or stage > self._end_stage or stage in self._skip_stages:
                 continue
             stages[stage]()
+
+        self.decompiled_prototype = self.function.get_prototype(self.flavor)
+        if self._upgrade_hidden_ptrarg_to_retval and self._variables_recovered:
+            self._upgrade_msx64_cc_hidden_ptrarg_to_retval()
 
         # remove empty nodes from the graph
         self._ail_graph = self.remove_empty_nodes(self._ail_graph)
@@ -2593,7 +2612,7 @@ class Clinic(Analysis, Serializable):
         remove_dead_assignments=True,
     ) -> bool:
         """
-        Simplify the entire function until it reaches a fixed point.
+        Simplify the entire function until it reaches a fixed point or hitting the maximum number of iterations.
 
         :param narrow_rounds:   How many leading iterations run expression narrowing, or None to narrow on every
                                 iteration. Narrowing is not part of the fixed point, so a caller that needs more than
@@ -2601,8 +2620,6 @@ class Clinic(Analysis, Serializable):
         :return:                True if a fixed point was reached, False if the iteration limit was hit first (in
                                 which case the graph may still be simplifiable).
         """
-
-        simplified = False
 
         for idx in range(max_iterations):
             simplified = self._simplify_function_once(
@@ -2624,8 +2641,6 @@ class Clinic(Analysis, Serializable):
             if not simplified:
                 return True
         return False
-
-        return simplified
 
     @timethis
     def _simplify_function_once(
@@ -3302,6 +3317,40 @@ class Clinic(Analysis, Serializable):
             new_proto.returnty = returnty
             self.function.set_prototype(self.flavor, new_proto.with_arch(self.project.arch))
 
+    def _upgrade_msx64_cc_hidden_ptrarg_to_retval(self) -> None:
+        """
+        Microsoft x64 calling convention has a special case for functions that return a struct by value. In this case,
+        the caller allocates space for the return value and passes a pointer to the callee function as the hidden first
+        argument. The callee then writes the return value to that space and returns the pointer. This method attempts
+        to upgrade the function prototype to reflect that the function actually returns a value of the type pointed to
+        by the hidden pointer argument.
+        """
+        func = self.function
+        proto = func.get_prototype(self.flavor)
+        if (
+            self.flavor != Flavors.DEFAULT_FLAVOR
+            or type(func.calling_convention) is not SimCCMicrosoftAMD64NoStructReturn
+            or proto is None
+            or not proto.args
+            or func.is_prototype_groundtruth_for(self.flavor)
+        ):
+            return
+        arch = self.project.arch
+        if proto.returnty is None or proto.returnty.with_arch(arch).size != arch.bits:
+            return
+        ptr_ty = proto.args[0]
+        if not isinstance(ptr_ty, SimTypePointer):
+            return
+        result_ty = ptr_ty.pts_to.with_arch(arch)
+        cc = SimCCMicrosoftAMD64(arch)
+        if result_ty.size is None or not cc.return_in_implicit_outparam(result_ty):
+            return
+        arg_names = proto.arg_names[1:] if proto.arg_names else None
+        new_proto = SimTypeFunction(proto.args[1:], result_ty, arg_names=arg_names, variadic=proto.variadic)
+        func.calling_convention = cc
+        func.set_prototype(self.flavor, new_proto.with_arch(arch), source=PrototypeSource.CCA_DECOMPILER)
+        self.hidden_result_pointer_upgraded = True
+
     @timethis
     def _make_function_prototype(self, arg_list: list[SimVariable]):
         if self.function.is_prototype_groundtruth_for(self.flavor):
@@ -3312,10 +3361,13 @@ class Clinic(Analysis, Serializable):
         existing_proto = self.function.get_prototype(self.flavor)
 
         variables = self.kb.dec_variables[self.function.addr]
-        func_args = []
+        func_args: list[SimType] = []
         for idx, arg in enumerate(arg_list):
             func_arg = None
             arg_ty = variables.get_variable_type(arg)
+            if arg_ty is not None and not type_fits_variable(arg_ty, arg, self.project.arch):
+                # resilience: reject types that are wider than the variable itself
+                arg_ty = None
             if arg_ty is None:
                 # determine type based on size
                 if isinstance(arg, (SimRegisterVariable, SimStackVariable)):
@@ -3323,12 +3375,16 @@ class Clinic(Analysis, Serializable):
                         func_arg = SimTypeChar()
                     elif arg.size == 2:
                         func_arg = SimTypeShort()
-                    elif arg.size == 4:
+                    elif 2 < arg.size <= 4:
                         func_arg = SimTypeInt()
-                    elif arg.size == 8:
+                    elif 4 < arg.size <= 8:
                         func_arg = SimTypeLongLong()
                     else:
-                        l.warning("Unsupported argument size %d.", arg.size)
+                        l.warning("Unsupported argument size %d; fall back to SimTypeInt().", arg.size)
+                        func_arg = SimTypeInt()
+                else:
+                    l.warning("Unsupported argument type %s; fall back to SimTypeInt().", type(arg).__name__)
+                    func_arg = SimTypeInt()
             else:
                 func_arg = arg_ty
 
@@ -3413,7 +3469,7 @@ class Clinic(Analysis, Serializable):
         for block_node in self.function.graph.nodes():
             try:
                 vex = self.project.factory.block(block_node.addr, size=block_node.size).vex
-            except Exception:
+            except SimTranslationError:
                 continue
             if vex.jumpkind != "Ijk_Call" or not isinstance(vex.next, pyvex.IRExpr.Const):
                 continue
@@ -3454,7 +3510,7 @@ class Clinic(Analysis, Serializable):
         new_func_args = []
         new_arg_list = []
         skip_next = False
-        for idx in range(len(arg_list)):
+        for idx in range(len(arg_list)):  # pylint:disable=consider-using-enumerate
             if skip_next:
                 skip_next = False
                 continue
@@ -3514,7 +3570,7 @@ class Clinic(Analysis, Serializable):
         for block_node in self.function.graph.nodes():
             try:
                 vex = self.project.factory.block(block_node.addr, size=block_node.size).vex
-            except Exception:
+            except SimTranslationError:
                 continue
             if vex.jumpkind != "Ijk_Call" or not isinstance(vex.next, pyvex.IRExpr.Const):
                 continue
@@ -3551,7 +3607,7 @@ class Clinic(Analysis, Serializable):
         new_arg_list: list[SimVariable] = []
         new_proto_args: list[SimType] = []
         skip_next = False
-        for idx in range(len(arg_list)):
+        for idx in range(len(arg_list)):  # pylint:disable=consider-using-enumerate
             if skip_next:
                 skip_next = False
                 continue
@@ -3810,6 +3866,7 @@ class Clinic(Analysis, Serializable):
                 )
 
         # Link variables and struct member information to every statement and expression
+        self._collect_stack_complex_types(var_manager)
         for block in ail_graph.nodes():
             self._link_variables_on_block(block, tmp_kb)
 
@@ -3837,6 +3894,51 @@ class Clinic(Analysis, Serializable):
             self._cache.max_tv_id = vr.tv_manager.max_tv_id
 
         return tmp_kb
+
+    def _collect_stack_complex_types(self, variable_manager: VariableManagerInternal) -> None:
+        """
+        Collect the struct- and array-typed stack variables by stack offset. Each one is taken to own its bytes for the
+        entire function (no stack slot reuse).
+        """
+        found: dict[int, tuple[SimStackVariable, int]] = {}
+        for var in variable_manager.get_variables(sort="stack"):
+            if not isinstance(var, SimStackVariable) or not isinstance(var.offset, int):
+                continue
+            ty = unpack_typeref(variable_manager.get_variable_type(var))
+            if not isinstance(ty, (SimStruct, SimTypeArray)) or not ty.size:
+                continue
+            size = ty.size // self.project.arch.byte_width
+            existing = found.get(var.offset)
+            if existing is None or (size, existing[0].ident or "") > (existing[1], var.ident or ""):
+                found[var.offset] = var, size
+        self._stack_complex_types = found
+        self._stack_complex_type_offsets = sorted(found)
+
+    def _map_stackvar_to_struct_member(
+        self,
+        variable_manager: VariableManagerInternal,
+        expr_or_stmt: ailment.Expr.Expression | ailment.Stmt.Statement,
+        variable: SimVariable,
+        stack_offset: int,
+        size: int,
+    ) -> bool:
+        """
+        Map a stack access that falls inside a struct- or array-typed stack variable to a member access of that
+        variable.
+        """
+        idx = bisect.bisect_right(self._stack_complex_type_offsets, stack_offset)
+        if idx == 0:
+            return False
+        base_offset = self._stack_complex_type_offsets[idx - 1]
+        the_var, the_size = self._stack_complex_types[base_offset]
+        if stack_offset + size > base_offset + the_size:
+            return False
+        unified = variable_manager.unified_variable(variable)
+        if unified is not None and unified is variable_manager.unified_variable(the_var):
+            # an access to the variable itself
+            return False
+        self.variable_map.set_struct_member(expr_or_stmt, the_var, stack_offset - base_offset)
+        return True
 
     def _set_expr_variable(self, expr, variable, offset) -> None:
         self.variable_map.set_variable(expr, variable, offset)
@@ -3868,6 +3970,10 @@ class Clinic(Analysis, Serializable):
                 if len(mem_vars) == 1:
                     var, offset = next(iter(mem_vars))
                     self._set_store_variable(stmt, var, offset)
+                    if isinstance(var, SimStackVariable):
+                        self._map_stackvar_to_struct_member(
+                            variable_manager, stmt, var, var.offset + (offset or 0), stmt.size
+                        )
                 else:
                     # check if the dest address is a variable
                     stmt: ailment.Stmt.Store
@@ -3974,6 +4080,8 @@ class Clinic(Analysis, Serializable):
             if len(vars_) >= 1:
                 var, offset = _pick_var_and_offset(vars_)
                 self._set_expr_variable(expr, var, offset)
+                if expr.was_stack:
+                    self._map_stackvar_to_struct_member(variable_manager, expr, var, expr.stack_offset, expr.size)
 
             if expr.was_combo_reg:
                 for reg_vvar in expr.reg_vvars:
@@ -4017,6 +4125,10 @@ class Clinic(Analysis, Serializable):
                     )
                 var, offset = _pick_var_and_offset(variables)
                 self._set_expr_variable(expr, var, offset)
+                if isinstance(var, SimStackVariable):
+                    self._map_stackvar_to_struct_member(
+                        variable_manager, expr, var, var.offset + (offset or 0), expr.size
+                    )
 
         elif isinstance(expr, ailment.Expr.BinaryOp):
             variables = variable_manager.find_variables_by_atom(block.addr, stmt_idx, expr, block_idx=block.idx)
@@ -6239,6 +6351,7 @@ class Clinic(Analysis, Serializable):
         msg._expose_loop_head_backedges = self._expose_loop_head_backedges
         msg._force_single_loop_entry = self._force_single_loop_entry
         msg._constrain_callee_prototypes = self._constrain_callee_prototypes
+        msg._upgrade_hidden_ptrarg_to_retval = self._upgrade_hidden_ptrarg_to_retval
         msg._save_unoptimized_graph = self._save_unoptimized_graph
 
         msg._mode = self._mode.value
@@ -6387,6 +6500,7 @@ class Clinic(Analysis, Serializable):
         clinic._expose_loop_head_backedges = msg._expose_loop_head_backedges
         clinic._force_single_loop_entry = msg._force_single_loop_entry
         clinic._constrain_callee_prototypes = msg._constrain_callee_prototypes
+        clinic._upgrade_hidden_ptrarg_to_retval = msg._upgrade_hidden_ptrarg_to_retval
         clinic._save_unoptimized_graph = msg._save_unoptimized_graph
 
         clinic._mode = ClinicMode(msg._mode) if msg._mode in {m.value for m in ClinicMode} else ClinicMode.DECOMPILE

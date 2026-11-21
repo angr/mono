@@ -756,12 +756,11 @@ class CConstruct:
                     if pos_to_node is not None:
                         pos_to_node.add_mapping(pos, len(s), obj)
 
-                elif isinstance(obj, SimType):
-                    if pos_to_node is not None:
-                        if isinstance(obj, TypeRef):
-                            pos_to_node.add_mapping(pos, len(s), obj.type)
-                        else:
-                            pos_to_node.add_mapping(pos, len(s), obj)
+                elif isinstance(obj, SimType) and pos_to_node is not None:
+                    if isinstance(obj, TypeRef):
+                        pos_to_node.add_mapping(pos, len(s), obj.type)
+                    else:
+                        pos_to_node.add_mapping(pos, len(s), obj)
 
                 if s.endswith("\n"):
                     text = pending_stmt_comments.pop(last_insn_addr, None) if isinstance(last_insn_addr, int) else None
@@ -3599,6 +3598,7 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
         indent_size: int = 4,
         variable_map: VariableMap | None = None,
         stl_accessor_calls: bool = False,
+        func_prototype: SimTypeFunction | None = None,
     ):
         super().__init__(
             flavor=flavor,
@@ -3655,6 +3655,9 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
         }
 
         self._func = func
+        # the prototype that the function was decompiled against.
+        # KB may hold a different prototype.
+        self._func_prototype = func_prototype
         self._func_args = func_args
         self._cfg = cfg
         self._sequence = sequence
@@ -3664,7 +3667,8 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
         self._variables_in_use: dict | None = None
         self._inlined_strings: set[SimMemoryVariable] = set()
         self._function_pointers: set[SimMemoryVariable] = set()
-        self.ailexpr2cnode: dict[tuple[Expr.Expression, bool], CExpression] | None = None
+        # (AIL node, is_expr, lvalue) -> C node; a node read and written converts differently
+        self.ailexpr2cnode: dict[tuple[Expr.Expression, bool, bool], CExpression] | None = None
         self.cnode2ailexpr: dict[CExpression, Expr.Expression] | None = None
         self._indent = indent
         self.show_casts = show_casts
@@ -3758,7 +3762,7 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
         self.cfunc = CFunction(
             self._func.addr,
             self._func.name,
-            self._func.prototype,
+            self._func_prototype if self._func_prototype is not None else self._func.prototype,
             arg_list,
             obj,
             self._variables_in_use,
@@ -4699,8 +4703,9 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
         ref: bool = False,
     ):
         assert self.ailexpr2cnode is not None
-        if (node, is_expr) in self.ailexpr2cnode:
-            return self.ailexpr2cnode[(node, is_expr)]
+        key = node, is_expr, lvalue
+        if key in self.ailexpr2cnode:
+            return self.ailexpr2cnode[key]
 
         handler: Callable | None = self._handlers.get(_dispatch_key(node), None)
         if handler is not None:
@@ -4710,7 +4715,7 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
                 if isinstance(node, Stmt.SideEffectStatement)
                 else handler(node, lvalue=lvalue, likely_signed=likely_signed, type_=type_, ref=ref)
             )
-            self.ailexpr2cnode[(node, is_expr)] = converted
+            self.ailexpr2cnode[key] = converted
             return converted
         raise UnsupportedNodeTypeError(
             f"Node type {getattr(node, 'kind', None) or type(node).__name__} is not supported yet."
@@ -4904,8 +4909,13 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
 
         stmt_var = self._variable_map.variable(stmt)
         if stmt_var is not None and cdata.type is not None:
-            cvar = self._variable(stmt_var, stmt.size)
-            offset = self._variable_map.variable_offset(stmt) or 0
+            member = self._variable_map.struct_member(stmt)
+            if member is not None:
+                cvar = self._variable(member[0], stmt.size)
+                offset = member[1]
+            else:
+                cvar = self._variable(stmt_var, stmt.size)
+                offset = self._variable_map.variable_offset(stmt) or 0
             assert type(offset) is int  # I refuse to deal with the alternative
             if offset == 0:
                 cdata = self._bit_pattern_constant_for_dst(cdata, cvar.type)
@@ -4955,7 +4965,12 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
             )
         ):
             offset = stmt.src.offset.value
-            var = self._variable_map.variable(stmt.dst)
+            member = self._variable_map.struct_member(stmt.dst)
+            if member is not None:
+                var = member[0]
+                offset += member[1]
+            else:
+                var = self._variable_map.variable(stmt.dst)
             cvar = self._variable(var, stmt.dst.size, vvar_id=stmt.dst.varid)
             csrc = self._handle(stmt.src.value)
             src_type = csrc.type
@@ -4982,6 +4997,22 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
             else:
                 csrc = self._handle(stmt.src, lvalue=False)
             cdst = self._handle(stmt.dst, lvalue=True)
+            if (
+                isinstance(stmt.dst, Expr.VirtualVariable)
+                and isinstance(cdst, CVariable)
+                and isinstance(cdst_ty := unpack_typeref(cdst.type), SimStruct)
+                and cdst_ty.size is not None
+                and cdst_ty.size > stmt.dst.bits
+                and csrc.type is not None
+            ):
+                # the vvar is only the leading bytes of a struct-typed stack object: write its leading field
+                cdst = self._access_constant_offset(
+                    self._get_variable_reference(cdst),
+                    0,
+                    csrc.type,
+                    True,
+                    lambda old, proposed: proposed if qualifies_for_simple_cast(old, proposed) else old,
+                )
             if (
                 isinstance(stmt.src, Expr.Convert)
                 and stmt.src.to_type == Expr.ConvertType.TYPE_FP
@@ -5438,8 +5469,13 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
 
         expr_var = self._variable_map.variable(expr)
         if expr_var is not None:
-            cvar = self._variable(expr_var, expr_size)
-            offset = self._variable_map.variable_offset(expr) or 0
+            member = self._variable_map.struct_member(expr)
+            if member is not None:
+                cvar = self._variable(member[0], expr_size)
+                offset = member[1]
+            else:
+                cvar = self._variable(expr_var, expr_size)
+                offset = self._variable_map.variable_offset(expr) or 0
 
             assert type(offset) is int  # I refuse to deal with the alternative
             result = self._access_constant_offset(
@@ -6029,6 +6065,20 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
         **kwargs,
     ):
         expr_var = self._variable_map.variable(expr)
+        member = self._variable_map.struct_member(expr) if expr_var is not None else None
+        if member is not None:
+            # the vvar is a member of a struct- or array-typed stack variable
+            cbasevar = self._variable(member[0], None, vvar_id=expr.varid)
+            if ref and member[1] == 0:
+                return cbasevar
+            data_type = type_ if type_ is not None else SimTypeNum(expr.bits, signed=False).with_arch(self.project.arch)
+            return self._access_constant_offset(
+                self._get_variable_reference(cbasevar),
+                member[1],
+                data_type,
+                lvalue,
+                lambda old, proposed: proposed if qualifies_for_simple_cast(old, proposed) else old,
+            )
         if expr_var is not None:
             cvar = self._variable(expr_var, None, vvar_id=expr.varid)
 
@@ -6048,6 +6098,20 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis, Serializab
                 if dst_type is not None:
                     dst_type = dst_type.with_arch(self.project.arch)
                     return CTypeCast(src_type, dst_type, cvar, tags=expr.tags, codegen=self)
+            elif (
+                not lvalue
+                and isinstance(cvar_ty := unpack_typeref(cvar.type), SimStruct)
+                and cvar_ty.size is not None
+                and cvar_ty.size > expr.bits
+            ):
+                # the vvar is only the leading bytes of a struct-typed stack object: read its leading field
+                return self._access_constant_offset(
+                    self._get_variable_reference(cvar),
+                    0,
+                    SimTypeNum(expr.bits, signed=False).with_arch(self.project.arch),
+                    False,
+                    lambda old, proposed: proposed if qualifies_for_simple_cast(old, proposed) else old,
+                )
             return cvar
 
         if expr.was_reg:

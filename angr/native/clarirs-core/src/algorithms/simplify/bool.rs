@@ -293,13 +293,16 @@ pub(crate) fn simplify_bool<'c>(
                     )?),
                 }
             }
+            // `=` on floats is identity of the value (NaN equals NaN, +0
+            // differs from -0), so unlike `FpEq` it is reflexive.
             AstType::Float(_) => {
                 let early_lhs = state.get_child_available(0);
                 let early_rhs = state.get_child_available(1);
 
                 match (early_lhs.op(), early_rhs.op()) {
-                    (AstOp::FPV(lhs), AstOp::FPV(rhs)) => Ok(ctx.boolv(lhs.compare_fp(rhs))?),
-                    _ => Ok(ctx.fp_eq(
+                    (AstOp::FPV(lhs), AstOp::FPV(rhs)) => Ok(ctx.boolv(lhs.eq_smtlib(rhs))?),
+                    _ if early_lhs == early_rhs => Ok(ctx.true_()?),
+                    _ => Ok(ctx.eq_(
                         state.get_child_simplified(0)?,
                         state.get_child_simplified(1)?,
                     )?),
@@ -472,13 +475,16 @@ pub(crate) fn simplify_bool<'c>(
                     )?),
                 }
             }
+            // `distinct` on floats is the negation of `=`, so `x != x` is
+            // false even though `Not(FpEq(x, x))` holds for NaN.
             AstType::Float(_) => {
                 let early_lhs = state.get_child_available(0);
                 let early_rhs = state.get_child_available(1);
 
                 match (early_lhs.op(), early_rhs.op()) {
-                    (AstOp::FPV(lhs), AstOp::FPV(rhs)) => Ok(ctx.boolv(!lhs.compare_fp(rhs))?),
-                    _ => Ok(ctx.fp_neq(
+                    (AstOp::FPV(lhs), AstOp::FPV(rhs)) => Ok(ctx.boolv(!lhs.eq_smtlib(rhs))?),
+                    _ if early_lhs == early_rhs => Ok(ctx.false_()?),
+                    _ => Ok(ctx.neq(
                         state.get_child_simplified(0)?,
                         state.get_child_simplified(1)?,
                     )?),
@@ -669,6 +675,16 @@ pub(crate) fn simplify_bool<'c>(
                 _ => Ok(ctx.sge(lhs, rhs)?),
             }
         }
+        // IEEE equality is not reflexive (NaN != NaN), so `FpEq(x, x)` only
+        // folds when `x` is a constant.
+        AstOp::FpEq(..) => {
+            let lhs = state.get_child_simplified(0)?;
+            let rhs = state.get_child_simplified(1)?;
+            match (lhs.op(), rhs.op()) {
+                (AstOp::FPV(lhs), AstOp::FPV(rhs)) => Ok(ctx.boolv(lhs.eq_ieee_754(rhs))?),
+                _ => Ok(ctx.fp_eq(lhs, rhs)?),
+            }
+        }
         AstOp::FpLt(..) => {
             let lhs = state.get_child_simplified(0)?;
             let rhs = state.get_child_simplified(1)?;
@@ -763,35 +779,30 @@ pub(crate) fn simplify_bool<'c>(
         }
 
         AstOp::ITE(..) => {
-            let cond = state.get_child_simplified(0)?;
-            let early_then = state.get_child_available(1);
-            let early_else = state.get_child_available(2);
+            let ite = super::simplify_ite(state)?;
+            match ite.op() {
+                AstOp::ITE(cond, then_, else_) => match (cond.op(), then_.op(), else_.op()) {
+                    (_, AstOp::BoolV(true), AstOp::BoolV(false)) => Ok(cond.clone()),
+                    // ite(c, false, true) -> !c; rerun so the produced Not canonicalizes.
+                    (_, AstOp::BoolV(false), AstOp::BoolV(true)) => state.rerun(ctx.not(cond)?),
 
-            match (cond.op(), early_then.op(), early_else.op()) {
-                // Concrete condition cases
-                (AstOp::BoolV(true), _, _) => state.get_child_simplified(1),
-                (AstOp::BoolV(false), _, _) => state.get_child_simplified(2),
+                    // When condition equals one branch with concrete other branch
+                    (cond_op, AstOp::BoolV(true), else_op) if else_op == cond_op => {
+                        Ok(cond.clone())
+                    }
+                    (cond_op, AstOp::BoolV(false), else_op) if else_op == cond_op => {
+                        Ok(ctx.false_()?)
+                    }
+                    (cond_op, then_op, AstOp::BoolV(true)) if then_op == cond_op => {
+                        Ok(ctx.true_()?)
+                    }
+                    (cond_op, then_op, AstOp::BoolV(false)) if then_op == cond_op => {
+                        Ok(cond.clone())
+                    }
 
-                // Same branch cases
-                (_, _, _) if early_then == early_else => state.get_child_simplified(1),
-
-                // Known then/else cases
-                (_, AstOp::BoolV(true), AstOp::BoolV(false)) => Ok(cond.clone()),
-                // ite(c, false, true) -> !c; rerun so the produced Not canonicalizes.
-                (_, AstOp::BoolV(false), AstOp::BoolV(true)) => state.rerun(ctx.not(cond)?),
-
-                // When condition equals one branch with concrete other branch
-                (cond_op, AstOp::BoolV(true), else_op) if else_op == cond_op => Ok(cond.clone()),
-                (cond_op, AstOp::BoolV(false), else_op) if else_op == cond_op => Ok(ctx.false_()?),
-                (cond_op, then_op, AstOp::BoolV(true)) if then_op == cond_op => Ok(ctx.true_()?),
-                (cond_op, then_op, AstOp::BoolV(false)) if then_op == cond_op => Ok(cond.clone()),
-
-                // Default case
-                _ => Ok(ctx.ite(
-                    cond,
-                    state.get_child_simplified(1)?,
-                    state.get_child_simplified(2)?,
-                )?),
+                    _ => Ok(ite.clone()),
+                },
+                _ => Ok(ite.clone()),
             }
         }
         _ => unreachable!("non-boolean op dispatched to simplify_bool"),

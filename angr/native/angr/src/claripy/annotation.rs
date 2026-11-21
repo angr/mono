@@ -1,10 +1,31 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use clarirs_core::ast::annotation::Ignored;
+use dashmap::DashMap;
 use num_bigint::BigUint;
+use pyo3::intern;
 use pyo3::types::{PyDict, PyTuple, PyType};
 
 use crate::claripy::prelude::*;
+
+/// `module:class` of each user-defined annotation class seen, keyed by the type object's
+/// address; the type is kept alive so the address cannot be reused.
+static PY_ANNOTATION_TYPE_NAMES: LazyLock<PyAnnotationTypeNames> = LazyLock::new(DashMap::new);
+
+type PyAnnotationTypeNames = DashMap<usize, (Py<PyType>, Arc<str>)>;
+
+fn py_annotation_type_name(ty: &Bound<'_, PyType>) -> PyResult<Arc<str>> {
+    let key = ty.as_ptr() as usize;
+    if let Some(entry) = PY_ANNOTATION_TYPE_NAMES.get(&key) {
+        return Ok(entry.1.clone());
+    }
+    let py = ty.py();
+    let module_name = ty.getattr(intern!(py, "__module__"))?.extract::<String>()?;
+    let class_name = ty.getattr(intern!(py, "__name__"))?.extract::<String>()?;
+    let name: Arc<str> = format!("{module_name}:{class_name}").into();
+    PY_ANNOTATION_TYPE_NAMES.insert(key, (ty.clone().unbind(), name.clone()));
+    Ok(name)
+}
 
 /// `claripy.annotation.Annotation`
 ///
@@ -44,11 +65,11 @@ impl PyAnnotation {
 impl PyAnnotation {
     /// Convert a Python annotation object (an instance of this class or any of
     /// its subclasses) into the core [`Annotation`] consumed by the solver.
-    pub fn to_annotation(slf: &Bound<'_, PyAnnotation>) -> Result<Annotation, ClaripyError> {
+    pub fn to_annotation(slf: &Bound<'_, PyAnnotation>) -> Result<Arc<Annotation>, ClaripyError> {
         let any = slf.as_any();
-        let annotation = if any.cast::<SimplificationAvoidanceAnnotation>().is_ok() {
+        let annotation = if any.is_exact_instance_of::<SimplificationAvoidanceAnnotation>() {
             Annotation::new(AnnotationType::SimplificationAvoidance, false, false)
-        } else if let Ok(si) = any.cast::<StridedIntervalAnnotation>() {
+        } else if let Ok(si) = any.cast_exact::<StridedIntervalAnnotation>() {
             let si = si.get();
             Annotation::new(
                 AnnotationType::StridedInterval {
@@ -59,9 +80,9 @@ impl PyAnnotation {
                 false,
                 false,
             )
-        } else if any.cast::<EmptyStridedIntervalAnnotation>().is_ok() {
+        } else if any.is_exact_instance_of::<EmptyStridedIntervalAnnotation>() {
             Annotation::new(AnnotationType::EmptyStridedInterval, false, false)
-        } else if let Ok(region) = any.cast::<RegionAnnotation>() {
+        } else if let Ok(region) = any.cast_exact::<RegionAnnotation>() {
             let region = region.get();
             Annotation::new(
                 AnnotationType::Region {
@@ -71,29 +92,26 @@ impl PyAnnotation {
                 false,
                 false,
             )
-        } else if any.cast::<UninitializedAnnotation>().is_ok() {
+        } else if any.is_exact_instance_of::<UninitializedAnnotation>() {
             Annotation::new(AnnotationType::Uninitialized, false, true)
         } else {
             // User-defined annotation: hold on to the Python object itself.
+            let py = slf.py();
             let eliminatable = slf
-                .getattr("eliminatable")
+                .getattr(intern!(py, "eliminatable"))
                 .and_then(|v| v.extract::<bool>())
                 .unwrap_or(true);
             let relocatable = slf
-                .getattr("relocatable")
+                .getattr(intern!(py, "relocatable"))
                 .and_then(|v| v.extract::<bool>())
                 .unwrap_or(false);
-            let module_name = slf.getattr("__module__")?.extract::<String>()?;
-            let class_name = slf
-                .getattr("__class__")?
-                .getattr("__name__")?
-                .extract::<String>()?;
+            let name = py_annotation_type_name(&slf.get_type())?;
             // Identify the annotation by the object's hash, not the object.
             let obj_hash = slf.hash()? as i64;
             Annotation::new(
                 AnnotationType::PyAnnotation {
-                    name: format!("{module_name}:{class_name}"),
-                    object: Ignored(Arc::new(slf.clone().into_any().unbind())),
+                    name,
+                    object: Ignored(slf.clone().into_any().unbind()),
                     obj_hash,
                 },
                 eliminatable,

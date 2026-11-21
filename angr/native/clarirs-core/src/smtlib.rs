@@ -106,20 +106,8 @@ fn to_smtlib_op(ast: &AstRef<'_>, children: &[String]) -> String {
         // Booleans
         AstOp::BoolS(s) => smtlib_symbol(s.as_str()),
         AstOp::BoolV(b) => b.to_string(),
-        AstOp::Eq(a, _) => {
-            if a.ast_type().is_float() {
-                format!("(fp.eq {} {})", children[0], children[1])
-            } else {
-                format!("(= {} {})", children[0], children[1])
-            }
-        }
-        AstOp::Neq(a, _) => {
-            if a.ast_type().is_float() {
-                format!("(not (fp.eq {} {}))", children[0], children[1])
-            } else {
-                format!("(distinct {} {})", children[0], children[1])
-            }
-        }
+        AstOp::Eq(..) => format!("(= {} {})", children[0], children[1]),
+        AstOp::Neq(..) => format!("(distinct {} {})", children[0], children[1]),
         AstOp::ULT(..) => format!("(bvult {} {})", children[0], children[1]),
         AstOp::ULE(..) => format!("(bvule {} {})", children[0], children[1]),
         AstOp::UGT(..) => format!("(bvugt {} {})", children[0], children[1]),
@@ -128,6 +116,7 @@ fn to_smtlib_op(ast: &AstRef<'_>, children: &[String]) -> String {
         AstOp::SLE(..) => format!("(bvsle {} {})", children[0], children[1]),
         AstOp::SGT(..) => format!("(bvsgt {} {})", children[0], children[1]),
         AstOp::SGE(..) => format!("(bvsge {} {})", children[0], children[1]),
+        AstOp::FpEq(..) => format!("(fp.eq {} {})", children[0], children[1]),
         AstOp::FpLt(..) => format!("(fp.lt {} {})", children[0], children[1]),
         AstOp::FpLeq(..) => format!("(fp.leq {} {})", children[0], children[1]),
         AstOp::FpGt(..) => format!("(fp.gt {} {})", children[0], children[1]),
@@ -257,6 +246,20 @@ fn to_smtlib_op(ast: &AstRef<'_>, children: &[String]) -> String {
             children[1]
         ),
         AstOp::FpSqrt(_, fprm) => format!("(fp.sqrt {} {})", fprm_to_smtlib(fprm), children[0]),
+        AstOp::FpMin(..) => format!("(fp.min {} {})", children[0], children[1]),
+        AstOp::FpMax(..) => format!("(fp.max {} {})", children[0], children[1]),
+        AstOp::FpFma(.., fprm) => format!(
+            "(fp.fma {} {} {} {})",
+            fprm_to_smtlib(fprm),
+            children[0],
+            children[1],
+            children[2]
+        ),
+        AstOp::FpRoundToIntegral(_, fprm) => format!(
+            "(fp.roundToIntegral {} {})",
+            fprm_to_smtlib(fprm),
+            children[0]
+        ),
         AstOp::FpToFp(_, fsort, fprm) => format!(
             "((_ to_fp {} {}) {} {})",
             fsort.exponent,
@@ -288,7 +291,7 @@ fn to_smtlib_op(ast: &AstRef<'_>, children: &[String]) -> String {
         // Strings
         AstOp::StringS(s) => smtlib_symbol(s.as_str()),
         AstOp::StringV(s) => smtlib_string_literal(s),
-        AstOp::StrConcat(..) => format!("(str.++ {} {})", children[0], children[1]),
+        AstOp::StrConcat(..) => format!("(str.++ {})", children.join(" ")),
         AstOp::StrSubstr(..) => format!(
             "(str.substr {} {} {})",
             children[0], children[1], children[2]

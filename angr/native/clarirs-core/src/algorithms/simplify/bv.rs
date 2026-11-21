@@ -154,7 +154,7 @@ pub(crate) fn simplify_bv<'c>(
                                             (shl_val.to_u64(), lshr_val.to_u64())
                                         {
                                             let bitwidth = a.size() as u64;
-                                            if lshift + rshift == bitwidth
+                                            if lshift.checked_add(rshift) == Some(bitwidth)
                                                 && (bitwidth == 32 || bitwidth == 64)
                                             {
                                                 let mask_big = mask_val.to_biguint();
@@ -512,47 +512,56 @@ pub(crate) fn simplify_bv<'c>(
                     .zip(simplified.iter())
                     .any(|(a, b)| a.hash() != b.hash());
 
+            if let [a, b] = sym_args.as_slice() {
+                match (a.op(), b.op()) {
+                    // v + (bvv - other) => (v + bvv) - other
+                    (AstOp::BVV(v), AstOp::Sub(bvv, other))
+                    | (AstOp::Sub(bvv, other), AstOp::BVV(v))
+                        if matches!(bvv.op(), AstOp::BVV(_)) =>
+                    {
+                        if let AstOp::BVV(bvv_value) = bvv.op() {
+                            let combined_value = (v.clone() + bvv_value.clone())?;
+                            let combined_bvv = ctx.bvv(combined_value)?;
+                            return state.rerun(ctx.sub(combined_bvv, other.clone())?);
+                        }
+                        unreachable!()
+                    }
+                    (AstOp::BVV(v), AstOp::Sub(other, bvv))
+                    | (AstOp::Sub(other, bvv), AstOp::BVV(v))
+                        if matches!(bvv.op(), AstOp::BVV(_)) =>
+                    {
+                        if let AstOp::BVV(bvv_value) = bvv.op() {
+                            let combined_value = (v.clone() - bvv_value.clone())?;
+                            let combined_bvv = ctx.bvv(combined_value)?;
+                            return state.rerun(ctx.add(other.clone(), combined_bvv)?);
+                        }
+                        unreachable!()
+                    }
+                    _ => {}
+                }
+            }
+
             match sym_args.len() {
                 0 => Ok(ctx.bvv(BitVec::zeros(size))?),
                 1 => Ok(sym_args.into_iter().next().unwrap()),
-                2 => {
-                    let (a, b) = (&sym_args[0], &sym_args[1]);
-                    match (a.op(), b.op()) {
-                        // v + (bvv - other) => (v + bvv) - other
-                        (AstOp::BVV(v), AstOp::Sub(bvv, other))
-                        | (AstOp::Sub(bvv, other), AstOp::BVV(v))
-                            if matches!(bvv.op(), AstOp::BVV(_)) =>
-                        {
-                            if let AstOp::BVV(bvv_value) = bvv.op() {
-                                let combined_value = (v.clone() + bvv_value.clone())?;
-                                let combined_bvv = ctx.bvv(combined_value)?;
-                                state.rerun(ctx.sub(combined_bvv, other.clone())?)
+                _ => {
+                    // x + c with the sign bit of c set is x - (-c), so that one value has one
+                    // form. The smallest signed value is its own negation and stays an Add.
+                    if let AstOp::BVV(c) = sym_args[sym_args.len() - 1].op()
+                        && c.len() > 1
+                        && c.sign()
+                    {
+                        let negated = (-c.clone())?;
+                        if !negated.sign() {
+                            sym_args.pop();
+                            let sum = if sym_args.len() == 1 {
+                                sym_args.pop().unwrap()
                             } else {
-                                unreachable!()
-                            }
-                        }
-                        (AstOp::BVV(v), AstOp::Sub(other, bvv))
-                        | (AstOp::Sub(other, bvv), AstOp::BVV(v))
-                            if matches!(bvv.op(), AstOp::BVV(_)) =>
-                        {
-                            if let AstOp::BVV(bvv_value) = bvv.op() {
-                                let combined_value = (v.clone() - bvv_value.clone())?;
-                                let combined_bvv = ctx.bvv(combined_value)?;
-                                state.rerun(ctx.add(other.clone(), combined_bvv)?)
-                            } else {
-                                unreachable!()
-                            }
-                        }
-                        _ => {
-                            if changed {
-                                state.rerun(ctx.add_many(sym_args)?)
-                            } else {
-                                Ok(ctx.add_many(sym_args)?)
-                            }
+                                ctx.add_many(sym_args)?
+                            };
+                            return state.rerun(ctx.sub(sum, ctx.bvv(negated)?)?);
                         }
                     }
-                }
-                _ => {
                     if changed {
                         state.rerun(ctx.add_many(sym_args)?)
                     } else {
@@ -745,9 +754,9 @@ pub(crate) fn simplify_bv<'c>(
                 // Which is: concat(extract(inner_size-1-(m-n), 0, inner), BVV(0, m))
                 // Simplified: concat(shl(inner, m-n), BVV(0, ext_size))
                 (AstOp::ZeroExt(inner, ext_size), AstOp::BVV(shift_amt))
-                    if { shift_amt.to_u64().unwrap_or(0) as u32 >= *ext_size } =>
+                    if { shift_amt.to_shift_amount() >= *ext_size } =>
                 {
-                    let shift_val = shift_amt.to_u64().unwrap_or(0) as u32;
+                    let shift_val = shift_amt.to_shift_amount();
                     let total_size = inner.size() + ext_size;
 
                     // The zero-extended MSB bits are shifted out entirely
@@ -775,7 +784,7 @@ pub(crate) fn simplify_bv<'c>(
                 // Fully concrete case
                 (AstOp::BVV(value), AstOp::BVV(shift_amount)) => {
                     let bit_width = value.len();
-                    let shift_amount_u32 = shift_amount.to_u64().unwrap_or(0) as u32;
+                    let shift_amount_u32 = shift_amount.to_shift_amount();
 
                     // If shifting >= bit_width, result is 0
                     if shift_amount_u32 >= bit_width {
@@ -805,8 +814,8 @@ pub(crate) fn simplify_bv<'c>(
                 // lshr by m then moves them down to positions [size-1-m : n-m].
                 (AstOp::ShL(inner, shl_amt), AstOp::BVV(shr_amt)) => {
                     if let AstOp::BVV(shl_val) = shl_amt.op() {
-                        let shl_u32 = shl_val.to_u64().unwrap_or(0) as u32;
-                        let shr_u32 = shr_amt.to_u64().unwrap_or(0) as u32;
+                        let shl_u32 = shl_val.to_shift_amount();
+                        let shr_u32 = shr_amt.to_shift_amount();
                         let size = lhs.size();
 
                         if shl_u32 >= size || shr_u32 >= size {
@@ -839,7 +848,7 @@ pub(crate) fn simplify_bv<'c>(
                 // Fully concrete case
                 (AstOp::BVV(value), AstOp::BVV(shift_amount)) => {
                     let bit_width = value.len();
-                    let shift_amount_u32 = shift_amount.to_u64().unwrap_or(0) as u32;
+                    let shift_amount_u32 = shift_amount.to_shift_amount();
                     if shift_amount_u32 >= bit_width {
                         Ok(ctx.bvv(BitVec::zeros(bit_width))?)
                     } else if shift_amount_u32 == 0 {
@@ -863,7 +872,7 @@ pub(crate) fn simplify_bv<'c>(
                 (_, AstOp::BVV(v)) if v.is_zero() => Ok(lhs.clone()),
                 // Fully concrete case
                 (AstOp::BVV(value), AstOp::BVV(shift_amount)) => {
-                    let shift_amount_u32 = shift_amount.to_u64().unwrap_or(0) as u32;
+                    let shift_amount_u32 = shift_amount.to_shift_amount();
                     let bit_length = value.len();
 
                     // Convert value to BigUint
@@ -1419,13 +1428,14 @@ pub(crate) fn simplify_bv<'c>(
                 ) => {
                     let s = input_string;
                     let t = substring;
-                    let i = start_index.to_usize().unwrap_or(0);
+                    let i = start_index.to_usize().unwrap_or(usize::MAX);
 
                     // Use character count for Unicode-aware indexing
                     let char_count = s.chars().count();
 
-                    // Check if `t` exists in `s` starting from character index `i`
-                    if i < char_count {
+                    // Check if `t` exists in `s` starting from character index `i`;
+                    // an empty `t` is found at any `i` up to the end of `s`
+                    if i <= char_count {
                         // Convert character index to byte index
                         let byte_index = s
                             .char_indices()
@@ -1476,30 +1486,7 @@ pub(crate) fn simplify_bv<'c>(
                 _ => Ok(ctx.str_to_bv(inner)?),
             }
         }
-        AstOp::ITE(..) => {
-            let if_ = state.get_child_simplified(0)?;
-            let then_ = state.get_child_simplified(1)?;
-            let else_ = state.get_child_simplified(2)?;
-
-            // If both branches are identical, return either one
-            if then_ == else_ {
-                return Ok(then_.clone());
-            }
-
-            match if_.op() {
-                // If the condition is a concrete boolean value, return the appropriate branch
-                AstOp::BoolV(value) => {
-                    if *value {
-                        Ok(then_.clone())
-                    } else {
-                        Ok(else_.clone())
-                    }
-                }
-                // If the condition has a Not at the top level, invert the branches
-                AstOp::Not(inner) => state.rerun(ctx.ite(inner, else_, then_)?),
-                _ => Ok(ctx.ite(if_, then_, else_)?),
-            }
-        }
+        AstOp::ITE(..) => super::simplify_ite(state),
         AstOp::Union(..) | AstOp::Intersection(..) => {
             let simplified = state.get_all_simplified()?;
             let is_union = matches!(bv_expr.op(), AstOp::Union(..));

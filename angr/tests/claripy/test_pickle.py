@@ -30,6 +30,21 @@ class TestPickle(unittest.TestCase):
         self.assert_round_trip(x | y | 8)
         self.assert_round_trip(x ^ y ^ 9)
 
+    def test_fp_min_max_fma_round(self):
+        x = claripy.FPS("x", claripy.FSORT_DOUBLE)
+        y = claripy.FPS("y", claripy.FSORT_DOUBLE)
+        rm = claripy.fp.RM.RM_TowardsZero
+        self.assert_round_trip(claripy.fpMin(x, y))
+        self.assert_round_trip(claripy.fpMax(x, y))
+        self.assert_round_trip(claripy.fpFMA(rm, x, y, x))
+        self.assert_round_trip(claripy.fpRoundToIntegral(rm, x))
+
+    def test_rounding_modes(self):
+        for name in dir(claripy.fp.RM):
+            if name.startswith("RM_"):
+                rm = getattr(claripy.fp.RM, name)
+                self.assertEqual(pickle.loads(pickle.dumps(rm)), rm)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "d816a4fa3bfecf657c01389fdd336fc094c3513e",
-      "committed_at": "2026-11-02T16:21:15-07:00",
-      "subject": "clarirs: route all evals back to batch_eval_n",
+      "commit": "80c962c99a8d487e75acdfba7a2bcf01a5abfb93",
+      "committed_at": "2026-11-18T12:01:07-07:00",
+      "subject": "unicorn: test fauxware for armhf in unicorn engine (#7814)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "1af4c02877c0ada70b457b4e321da07a912e4b6f",
-      "committed_at": "2026-11-02T12:41:22-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#1759)",
+      "commit": "a2bac0c8230e2afa0306215f4eb0da2a5b82787b",
+      "committed_at": "2026-11-17T10:20:47-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#1761)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -44,33 +44,33 @@
     },
     "angrop": {
       "upstream": "https://github.com/angr/angrop",
-      "commit": "6875df828b08db1922fde45a7290add1e05b6085",
-      "committed_at": "2026-09-07T05:40:10-07:00",
-      "subject": "rop_utils: Support controlling stack values that are shifted right. (#159)",
+      "commit": "79768326425633cb7f6e27dacc31f1cef774183e",
+      "committed_at": "2026-11-06T01:22:07-07:00",
+      "subject": "Merge pull request #157 from papadoxie/feat/ibt-endbr-support",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "bcece51c5b72fa96d46f654572040e5beb7e2ca8",
-      "committed_at": "2026-11-02T11:47:21-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#395)",
+      "commit": "353faf3aaae1b1c5154d445ff7df921727a2ea60",
+      "committed_at": "2026-11-16T12:14:40-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#397)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "claripy": {
       "upstream": "https://github.com/angr/claripy",
-      "commit": "6aad5d40ab7b2a800bda2ad7a5e53cbe10afb199",
-      "committed_at": "2026-10-26T08:58:32-07:00",
-      "subject": "Bump certifi from 2025.11.12 to 2026.10.19 (#751)",
+      "commit": "26baf5b5036a6a7f87d702f0e7888f96459c82a9",
+      "committed_at": "2026-11-17T14:06:23-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#753)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "6f1f3ed578f62bcb24c69ea77cbfb0b3bd60fd9c",
-      "committed_at": "2026-11-02T12:42:20-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#881)",
+      "commit": "a7d03655573de26160a4e375a5e8ef4a8b318b3a",
+      "committed_at": "2026-11-16T12:55:57-07:00",
+      "subject": "Let InlinedFunctions report source lines for call and decl (#890)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -87,25 +87,25 @@
     },
     "pypcode": {
       "upstream": "https://github.com/angr/pypcode",
-      "commit": "44d0f58f96865fea3bc6fc7d797fe8bd1e2cfbfa",
-      "committed_at": "2026-11-02T15:48:16-07:00",
-      "subject": "v4.1.1.dev0",
+      "commit": "e8c60ee7b34cc81e4ce404a52b2f9068f1504eba",
+      "committed_at": "2026-11-16T16:28:27-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pysoot": {
       "upstream": "https://github.com/angr/pysoot",
-      "commit": "fb24830fc18224e6f0cd50481b62014994a63c8c",
-      "committed_at": "2026-11-02T12:41:06-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#66)",
+      "commit": "7aeefd466a1149a1058febb1749e0ca468f4aa37",
+      "committed_at": "2026-11-16T12:13:57-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#69)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "63554810169ea89044458c27cfd820aa962446f4",
-      "committed_at": "2026-11-02T12:41:49-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#603)",
+      "commit": "09e3a235516f182817edb26a42576395f38c3ce7",
+      "committed_at": "2026-11-16T12:13:50-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#607)",
       "excluded": [
         ".gitmodules"
       ],
@@ -123,13 +123,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-03T03:15:20+00:00",
+  "imported_at": "2026-11-20T16:36:45+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "76ad9e296dde8f82b8ede93ce06a578cd1933639",
-      "committed_at": "2026-10-26T17:24:36Z",
-      "subject": "Add stripped zlib minigzip (O0) for the Phoenix switch-default-is-loop-latch structuring test (gz_decomp).",
+      "commit": "42dad96c852788f83aecba922981103eded4c95b",
+      "committed_at": "2026-11-13T19:33:47Z",
+      "subject": "Update version to 10.0.8.dev0 [ci skip]",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }

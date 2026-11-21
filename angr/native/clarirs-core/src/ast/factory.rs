@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use num_bigint::BigUint;
 
@@ -29,7 +30,7 @@ pub trait AstFactory<'c>: Sized {
     fn make_ast_exact(
         &'c self,
         op: AstOp<'c>,
-        annotations: BTreeSet<Annotation>,
+        annotations: BTreeSet<Arc<Annotation>>,
     ) -> Result<AstRef<'c>, ClarirsError> {
         op.validate()?;
         let ctx = self.context();
@@ -43,13 +44,23 @@ pub trait AstFactory<'c>: Sized {
     fn make_ast_annotated(
         &'c self,
         op: AstOp<'c>,
-        mut annotations: BTreeSet<Annotation>,
+        mut annotations: BTreeSet<Arc<Annotation>>,
     ) -> Result<AstRef<'c>, ClarirsError> {
-        annotations.extend(
-            op.child_iter()
-                .flat_map(|c| c.annotations().clone())
-                .filter(|a| a.relocatable()),
-        );
+        for child in op.child_iter() {
+            let child_annotations = child.annotations();
+            if child_annotations.is_empty() {
+                continue;
+            }
+            if annotations.is_empty() && child_annotations.iter().all(|a| a.relocatable()) {
+                annotations = child_annotations.clone();
+                continue;
+            }
+            for annotation in child_annotations {
+                if annotation.relocatable() {
+                    annotations.insert(annotation.clone());
+                }
+            }
+        }
         self.make_ast_exact(op, annotations)
     }
 
@@ -525,20 +536,53 @@ pub trait AstFactory<'c>: Sized {
         self.make_ast(AstOp::FpSqrt(lhs.into_owned(), rm.into()))
     }
 
+    fn fp_min(
+        &'c self,
+        lhs: impl IntoOwned<AstRef<'c>>,
+        rhs: impl IntoOwned<AstRef<'c>>,
+    ) -> Result<AstRef<'c>, ClarirsError> {
+        self.make_ast(AstOp::FpMin(lhs.into_owned(), rhs.into_owned()))
+    }
+
+    fn fp_max(
+        &'c self,
+        lhs: impl IntoOwned<AstRef<'c>>,
+        rhs: impl IntoOwned<AstRef<'c>>,
+    ) -> Result<AstRef<'c>, ClarirsError> {
+        self.make_ast(AstOp::FpMax(lhs.into_owned(), rhs.into_owned()))
+    }
+
+    /// `a * b + c`, rounded once.
+    fn fp_fma<RM: Into<FPRM>>(
+        &'c self,
+        a: impl IntoOwned<AstRef<'c>>,
+        b: impl IntoOwned<AstRef<'c>>,
+        c: impl IntoOwned<AstRef<'c>>,
+        rm: RM,
+    ) -> Result<AstRef<'c>, ClarirsError> {
+        self.make_ast(AstOp::FpFma(
+            a.into_owned(),
+            b.into_owned(),
+            c.into_owned(),
+            rm.into(),
+        ))
+    }
+
+    fn fp_round_to_integral<RM: Into<FPRM>>(
+        &'c self,
+        lhs: impl IntoOwned<AstRef<'c>>,
+        rm: RM,
+    ) -> Result<AstRef<'c>, ClarirsError> {
+        self.make_ast(AstOp::FpRoundToIntegral(lhs.into_owned(), rm.into()))
+    }
+
+    /// IEEE 754 equality (`fp.eq`); `eq_` is `=`, and inequality is `not(fp_eq(..))`.
     fn fp_eq(
         &'c self,
         lhs: impl IntoOwned<AstRef<'c>>,
         rhs: impl IntoOwned<AstRef<'c>>,
     ) -> Result<AstRef<'c>, ClarirsError> {
-        self.make_ast(AstOp::Eq(lhs.into_owned(), rhs.into_owned()))
-    }
-
-    fn fp_neq(
-        &'c self,
-        lhs: impl IntoOwned<AstRef<'c>>,
-        rhs: impl IntoOwned<AstRef<'c>>,
-    ) -> Result<AstRef<'c>, ClarirsError> {
-        self.make_ast(AstOp::Neq(lhs.into_owned(), rhs.into_owned()))
+        self.make_ast(AstOp::FpEq(lhs.into_owned(), rhs.into_owned()))
     }
 
     fn fp_lt(
@@ -587,10 +631,17 @@ pub trait AstFactory<'c>: Sized {
 
     fn str_concat(
         &'c self,
+        args: impl IntoIterator<Item = AstRef<'c>>,
+    ) -> Result<AstRef<'c>, ClarirsError> {
+        self.make_ast(AstOp::StrConcat(args.into_iter().collect()))
+    }
+
+    fn str_concat2(
+        &'c self,
         lhs: impl IntoOwned<AstRef<'c>>,
         rhs: impl IntoOwned<AstRef<'c>>,
     ) -> Result<AstRef<'c>, ClarirsError> {
-        self.make_ast(AstOp::StrConcat(lhs.into_owned(), rhs.into_owned()))
+        self.str_concat([lhs.into_owned(), rhs.into_owned()])
     }
 
     fn str_substr(
@@ -703,7 +754,7 @@ pub trait AstFactory<'c>: Sized {
     fn annotate(
         &'c self,
         ast: impl IntoOwned<AstRef<'c>>,
-        annotations: impl IntoIterator<Item = Annotation>,
+        annotations: impl IntoIterator<Item = Arc<Annotation>>,
     ) -> Result<AstRef<'c>, ClarirsError> {
         ast.into_owned().annotate(annotations)
     }
