@@ -746,7 +746,9 @@ class TestDecompiler(unittest.TestCase):
         dec = p.analyses[Decompiler].prep(fail_fast=True)(0x403D10, cfg=cfg.model, options=decompiler_options)
         assert dec.codegen is not None and dec.codegen.text is not None
         print_decompilation_result(dec)
-        m = re.search(r"\bv\d+ = (a4->field_8);\s+a4->field_8 = v\d+ \+ 1;", dec.codegen.text)
+        m = re.search(
+            r"\bv\d+ = (?:\([^()]+\))?(a4->field_8);\s+a4->field_8 = (?:\([^()]+\)\()?v\d+ \+ 1\)?;", dec.codegen.text
+        )
         assert m is not None, dec.codegen.text
 
     def _setup_decompiling_true_a_x86_64_0(self):
@@ -1736,8 +1738,9 @@ class TestDecompiler(unittest.TestCase):
             assert "break" not in replaced
 
             # ensure if-else removal does not incorrectly remove else nodes
-            assert "emaillist=strdup(" in code_without_spaces or re.search(
-                r"(\w+)=strdup[^\;]+;emaillist=\1", code_without_spaces
+            # emaillist is recovered as an integer, so the pointer strdup returns is stored with a cast
+            assert re.search(r"emaillist=(\([^()]*\))?strdup\(", code_without_spaces) or re.search(
+                r"(\w+)=(\([^()]*\))?strdup[^\;]+;emaillist=(\([^()]*\))?\1", code_without_spaces
             )
 
     def _setup_decompiling_morton_my_message_callback(self):
@@ -2384,7 +2387,7 @@ class TestDecompiler(unittest.TestCase):
         assert d.codegen is not None and isinstance(d.codegen.text, str)
 
         print_decompilation_result(d)
-        assert re.search(r"\([av]\d \* 48271\) % 0x7fffffff;", d.codegen.text) is not None
+        assert re.search(r"[av]\d \* 48271 % 0x7fffffff;", d.codegen.text) is not None
 
     # @for_all_structuring_algos
     def _setup_decompiling_dirname_quotearg_n_options(self):
@@ -6084,6 +6087,17 @@ class TestDecompiler(unittest.TestCase):
         assert isinstance(arg2_type, SimTypeLongLong), f"Unexpected arg2 type: {arg2_type}"
         assert arg2_type.signed is False
 
+    def test_decompiling_abnormal_switch_case_case2_extra_head_into_loop(self, decompiler_options=None):
+        bin_path = os.path.join(test_location, "x86_64", "decompiler", "fmt_rust")
+        proj, cfg = load_project_with_scoped_cfg(bin_path, 0x4A8800, expand_call_tree=False, run_ccc=False)
+        f = proj.kb.functions[0x4A8800]  # miniz_oxide::inflate::core::transfer
+        d = proj.analyses[Decompiler].prep(fail_fast=True)(f, cfg=cfg.model, options=decompiler_options)
+        assert d.codegen is not None and d.codegen.text is not None
+        print_decompilation_result(d)
+        # 0x4a8a81 is an extra head of the switch at 0x4a88ee, and its other successor is the 4-byte copy loop at
+        # 0x4a8a8b, which nothing else reaches. the loop must keep that edge rather than be reached by a goto
+        assert "LABEL_4a8a8b" not in d.codegen.text
+
     def test_decompiling_abnormal_switch_case_within_a_loop_with_redundant_jump(self, decompiler_options=None):
         bin_path = os.path.join(
             test_location, "x86_64", "windows", "0a9bd4898d4c966cda1102952a74b3b829581c5b6bbeb4c4e6a09cefde8c0d26"
@@ -6805,7 +6819,7 @@ class TestDecompiler(unittest.TestCase):
         # rep stosq are transformed into for-loops. check the existence of them
         lines = [line.strip() for line in dec.codegen.text.split("\n")]
         # first loop
-        assert _check_rep_stosq(lines, 48, r"= &\w+\->Anonymous")
+        assert _check_rep_stosq(lines, 48, r"= (?:\((?:struct )?\w+ \*\))?&\w+\->Anonymous")
         # second loop
         assert _check_rep_stosq(lines, 32, r"\+= 8") ^ _check_rep_stosq(lines, 32, r"\+= 1")
 
@@ -6914,6 +6928,24 @@ class TestDecompiler(unittest.TestCase):
         # ensure decompling this function should not take over 30 seconds - it was taking at least two minutes before
         # recent optimizations
 
+    def test_decompiling_armel_go_boundserror(self, decompiler_options=None):
+        # An ARM32 register-offset store (strb rX, [rB, rI]) lets the traversal pair a stack base with a
+        # .rodata address in the index register, producing an ~800 KB stack variable that swallowed the
+        # frame of runtime.boundsError.Error.
+        bin_path = os.path.join(test_location, "armel", "decompiler", "errorpaths_go")
+        proj, cfg = load_project_with_scoped_cfg(bin_path, 0x2744C)
+
+        start = time.time()
+        dec = proj.analyses[Decompiler].prep(fail_fast=True)(
+            cfg.functions[0x2744C], cfg=cfg.model, options=decompiler_options
+        )
+        elapsed = time.time() - start
+        assert dec.codegen is not None and dec.codegen.text is not None
+        print_decompilation_result(dec)
+
+        assert "|Stack bp-" not in dec.codegen.text, "an unresolved stack variable leaked into the output"
+        assert elapsed <= 120, f"Decompiling runtime.boundsError.Error took {elapsed} seconds"
+
     def test_fastfail_intrinsic(self, decompiler_options=None):
         bin_path = os.path.join(test_location, "x86_64", "windows", "fastfail.exe")
         proj = angr.Project(bin_path, auto_load_libs=False)
@@ -6958,7 +6990,8 @@ class TestDecompiler(unittest.TestCase):
         assert f"{wndclass_var}.hIcon = LoadIconA(" in dec.codegen.text
         assert f"{wndclass_var}.hCursor = LoadCursorA(" in dec.codegen.text
         assert f"{wndclass_var}.hbrBackground = GetStockObject(BLACK_BRUSH);" in dec.codegen.text
-        assert f"{wndclass_var}.lpszMenuName = 109;" in dec.codegen.text
+        # lpszMenuName is a pointer, so the resource id is stored with a cast
+        assert re.search(rf"{wndclass_var}\.lpszMenuName = \(\w+ \*\)109;", dec.codegen.text)
         assert f'{wndclass_var}.lpszClassName = "BOLHAS";' in dec.codegen.text
         assert f"{wndclass_var}.hIconSm = 0;" in dec.codegen.text
         assert f"if (!RegisterClassExA(&{wndclass_var}))" in dec.codegen.text
@@ -7045,6 +7078,29 @@ class TestDecompiler(unittest.TestCase):
         assert the_line is not None
         assert the_line.count(",") == 2
 
+    def test_decompiling_security_cookie_preserves_return_value(self):
+        bin_path = os.path.join(
+            test_location, "i386", "windows", "48460c9633d06cad3e3b41c87de04177d129906610c5bbdebc7507a211100e98_altered"
+        )
+        proj, cfg = load_project_with_scoped_cfg(
+            bin_path,
+            0x4113F0,
+            extra_func_addrs=(0x411DB8,),
+            window=0x100,
+            expand_call_tree=False,
+            project_kwargs={"auto_load_libs": False},
+            cfg_kwargs={"data_references": True},
+        )
+        func = proj.kb.functions[0x4113F0]
+        dec = proj.analyses.Decompiler(func, cfg=cfg.model)
+        assert dec.codegen is not None and dec.codegen.text is not None
+        print_decompilation_result(dec)
+
+        assert not dec.errors
+        assert "security_check_cookie" not in dec.codegen.text
+        return_expressions = set(re.findall(r"\breturn\s+([^;]+);", dec.codegen.text))
+        assert return_expressions == {"0", "1"}
+
     def test_regs_preserved_across_syscalls(self, decompiler_options=None):
         bin_path = os.path.join(test_location, "x86_64", "decompiler", "regs_preserved_across_syscalls")
         proj = angr.Project(bin_path, auto_load_libs=False)
@@ -7065,6 +7121,36 @@ class TestDecompiler(unittest.TestCase):
             }""")
 
         assert text == expected
+
+    def test_syscall_wrapper_return_without_argument_calling_convention(self, decompiler_options=None):
+        bin_path = os.path.join(test_location, "i386", "arbitrary_transmit")
+        proj = angr.Project(bin_path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True, data_references=True)
+        proj.analyses.CompleteCallingConventions(recover_variables=True, cfg=cfg.model)
+
+        func = proj.kb.functions["receive"]
+        facts = proj.analyses.FunctionFactCollector(func)
+        func.calling_convention = None
+        func.prototype = None
+        assert func.calling_convention is None
+        assert func.prototype is None
+        assert facts.retval_size == 4
+        assert facts.retval_incidental is True
+
+        def no_cc(self):
+            self.cc = None
+            self.prototype = None
+
+        with mock.patch.object(CallingConventionAnalysis, "_analyze", no_cc):
+            dec = proj.analyses.Decompiler(func, cfg=cfg.model, options=decompiler_options)
+        assert dec.codegen is not None and dec.codegen.text is not None
+        assert not dec.errors
+        print_decompilation_result(dec)
+
+        text = normalize_whitespace(dec.codegen.text)
+        assert re.search(r"return ::cle##kernel::receive\([^;]+\);", text) is not None
+        assert re.search(r"::cle##kernel::receive\([^;]+\); return;", text) is None
+        assert func.calling_convention is None
 
     def test_flipbooleancmp_fallthru_with_side_effects(self, decompiler_options=None):
         bin_path = os.path.join(test_location, "x86_64", "decompiler", "adds_then_call.o")
