@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "80c962c99a8d487e75acdfba7a2bcf01a5abfb93",
-      "committed_at": "2026-11-18T12:01:07-07:00",
-      "subject": "unicorn: test fauxware for armhf in unicorn engine (#7814)",
+      "commit": "7ff8538996994edee1983b7e967c59fe8746200a",
+      "committed_at": "2026-11-23T10:31:21-07:00",
+      "subject": "Update pypcode to 4.1.0 (#7833)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -103,9 +103,9 @@
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "09e3a235516f182817edb26a42576395f38c3ce7",
-      "committed_at": "2026-11-16T12:13:50-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#607)",
+      "commit": "e7c9c5b68de458788295fb3a427eb58896e3744c",
+      "committed_at": "2026-11-23T09:52:12-07:00",
+      "subject": "Migrate version metadata to [[tool.dynamic-metadata]] (#611)",
       "excluded": [
         ".gitmodules"
       ],
@@ -123,7 +123,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-20T16:36:45+00:00",
+  "imported_at": "2026-11-23T17:41:56+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
