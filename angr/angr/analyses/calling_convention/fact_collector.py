@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING
 import archinfo
 import pyvex
 from archinfo.types import RegisterOffset
+from cle.address_translator import AT
+from cle.backends.gopclntab import GO_FUNC_FLAG_ASM
 
 from angr.analyses.analysis import AnalysesHub, Analysis
 from angr.block import Block
@@ -30,6 +32,8 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
+    from cle.backends.gopclntab import GoFunction
+
     from angr.codenode import CodeNode
 
 # if you're going to change these to an enum, please do some benchmarking
@@ -197,12 +201,16 @@ class SimEngineFactCollectorVEX(
         track_arg_uses: bool,
         seen_reg_uses: defaultdict[int, int],
         seen_reg_pushes: defaultdict[int, int],
+        entry_restores: set[tuple[int, int]] | None = None,
     ):
         self.bp_as_gpr = bp_as_gpr
         self.track_arg_uses = track_arg_uses
         self.seen_reg_uses = seen_reg_uses
         #: stores of a register's entry value to the stack (push reg): spills or stack-padding pushes
         self.seen_reg_pushes = seen_reg_pushes
+        #: (instruction address, register offset) of each write that puts a register's own entry value back into it,
+        #: as in a reload from the slot it was spilled to (pop after push); recorded only when a set is given
+        self.entry_restores = entry_restores
         super().__init__(project)
         cc_cls = default_cc_for_project(project)
         self._fp_arg_reg_offsets: frozenset[int] = frozenset(
@@ -266,6 +274,8 @@ class SimEngineFactCollectorVEX(
         if isinstance(stmt.data, pyvex.IRExpr.RdTmp):
             t = self.state.tmps.get(stmt.data.tmp, None)
             if t is not None and t[0] == KIND_REG and t[1] == stmt.offset:
+                if t[2] == 0 and self.entry_restores is not None:
+                    self.entry_restores.add((self.ins_addr, stmt.offset))
                 same_ins_read = False
                 for i in range(self.stmt_idx, -1, -1):
                     if i >= self.block.vex.stmts_used:
@@ -527,6 +537,8 @@ class FactCollector(Analysis):
         self._tailcall_pops: set[int] = set()
         self._seen_reg_uses: defaultdict[int, int] = defaultdict(int)
         self._seen_reg_pushes: defaultdict[int, int] = defaultdict(int)
+        self._go_assembly = self._is_go_assembly(func)
+        self._entry_restores: set[tuple[int, int]] | None = set() if self._go_assembly else None
 
         self._analyze()
 
@@ -559,7 +571,12 @@ class FactCollector(Analysis):
 
         bp_as_gpr = self.function.info.get("bp_as_gpr", False)
         engine = SimEngineFactCollectorVEX(
-            self.project, bp_as_gpr, self._track_arg_uses, self._seen_reg_uses, self._seen_reg_pushes
+            self.project,
+            bp_as_gpr,
+            self._track_arg_uses,
+            self._seen_reg_uses,
+            self._seen_reg_pushes,
+            self._entry_restores,
         )
         init_state = FactCollectorState()
         if self.project.arch.call_pushes_ret:
@@ -978,6 +995,22 @@ class FactCollector(Analysis):
                 return True
         return False
 
+    def _is_go_assembly(self, func: Function) -> bool:
+        """
+        Whether ``func`` is Go assembly analysed with the register convention: the pclntab marks it as assembly, and the
+        linker has not marked it ABI0 (``.abi0``), whose results CallingConventionAnalysis places on the stack from
+        the size this analysis finds.
+        """
+        record = self._go_function_record(func)
+        return record is not None and bool(record.flag & GO_FUNC_FLAG_ASM) and not (func.name or "").endswith(".abi0")
+
+    def _go_function_record(self, func: Function) -> GoFunction | None:
+        """The main object's Go pclntab record of the function containing ``func.addr``, if any."""
+        obj = self.project.loader.main_object
+        if obj.gopclntab is None or not obj.contains_addr(func.addr):
+            return None
+        return obj.gopclntab.function_at(AT.from_mva(func.addr, obj).to_lva())
+
     def _analyze_endpoints_for_retval_size(self, end_states):
         """
         Analyze all endpoints to determine the return value size.
@@ -995,6 +1028,10 @@ class FactCollector(Analysis):
         if isinstance(cc.FP_RETURN_VAL, SimRegArg) and cc.FP_RETURN_VAL.reg_name in self.project.arch.registers:
             fp_retreg_offset = cc.FP_RETURN_VAL.check_offset(self.project.arch)
 
+        overflow_retreg_consumer_offset: int | None = None
+        if isinstance(cc.OVERFLOW_RETURN_VAL, SimRegArg):
+            overflow_retreg_consumer_offset = cc.OVERFLOW_RETURN_VAL.check_offset(self.project.arch)
+
         # Get the overflow return register offset (rdx on x64 System V, rbx under Go's ABIInternal).
         # This is only used to detect 128-bit return values on Rust and Go binaries, whose ABIs really
         # do return a second word there; elsewhere the overflow register is typically a scratch
@@ -1003,8 +1040,16 @@ class FactCollector(Analysis):
         # CallingConventionAnalysis._guess_retval_type which only maps 9..16 sizes to a type for those
         # binaries).
         overflow_retreg_offset: int | None = None
-        if (self.project.is_rust_binary or self.project.is_go_binary) and isinstance(cc.OVERFLOW_RETURN_VAL, SimRegArg):
-            overflow_retreg_offset = cc.OVERFLOW_RETURN_VAL.check_offset(self.project.arch)
+        if self.project.is_rust_binary or self.project.is_go_binary:
+            overflow_retreg_offset = overflow_retreg_consumer_offset
+
+        # Go assembly does not reliably follow the register result convention: most of it returns on the stack (ABI0),
+        # and helpers such as gcWriteBarrier put back the registers they save. A result register that still holds its
+        # entry value at the return, restored from a spill or never written, is no result there. In compiled Go it can
+        # be one: `func f(x int) int { g(); return x }` reloads x into rax
+        go_assembly = self._go_assembly
+        # whether a path calls or jumps into code the pclntab does not list, such as a C function
+        reaches_non_go = False
 
         retval_sizes = []
         propagated_retval_sizes = []
@@ -1034,6 +1079,8 @@ class FactCollector(Analysis):
                     else:
                         continue
                 if func is not None:
+                    if go_assembly and self._go_function_record(func) is None:
+                        reaches_non_go = True
                     func_proto = self._callee_proto(func)
                     if (
                         func.calling_convention is not None
@@ -1071,6 +1118,8 @@ class FactCollector(Analysis):
                     if isinstance(succ, (BlockNode, HookNode, FuncNode)) and self.kb.functions.contains_addr(succ.addr):
                         # attempt to convert it into a function
                         func_succ = self.kb.functions.get_by_addr(succ.addr)
+                    if go_assembly and func_succ is not None and self._go_function_record(func_succ) is None:
+                        reaches_non_go = True
                     if func_succ is not None and func_succ.name != "_security_check_cookie":
                         succ_proto = self._callee_proto(func_succ)
                         if (
@@ -1112,9 +1161,15 @@ class FactCollector(Analysis):
 
                 # collect tmps so we can trace back through RdTmp
                 tmp_definitions = {}
+                stmt_ins_addrs: list[int | None] = []
+                ins_addr = None
                 for stmt in block.vex.statements:
                     if isinstance(stmt, pyvex.IRStmt.WrTmp):
                         tmp_definitions[stmt.tmp] = stmt.data
+                    elif isinstance(stmt, pyvex.IRStmt.IMark):
+                        ins_addr = stmt.addr + stmt.delta
+                    if go_assembly:
+                        stmt_ins_addrs.append(ins_addr)
 
                 # scan the block statements backwards to find writes to the return value register
                 # block_retval_size stores the size of the first write (in the block) to the return register; this is
@@ -1123,8 +1178,17 @@ class FactCollector(Analysis):
                 block_retval_size = None
                 retval_stmt_idx = None
                 stack_canary_barrier = False
+                keeps_entry_value = False
                 for stmt_idx, stmt in reversed(list(enumerate(block.vex.statements))):
                     if isinstance(stmt, pyvex.IRStmt.Put):
+                        if (
+                            self._entry_restores is not None
+                            and (stmt_ins_addrs[stmt_idx], stmt.offset) in self._entry_restores
+                        ):
+                            if stmt.offset == retreg_offset and block_retval_size is None:
+                                keeps_entry_value = True
+                                break
+                            continue
                         assert block.vex.tyenv is not None
                         size = stmt.data.result_size(block.vex.tyenv) // self.project.arch.byte_width
 
@@ -1156,6 +1220,8 @@ class FactCollector(Analysis):
                         if stmt.offset == overflow_retreg_offset:
                             overflow_retval_sizes.append(max(size, 1))
 
+                if keeps_entry_value:
+                    continue
                 if block_retval_size is not None:
                     retval_sizes.append(block_retval_size)
                     assert retval_stmt_idx is not None
@@ -1164,7 +1230,12 @@ class FactCollector(Analysis):
                     incidental_flags.append(
                         bool(func_succs)
                         or self._retval_write_is_incidental(
-                            block, retval_stmt_idx, retreg_offset, block_retval_size, fp_retreg_offset
+                            block,
+                            retval_stmt_idx,
+                            retreg_offset,
+                            block_retval_size,
+                            fp_retreg_offset,
+                            overflow_retreg_consumer_offset,
                         )
                     )
                     l.debug(
@@ -1186,8 +1257,10 @@ class FactCollector(Analysis):
                         if edge_type in {"transition", "fake_return"}:
                             queue.append((depth + 1, pred))
 
-        # ARM/AArch64: R0/X0 used for both arg0 and return
-        if not retval_sizes:
+        # ARM/AArch64: R0/X0 used for both arg0 and return, as is rax in Go's ABIInternal on amd64. Not in Go assembly,
+        # unless a path hands control to code outside Go (the libc trampolines on darwin jump to libc), whose result is
+        # then in the register
+        if not retval_sizes and not (go_assembly and not reaches_non_go):
             first_arg_offset = None
             if cc.ARG_REGS:
                 arg0_name = cc.ARG_REGS[0]
@@ -1430,7 +1503,13 @@ class FactCollector(Analysis):
         return False
 
     def _retval_write_is_incidental(
-        self, block: Block, put_idx: int, retreg_offset: int, retreg_size: int, fp_retreg_offset: int | None
+        self,
+        block: Block,
+        put_idx: int,
+        retreg_offset: int,
+        retreg_size: int,
+        fp_retreg_offset: int | None,
+        overflow_retreg_consumer_offset: int | None,
     ) -> bool:
         """Is the write to the return register at ``put_idx`` of ``block.vex`` a leftover rather than a return value?
 
@@ -1442,8 +1521,9 @@ class FactCollector(Analysis):
         re-lifted unoptimized: there, only an explicit re-read of the register counts, plus whatever derives from
         the written tmp within the writing instruction.
 
-        One consumer is exempt: the floating-point return register. ``fabs`` masks the sign bit in rax and moves
-        the result back to xmm0; that value is the return value, it just travelled through rax.
+        Two consumers are exempt: the floating-point and overflow return registers. ``fabs`` masks the sign bit in
+        rax and moves the result back to xmm0; similarly, ``cdq`` sign-extends eax into edx. In both cases the
+        consumed value is still part of the ABI return value.
         """
         ins_addr = None
         for stmt in reversed(block.vex.statements[:put_idx]):
@@ -1490,7 +1570,10 @@ class FactCollector(Analysis):
             # a Put of the next instruction address is a constant and reads nothing; a Put of a derived tmp into the
             # instruction pointer is `jmp rax`, and consumes the value like any other use
             if reads_retval(stmt):
-                return not (isinstance(stmt, pyvex.IRStmt.Put) and stmt.offset == fp_retreg_offset)
+                return not (
+                    isinstance(stmt, pyvex.IRStmt.Put)
+                    and stmt.offset in (fp_retreg_offset, overflow_retreg_consumer_offset)
+                )
         return False
 
     def _analyze_endpoints_for_restored_regs(self):
