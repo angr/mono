@@ -70,7 +70,7 @@ from angr.code_location import ExternalCodeLocation
 from angr.codenode import BlockNode, FuncNode
 from angr.enums import Flavors
 from angr.errors import AngrDecompilationComplexityError, AngrDecompilationError, SimTranslationError
-from angr.go.sim_type import GoSimType
+from angr.go.sim_type import GoSimType, GoSimTypeUnsafePointer
 from angr.go.typehoon.translator import GoTypeTranslator
 from angr.knowledge_base import KnowledgeBase
 from angr.knowledge_plugins.cfg.memory_data import MemoryDataSort
@@ -3299,6 +3299,8 @@ class Clinic(Analysis, Serializable):
                 ty is not None
                 and not isinstance(ty, SimTypeBottom)
                 and ty.size == args[i].with_arch(self.project.arch).size
+                # a parameter declared unsafe.Pointer only gives way to a typed pointer
+                and (not isinstance(args[i], GoSimTypeUnsafePointer) or isinstance(ty, SimTypePointer))
             ):
                 args[i] = ty
                 changed = True
@@ -4203,8 +4205,10 @@ class Clinic(Analysis, Serializable):
                         # Create a new global variable if there isn't one already
                         global_vars = global_variables.get_global_variables(symbol.rebased_addr)
                         if not global_vars:
-                            global_var = SimMemoryVariable(symbol.rebased_addr, symbol.size, name=symbol.name)
-                            global_var.renamed = True
+                            global_var = SimMemoryVariable(
+                                symbol.rebased_addr, symbol.size, name=symbol.name or f"g_{symbol.rebased_addr:x}"
+                            )
+                            global_var.renamed = bool(symbol.name)
                             global_variables.add_variable("global", global_var.addr, global_var)
                             global_vars = {global_var}
                 if global_vars:
@@ -5109,6 +5113,7 @@ class Clinic(Analysis, Serializable):
                     ail_graph.add_edge(intended_head_1, succ)
 
         # split other heads
+        dropped_edges: list[tuple[ailment.Block, ailment.Block]] = []
         for o in other_heads:
             if other_head_split_insns > 0:
                 o_block = self.project.factory.block(o.addr, size=o.original_size)
@@ -5159,9 +5164,16 @@ class Clinic(Analysis, Serializable):
                     ail_graph.add_edge(new_head, new_head)
                 elif succ is indirect_jump_node:
                     ail_graph.add_edge(new_head, intended_head_1)
-                else:
-                    # it should be going to the default node. ignore it
-                    pass
+                elif new_head is o:
+                    # usually the default node, which intended_head_1 also reaches. a split head is left out: its other
+                    # successors follow the tail it shares with intended_head_1
+                    dropped_edges.append((new_head, succ))
+
+        # put back each dropped edge whose target the entry no longer reaches, such as a loop only this head enters
+        entry = next(n for n in ail_graph if (n.addr, n.idx) == self.entry_node_addr)
+        for src, dst in dropped_edges:
+            if dst is not entry and dst not in networkx.descendants(ail_graph, entry):
+                ail_graph.add_edge(src, dst)
 
     def _fix_abnormal_switch_case_heads_case3(
         self, indirect_jump_node: ailment.Block, other_heads: list[ailment.Block]

@@ -10,6 +10,7 @@ import re
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import archinfo
 
@@ -23,12 +24,15 @@ from angr.analyses.decompiler.structured_codegen.c import (
     CExpression,
     CGoto,
     CReturn,
+    CStatements,
     CStructField,
     CStructuredCodeGenerator,
+    CStructuredCodeWalker,
     CTypeCast,
     CUnaryOp,
     CVariable,
     CVariableField,
+    MakeTypecastsImplicit,
     c_return_type,
     qualifies_for_simple_cast,
     type_layout_key,
@@ -54,6 +58,7 @@ from angr.sim_type import (
     parse_cpp_file,
 )
 from angr.sim_variable import SimRegisterVariable
+from angr.utils.types import unpack_typeref
 from tests.common import WORKER, bin_location, load_project_with_scoped_cfg, print_decompilation_result
 
 test_location = os.path.join(bin_location, "tests")
@@ -76,11 +81,15 @@ class _RenderedExpression(CExpression):
 class TestConvertRendering(unittest.TestCase):
     """How CStructuredCodeGenerator renders Convert expressions of assorted widths."""
 
+    codegen: CStructuredCodeGenerator
+
     @classmethod
     def setUpClass(cls):
         proj = angr.Project(os.path.join(test_location, "x86_64", "fauxware"), auto_load_libs=False)
         cfg = proj.analyses.CFGFast(normalize=True)
-        cls.codegen = proj.analyses.Decompiler(cfg.functions["main"], cfg=cfg).codegen
+        codegen = proj.analyses.Decompiler(cfg.functions["main"], cfg=cfg).codegen
+        assert isinstance(codegen, CStructuredCodeGenerator)
+        cls.codegen = codegen
 
     def _render(self, from_bits: int, to_bits: int, value: int = 0x1234) -> str:
         conv = Expr.Convert(0, from_bits, to_bits, False, Expr.Const(0, value, from_bits))
@@ -103,6 +112,54 @@ class TestConvertRendering(unittest.TestCase):
         assert self._render(1, 5, value=1) == "(char)1"
         assert self._render(8, 12, value=3) == "(unsigned short)3"
         assert self._render(32, 64, value=3) == "(unsigned long long)3"
+
+    def test_widening_sizeless_child_uses_ail_source_width(self):
+        unknown_type = SimTypeBottom().with_arch(self.codegen.project.arch)
+        child = CBinaryOp(
+            "Shr",
+            CConstant(1, unknown_type, codegen=self.codegen),
+            CConstant(2, unknown_type, codegen=self.codegen),
+            codegen=self.codegen,
+        )
+        assert child.type.size is None
+
+        conv = Expr.Convert(0, 1, 64, True, Expr.Const(0, 1, 1))
+        with patch.object(self.codegen, "_handle", return_value=child):
+            rendered = self.codegen._handle_Expr_Convert(conv)
+
+        assert isinstance(rendered, CTypeCast)
+        assert isinstance(rendered.expr, CTypeCast)
+        assert rendered.expr.dst_type.size == conv.from_bits
+        assert getattr(rendered.expr.dst_type, "signed", None) is True
+        assert rendered.c_repr() == "(long long)(int1_t)(1 >> 2)"
+
+    def test_widening_zero_width_child_uses_ail_source_width(self):
+        fieldless_type = SimStruct({}, name="fieldless").with_arch(self.codegen.project.arch)
+        child = CConstant(1, fieldless_type, codegen=self.codegen)
+        assert child.type.size == 0
+
+        conv = Expr.Convert(0, 32, 64, True, Expr.Const(0, 1, 32))
+        with patch.object(self.codegen, "_handle", return_value=child):
+            rendered = self.codegen._handle_Expr_Convert(conv)
+
+        assert isinstance(rendered, CTypeCast)
+        assert isinstance(rendered.expr, CTypeCast)
+        assert rendered.expr.dst_type.size == conv.from_bits
+        assert getattr(rendered.expr.dst_type, "signed", None) is True
+        assert rendered.c_repr() == "(long long)(int)1"
+
+    def test_widening_known_child_keeps_inferred_width(self):
+        known_type = self.codegen.default_simtype_from_bits(16, signed=False)
+        child = CConstant(1, known_type, codegen=self.codegen)
+        conv = Expr.Convert(0, 32, 64, True, Expr.Const(0, 1, 32))
+        with patch.object(self.codegen, "_handle", return_value=child):
+            rendered = self.codegen._handle_Expr_Convert(conv)
+
+        assert isinstance(rendered, CTypeCast)
+        assert isinstance(rendered.expr, CTypeCast)
+        assert rendered.expr.dst_type.size == known_type.size
+        assert getattr(rendered.expr.dst_type, "signed", None) is True
+        assert rendered.c_repr() == "(long long)(short)1"
 
 
 class TestGotoRendering(unittest.TestCase):
@@ -278,18 +335,44 @@ class TestRightShiftRendering(unittest.TestCase):
         assert expression.c_repr() == "(unsigned int)(status()) >> (amount & 31)"
 
     def test_same_precedence_rhs_is_parenthesized(self):
-        # a < (b < c) and a << (b << c) are not a < b < c / a << b << c; a + (b + c) needs no parentheses
+        # a < (b < c) differs from a < b < c, and a * (b / c) from a * b / c; integer a + (b + c) needs no parentheses
         value_type = SimTypeInt(signed=False).with_arch(self.codegen.project.arch)
         a, b, c = (_RenderedExpression(n, value_type, codegen=self.codegen) for n in "abc")
-        for op, text in (
-            ("CmpLT", "a < (b < c)"),
-            ("CmpEQ", "a == (b == c)"),
-            ("Shl", "a << (b << c)"),
-            ("Add", "a + b + c"),
+        for op, rhs_op, text in (
+            ("CmpLT", "CmpLT", "a < (b < c)"),
+            ("CmpEQ", "CmpEQ", "a == (b == c)"),
+            ("Shl", "Shl", "a << (b << c)"),
+            ("Mul", "Div", "a * (b / c)"),
+            ("Mul", "Mod", "a * (b % c)"),
+            ("Div", "Mod", "a / (b % c)"),
+            ("Add", "Sub", "a + (b - c)"),
+            ("Add", "CmpLTs", "a + (b < c)"),
+            ("Add", "Add", "a + b + c"),
+            ("Mul", "Mul", "a * b * c"),
         ):
+            with self.subTest(op=op, rhs_op=rhs_op):
+                rhs = CBinaryOp(rhs_op, b, c, codegen=self.codegen)
+                assert CBinaryOp(op, a, rhs, codegen=self.codegen).c_repr() == text
+
+    def test_modulo_has_multiplicative_precedence(self):
+        value_type = SimTypeInt(signed=False).with_arch(self.codegen.project.arch)
+        a, b, c = (_RenderedExpression(n, value_type, codegen=self.codegen) for n in "abc")
+        lhs = CBinaryOp("Mul", a, b, codegen=self.codegen)
+        assert CBinaryOp("Mod", lhs, c, codegen=self.codegen).c_repr() == "a * b % c"
+
+    def test_floating_point_rhs_of_the_same_operator_is_parenthesized(self):
+        value_type = SimTypeDouble().with_arch(self.codegen.project.arch)
+        a, b, c = (_RenderedExpression(n, value_type, codegen=self.codegen) for n in "abc")
+        for op, text in (("Add", "a + (b + c)"), ("Mul", "a * (b * c)")):
             with self.subTest(op=op):
                 rhs = CBinaryOp(op, b, c, codegen=self.codegen)
                 assert CBinaryOp(op, a, rhs, codegen=self.codegen).c_repr() == text
+
+    def test_cast_shift_parenthesizes_same_precedence_count(self):
+        value_type = SimTypeInt(signed=False).with_arch(self.codegen.project.arch)
+        a, b, c = (_RenderedExpression(n, value_type, codegen=self.codegen) for n in "abc")
+        rhs = CBinaryOp("Shl", b, c, codegen=self.codegen)
+        assert CBinaryOp("Sar", a, rhs, codegen=self.codegen).c_repr() == "(int)(a) >> (b << c)"
 
     def test_decompile_signed_call_logical_shift(self):
         for directory, type_class, width in (
@@ -316,6 +399,87 @@ class TestRightShiftRendering(unittest.TestCase):
                 assert text.count(f"signed_status{width}(") == 1
                 assert source.prototype == prototype
                 assert not result.structuring_failures
+
+
+class TestWideningOperand(unittest.TestCase):
+    """A sign extension on an operand of +, - or *, or on the left operand of <<, sets the width C computes it in."""
+
+    @classmethod
+    def setUpClass(cls):
+        project = angr.Project(os.path.join(test_location, "x86_64", "decompiler", "ffs"), auto_load_libs=False)
+        cfg = project.analyses.CFGFast(normalize=True, data_references=True)
+        project.analyses.CompleteCallingConventions(cfg=cfg.model, recover_variables=True)
+        result = project.analyses[angr.analyses.Decompiler].prep(fail_fast=True)(
+            cfg.kb.functions["sub_404060"], cfg=cfg.model
+        )
+        codegen = result.codegen
+        assert isinstance(codegen, CStructuredCodeGenerator)
+        assert codegen.text is not None and codegen.cfunc is not None
+        cls.codegen = codegen
+        cls.text = codegen.text
+        variables: dict[str, CVariable] = {}
+
+        class _Variables(CStructuredCodeWalker):
+            def handle_CVariable(self, obj):
+                variables.setdefault(obj.c_repr(), obj)
+                return obj
+
+        _Variables().handle(codegen.cfunc)
+        cls.i, cls.n1 = variables["i"], variables["n1"]  # an int and an unsigned long long
+        arch = project.arch
+        cls.ll = SimTypeLongLong(signed=True).with_arch(arch)
+        cls.ull = SimTypeLongLong(signed=False).with_arch(arch)
+        cls.int = SimTypeInt(signed=True).with_arch(arch)
+        cls.char = SimTypeChar(signed=True).with_arch(arch)
+
+    def _cast(self, ty, expr):
+        return CTypeCast(None, ty, expr, codegen=self.codegen)
+
+    def _op(self, op, lhs, rhs):
+        return CBinaryOp(op, lhs, rhs, codegen=self.codegen)
+
+    def _const(self, value):
+        return CConstant(value, self.ull, codegen=self.codegen)
+
+    def _assign(self, lhs, rhs) -> str:
+        statements = CStatements([CAssignment(lhs, rhs, codegen=self.codegen)], codegen=self.codegen)
+        return MakeTypecastsImplicit().handle(statements).statements[0].c_repr().strip()
+
+    def test_sign_extended_int_is_scaled_in_64_bits(self):
+        # the __memmove_chk size: movsxd rdx, ebx; shl rdx, 4, with ebx the int i
+        assert "int i;" in self.text
+        assert "(long long)i * 16" in self.text
+
+    def test_operand_of_a_narrower_operation(self):
+        # (char)i * 3 cannot leave an int, so C computes it in int, and adding i needs i's own sign extension
+        mul = self._op("Mul", self._cast(self.ll, self._cast(self.char, self.i)), self._const(3))
+        expr = self._op("Add", mul, self._cast(self.ll, self.i))
+        assert self._assign(self.n1, expr) == "n1 = (char)i * 3 + (long long)i;"
+
+    def test_and_with_a_signed_operand_is_not_bounded(self):
+        masked = self._op("And", self._cast(self.int, self._cast(self.char, self.i)), self.i)
+        expr = self._op("Mul", self._cast(self.ll, masked), self._const(0x100))
+        assert self._assign(self.n1, expr) == "n1 = (long long)((char)i & i) * 0x100;"
+
+    def test_shift_takes_the_type_of_its_left_operand(self):
+        shifted = self._op("Shl", self._cast(self.ll, self.i), self.n1)
+        assert self._assign(self.n1, shifted) == "n1 = (long long)i << n1;"
+        # C ignores the amount's type, so the amount gets no cast back
+        amount = self._cast(self.ull, self._cast(self.char, self.i))
+        shifted = self._op("Shl", self._cast(self.ll, self.i), amount)
+        assert self._assign(self.n1, shifted) == "n1 = (long long)i << (char)i;"
+
+    def test_negation_takes_the_type_of_its_operand(self):
+        negated = CUnaryOp("Neg", self._cast(self.ll, self.i), codegen=self.codegen)
+        assert self._assign(self.n1, self._op("Sub", negated, self._cast(self.ll, self.i))) == "n1 = -i - (long long)i;"
+
+    def test_result_that_cannot_overflow_or_is_truncated_keeps_its_narrower_form(self):
+        byte = self._op("Mul", self._cast(self.ll, self._cast(self.char, self.i)), self._const(0x100))
+        assert self._assign(self.n1, byte) == "n1 = (char)i * 0x100;"
+        masked = self._op("And", self._op("Mul", self._cast(self.ll, self.i), self._const(16)), self._const(0xFFFFFFFF))
+        assert self._assign(self.n1, masked) == "n1 = i * 16 & 0xffffffff;"
+        narrowed = self._cast(self.int, self._op("Mul", self._cast(self.ll, self.i), self._const(3)))
+        assert "long long" not in self._assign(self.i, narrowed)
 
 
 class TestStoreWidth(unittest.TestCase):
@@ -564,6 +728,28 @@ class TestMultiRegisterReturnEndToEnd(unittest.TestCase):
         assert "return CONCAT(a2 + 1, 0xfffd);" in text, text
 
 
+class TestConvertOfZeroWidthChild(unittest.TestCase):
+    """A widening cast whose child is rendered with a type that has no width."""
+
+    def test_widening_a_child_typed_as_a_fieldless_struct(self):
+        # Go's runtime.setThreadCPUProfiler calls timer_create, and the kernel prototype spells that
+        # syscall's second argument as SimStruct({}, name="sigevent"). A struct with no fields has
+        # size 0, so a stack variable reaches the code generator with a type whose size is 0 rather
+        # than None. The intermediate sign-extension cast then asked for an integer of that width and
+        # got int0_t, and MakeTypecastsImplicit.collapse asserted on its size, so the whole function
+        # produced no C at all.
+        bin_path = os.path.join(test_location, "x86_64", "langdetect_go")
+        proj, cfg = load_project_with_scoped_cfg(bin_path, 0x430CA0, project_kwargs={"auto_load_libs": False})
+
+        dec = proj.analyses.Decompiler(cfg.functions[0x430CA0], cfg=cfg, fail_fast=True)
+        assert dec.codegen is not None
+        print_decompilation_result(dec)
+
+        text = dec.codegen.text or ""
+        assert text.strip()
+        assert "int0_t" not in text, text
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -585,6 +771,80 @@ class TestSimpleCastQualification(unittest.TestCase):
         sizeless = sizeless.with_arch(arch)
         assert not qualifies_for_simple_cast(sizeless, longlong)
         assert not qualifies_for_simple_cast(longlong, sizeless)
+
+
+class _AssignmentCollector(CStructuredCodeWalker):
+    def __init__(self):
+        self.assignments: list[CAssignment] = []
+
+    def handle_CAssignment(self, obj):
+        self.assignments.append(obj)
+        return super().handle_CAssignment(obj)
+
+
+class TestPointerAssignmentCasts(unittest.TestCase):
+    """An assignment keeps a cast C needs: between a pointer and an integer, or between pointers to different types."""
+
+    @staticmethod
+    def _decompile(bin_name: str, func_addr: int):
+        proj = angr.Project(os.path.join(test_location, "x86_64", "decompiler", bin_name), auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True, data_references=True, show_progressbar=not WORKER)
+        proj.analyses.CompleteCallingConventions(recover_variables=True, cfg=cfg.model)
+        dec = proj.analyses[angr.analyses.Decompiler].prep(fail_fast=True)(cfg.functions[func_addr], cfg=cfg.model)
+        assert isinstance(dec.codegen, CStructuredCodeGenerator) and dec.codegen.text is not None
+        print_decompilation_result(dec)
+        collector = _AssignmentCollector()
+        collector.handle(dec.codegen.cfunc)
+        return dec.codegen.text, collector.assignments
+
+    def test_assignments_between_pointers_and_integers_keep_their_casts(self):
+        # add_fs_type in df.o is `fsp = xmalloc(sizeof *fsp); ...; fs_select_list = fsp;`. xmalloc's result and the
+        # global are recovered as integers and fsp as a pointer, so C needs a cast in both assignments.
+        text, assignments = self._decompile("df.o", 0x4002E0)
+        scalar = (SimTypeChar, SimTypeInt, SimTypeNum, SimTypePointer)
+        conversions = [
+            a
+            for a in assignments
+            if isinstance(a.lhs.type, scalar)
+            and isinstance(a.rhs.type, scalar)
+            and isinstance(a.lhs.type, SimTypePointer) != isinstance(a.rhs.type, SimTypePointer)
+        ]
+        assert not conversions, [a.c_repr() for a in conversions]
+        casts = [
+            a.rhs
+            for a in assignments
+            if isinstance(a.rhs, CTypeCast)
+            and isinstance(a.rhs.src_type, SimTypePointer) != isinstance(a.rhs.dst_type, SimTypePointer)
+        ]
+        assert {isinstance(c.dst_type, SimTypePointer) for c in casts} == {True, False}, text
+
+    def test_assignments_between_different_pointer_types_keep_their_casts(self):
+        # vec_push in known_patterns_stl5 calls std::vector<int>::push_back. The vector's pointer fields are recovered as
+        # pointers to a struct and the local holding _M_finish as an unsigned int *, so reading the field into the local
+        # and storing the local back each need a cast.
+        def pointee(ty):
+            return unpack_typeref(ty.pts_to)
+
+        text, assignments = self._decompile("known_patterns_stl5", 0x401570)
+        pointer_pairs = [
+            a for a in assignments if isinstance(a.lhs.type, SimTypePointer) and isinstance(a.rhs.type, SimTypePointer)
+        ]
+        incompatible = [
+            a
+            for a in pointer_pairs
+            if pointee(a.lhs.type) != pointee(a.rhs.type)
+            and not isinstance(pointee(a.lhs.type), SimTypeBottom)
+            and not isinstance(pointee(a.rhs.type), SimTypeBottom)
+        ]
+        assert not incompatible, [a.c_repr() for a in incompatible]
+        casts = [
+            a.rhs
+            for a in pointer_pairs
+            if isinstance(a.rhs, CTypeCast)
+            and isinstance(a.rhs.src_type, SimTypePointer)
+            and pointee(a.rhs.src_type) != pointee(a.rhs.dst_type)
+        ]
+        assert len(casts) >= 2, text
 
 
 class TestCommonType(unittest.TestCase):
@@ -769,3 +1029,25 @@ class TestPointerStepInCommaExpression(unittest.TestCase):
         for dst, _, step in comma_steps:
             assert re.search(rf"unsigned int \*{dst};", text) is not None
             assert step == "1", f"{dst} stepped by {step} bytes inside the comma expression"
+
+
+class TestVoidPointerConstantOffset(unittest.TestCase):
+    def test_load_through_void_pointer_is_a_byte_offset_cast(self):
+        # mirai's main: `util_strlen(args[1])`, with args recovered as void*. The 8-byte load at byte 8 must
+        # print as a char* byte offset, not as the subscript `(long long)v21[8]`, which C rejects.
+        bin_path = os.path.join(test_location, "x86_64", "decompiler", "decbench_mirai_O2_noinline")
+        proj, cfg = load_project_with_scoped_cfg(bin_path, 0x402640)
+        func = cfg.functions[0x402640]
+        assert func.name == "main.cold"
+        dec = proj.analyses[angr.analyses.Decompiler].prep(fail_fast=True)(func, cfg=cfg.model)
+        assert dec.codegen is not None and dec.codegen.text is not None
+        print_decompilation_result(dec)
+        text = dec.codegen.text
+
+        void_ptrs = re.findall(r"^\s*void\* (\w+);", text, re.MULTILINE)
+        assert void_ptrs, text
+        for name in void_ptrs:
+            assert re.search(rf"(?<![\w.>]){name}\[", text) is None, f"{name} is void* and must not be subscripted"
+        m = re.search(r"util_strlen\(\*\(long long \*\)\(\(char \*\)(\w+) \+ 8\)\)", text)
+        assert m is not None, text
+        assert m.group(1) in void_ptrs
