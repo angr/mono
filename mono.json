@@ -123,13 +123,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-24T01:38:31+00:00",
+  "imported_at": "2026-11-24T05:14:53+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "2395a6be75d7c6c85667330aa6cd20807d293d0f",
-      "committed_at": "2026-11-23T20:59:11Z",
-      "subject": "Add the hand-made PE files of angr's unpacker tests and the script that builds them.",
+      "commit": "94186ffed5b510481e114195532bbc39bf52952a",
+      "committed_at": "2026-11-23T20:29:41-07:00",
+      "subject": "x86_64: add tailcall_table_dispatch binary. (#280)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
