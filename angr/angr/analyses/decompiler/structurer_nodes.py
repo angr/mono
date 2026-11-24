@@ -454,6 +454,17 @@ class IncompleteSwitchCaseHeadStatement(ailment.statement.Statement):
             )
         return self._cached_hash
 
+    def deep_copy(self, manager):
+        idx = manager.next_atom()
+        if manager.variable_map is not None:
+            manager.variable_map.transfer(self.idx, idx)
+        return IncompleteSwitchCaseHeadStatement(
+            idx,
+            self.switch_variable.deep_copy(manager),
+            list(self.case_addrs),
+            **self.tags,
+        )
+
     def replace(self, old_expr, new_expr):  # pylint:disable=unused-argument
         return False, self
 
