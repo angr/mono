@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "636a0bf8ea8b01cd51bf2b168a88d49237c20f39",
-      "committed_at": "2026-11-23T15:15:45-07:00",
-      "subject": "UnicornEngine: Stop at a 32-bit sysenter. (#7837)",
+      "commit": "bc0758d457b00bce28c6b5a460f724162172803d",
+      "committed_at": "2026-11-24T01:06:56-07:00",
+      "subject": "Switch Windows CI image to windows-2022. (#7840)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,13 +123,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-24T01:38:31+00:00",
+  "imported_at": "2026-11-24T15:47:28+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "2395a6be75d7c6c85667330aa6cd20807d293d0f",
-      "committed_at": "2026-11-23T20:59:11Z",
-      "subject": "Add the hand-made PE files of angr's unpacker tests and the script that builds them.",
+      "commit": "94186ffed5b510481e114195532bbc39bf52952a",
+      "committed_at": "2026-11-23T20:29:41-07:00",
+      "subject": "x86_64: add tailcall_table_dispatch binary. (#280)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
