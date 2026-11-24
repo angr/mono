@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "80c962c99a8d487e75acdfba7a2bcf01a5abfb93",
-      "committed_at": "2026-11-18T12:01:07-07:00",
-      "subject": "unicorn: test fauxware for armhf in unicorn engine (#7814)",
+      "commit": "636a0bf8ea8b01cd51bf2b168a88d49237c20f39",
+      "committed_at": "2026-11-23T15:15:45-07:00",
+      "subject": "UnicornEngine: Stop at a 32-bit sysenter. (#7837)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -16,9 +16,9 @@
     },
     "angr-management": {
       "upstream": "https://github.com/angr/angr-management",
-      "commit": "a2bac0c8230e2afa0306215f4eb0da2a5b82787b",
-      "committed_at": "2026-11-17T10:20:47-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#1761)",
+      "commit": "84ce5c6951e7f5bf156c9c85314e36c3e81be84d",
+      "committed_at": "2026-11-23T11:25:56-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#1763)",
       "excluded": [
         "angrmanagement/resources/flirt_signatures",
         "angrmanagement/resources/library_docs"
@@ -52,25 +52,25 @@
     },
     "archinfo": {
       "upstream": "https://github.com/angr/archinfo",
-      "commit": "353faf3aaae1b1c5154d445ff7df921727a2ea60",
-      "committed_at": "2026-11-16T12:14:40-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#397)",
+      "commit": "271abc87603f66d400765547bf7ac4178289f4c1",
+      "committed_at": "2026-11-23T11:26:02-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#398)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "claripy": {
       "upstream": "https://github.com/angr/claripy",
-      "commit": "26baf5b5036a6a7f87d702f0e7888f96459c82a9",
-      "committed_at": "2026-11-17T14:06:23-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#753)",
+      "commit": "67560728e122da69daf1b6663d9a5a2e685ee4f1",
+      "committed_at": "2026-11-23T14:03:13-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#754)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "a7d03655573de26160a4e375a5e8ef4a8b318b3a",
-      "committed_at": "2026-11-16T12:55:57-07:00",
-      "subject": "Let InlinedFunctions report source lines for call and decl (#890)",
+      "commit": "91a872f4812f6fde4b49cb580d78a2295be0b7d3",
+      "committed_at": "2026-11-23T11:25:51-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#893)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -87,25 +87,25 @@
     },
     "pypcode": {
       "upstream": "https://github.com/angr/pypcode",
-      "commit": "e8c60ee7b34cc81e4ce404a52b2f9068f1504eba",
-      "committed_at": "2026-11-16T16:28:27-07:00",
+      "commit": "8a856d4c3c0c6b066effc812fe884b3989b93422",
+      "committed_at": "2026-11-23T14:03:32-07:00",
       "subject": "[pre-commit.ci] pre-commit autoupdate",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pysoot": {
       "upstream": "https://github.com/angr/pysoot",
-      "commit": "7aeefd466a1149a1058febb1749e0ca468f4aa37",
-      "committed_at": "2026-11-16T12:13:57-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#69)",
+      "commit": "60228bc7dd9c5d7639420d46da633452d5b81b9d",
+      "committed_at": "2026-11-23T11:25:46-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#70)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
     "pyvex": {
       "upstream": "https://github.com/angr/pyvex",
-      "commit": "09e3a235516f182817edb26a42576395f38c3ce7",
-      "committed_at": "2026-11-16T12:13:50-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#607)",
+      "commit": "6a81d15f490795522aeebb7e1786bb60c5ca2ec1",
+      "committed_at": "2026-11-23T11:26:21-07:00",
+      "subject": "[pre-commit.ci] pre-commit autoupdate (#612)",
       "excluded": [
         ".gitmodules"
       ],
@@ -123,13 +123,13 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-20T16:36:45+00:00",
+  "imported_at": "2026-11-24T01:38:31+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
-      "commit": "42dad96c852788f83aecba922981103eded4c95b",
-      "committed_at": "2026-11-13T19:33:47Z",
-      "subject": "Update version to 10.0.8.dev0 [ci skip]",
+      "commit": "2395a6be75d7c6c85667330aa6cd20807d293d0f",
+      "committed_at": "2026-11-23T20:59:11Z",
+      "subject": "Add the hand-made PE files of angr's unpacker tests and the script that builds them.",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     }
