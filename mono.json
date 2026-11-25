@@ -68,9 +68,9 @@
     },
     "cle": {
       "upstream": "https://github.com/angr/cle",
-      "commit": "91a872f4812f6fde4b49cb580d78a2295be0b7d3",
-      "committed_at": "2026-11-23T11:25:51-07:00",
-      "subject": "[pre-commit.ci] pre-commit autoupdate (#893)",
+      "commit": "217ff09283e3485c31de40c1190e68ae47756495",
+      "committed_at": "2026-11-25T14:38:00-07:00",
+      "subject": "ELF: use DW_AT_linkage_name as fallback for inlined function names (#894)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,7 +123,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-25T10:44:20+00:00",
+  "imported_at": "2026-11-25T23:20:19+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
