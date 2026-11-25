@@ -58,6 +58,14 @@ _NON_ALLOCATED_SECTION_NAMES = {  # Sections that do not occupy memory at runtim
     "SHT_MIPS_REGINFO",
 }
 
+_DWARF_SIZE_TRANSPARENT_TYPE_TAGS = {
+    "DW_TAG_const_type",
+    "DW_TAG_immutable_type",
+    "DW_TAG_restrict_type",
+    "DW_TAG_typedef",
+    "DW_TAG_volatile_type",
+}
+
 
 # MIPS e_flags bits that name the ABI. binutils include/elf/mips.h.
 EF_MIPS_ABI2 = 0x20  # n32
@@ -75,13 +83,49 @@ additional_e_machine_mappings: dict[int, str] = {
 }
 
 
+class _LenientELFFile(elffile.ELFFile):
+    """
+    An ELFFile that does not discard the whole section header table because one section is malformed.
+
+    pyelftools validates ``sh_link`` when it builds a section: a hash table or a version table whose link does not
+    point at a symbol table, or a symbol table whose link does not point at a string table, raises ``ELFError``.
+    Real linker output hits this. u-boot's linker scripts discard ``.dynstr``, and on some architectures
+    ``.dynsym`` too, while keeping ``.hash``; the linker then writes ``sh_link = 0`` into what is left and any walk
+    of the section table dies on the first such section.
+
+    Sections pyelftools refuses to specialise are handed back as plain sections instead. The header and the data are
+    still there; only the interpretation is missing, which is the right answer for a section whose link is broken.
+    """
+
+    def __init__(self, *args, **kwargs):
+        # Set before the base constructor: it builds sections itself.
+        self._malformed_sections: set[str] = set()
+        super().__init__(*args, **kwargs)
+
+    def _make_section(self, section_header):
+        try:
+            return super()._make_section(section_header)
+        except (ELFError, AssertionError):
+            # pyelftools reports a bad link either by raising ELFError or, when the linked section has the right
+            # sh_type but we have already downgraded it, by tripping an internal assertion. Both mean the same
+            # thing here: this section cannot be interpreted.
+            # If the name cannot be read either then the section header string table is broken too, and the table
+            # really is unusable. Let that propagate to the caller, which knows how to fall back.
+            name = self._get_section_name(section_header)
+            if name not in self._malformed_sections:
+                self._malformed_sections.add(name)
+                log.warning("Section %s is malformed; loading it without interpreting its contents.", name)
+            return sections.Section(section_header, name, self)
+
+
 class ELF(MetaELF):
     """
     The main loader class for statically loading ELF executables. Uses the pyreadelf library where useful.
 
     Useful backend options:
 
-    - ``debug_symbols``: Provides the path to a separate file which contains the binary's debug symbols
+    - ``debug_symbols``: Provides the path to a separate file which contains the binary's debug symbols. Supplying it
+            explicitly loads its symbol, line, and external-size information independently of ``load_debug_info``.
     - ``discard_section_headers``: Do not parse section headers. Use this if they are corrupted or malicious.
     - ``discard_program_headers``: Do not parse program headers. Use this if the binary is for a platform whose ELF
             loader only looks at section headers, but whose toolchain generates program headers anyway.
@@ -107,7 +151,7 @@ class ELF(MetaELF):
         )
         patch_undo = []
         try:
-            self._reader = elffile.ELFFile(self._binary_stream)
+            self._reader = _LenientELFFile(self._binary_stream)
             list(self._reader.iter_sections())
         except Exception as e:  # pylint: disable=broad-except
             self._binary_stream.seek(4)
@@ -128,7 +172,7 @@ class ELF(MetaELF):
             log.error("PyReadELF couldn't load this file. Trying again without section headers...")
 
             try:
-                self._reader = elffile.ELFFile(self._binary_stream)
+                self._reader = _LenientELFFile(self._binary_stream)
             except Exception as e1:  # pylint: disable=broad-except
                 raise CLECompatibilityError from e1
 
@@ -187,7 +231,7 @@ class ELF(MetaELF):
         self.is_relocatable = self._reader.header.e_type == "ET_REL"
         self.pic = self.pic or self._reader.header.e_type in ("ET_REL", "ET_DYN")
         self.tls_block_offset = None  # this is an ELF-only attribute
-        self.extern_size_hints: dict[str, int] = {}  # maps symbol name to a size based on reloc addends
+        self.extern_size_hints: dict[str, int] = {}  # maps symbol names to inferred minimum allocation sizes
         self._dynamic = {}
         self.deps = []
 
@@ -263,8 +307,12 @@ class ELF(MetaELF):
         if self.is_relocatable and self.imports and not self._dynamic:
             self.guess_simprocs = True
 
+        # Repair only the header bytes that were loaded. These are file offsets, and nothing requires the
+        # ELF header to be mapped: an image whose first PT_LOAD starts past it maps none of them.
         for offset, patch in patch_undo:
-            self.memory.store(AT.from_lva(self.min_addr + offset, self).to_rva(), patch)
+            for index in range(len(patch)):
+                if self.offset_to_addr(offset + index) is not None:
+                    self.memory.store(AT.from_raw(offset + index, self).to_rva(), patch[index : index + 1])
 
     #
     # Properties and Public Methods
@@ -372,8 +420,14 @@ class ELF(MetaELF):
             if e_flags & EF_MIPS_ABI2 or (e_flags & EF_MIPS_ABI) == E_MIPS_ABI_O64:
                 return archinfo.ArchMIPSN32(archinfo.Endness.LE if reader.little_endian else archinfo.Endness.BE)
 
+        # The class gives the pointer width and the machine gives the instruction
+        # set, and the x32 ABI is where they disagree: an ELFCLASS32 container of
+        # EM_X86_64 code. Resolving that by the class picks 32-bit X86 and none of
+        # the instruction stream decodes.
+        bits = "64" if arch_str == "EM_X86_64" else reader.elfclass
+
         try:
-            return archinfo.arch_from_id(arch_str, "le" if reader.little_endian else "be", reader.elfclass)
+            return archinfo.arch_from_id(arch_str, "le" if reader.little_endian else "be", bits)
         except archinfo.ArchNotFound:
             arch = ELF._extract_pcode_arch(reader)
             if arch:
@@ -678,7 +732,11 @@ class ELF(MetaELF):
                             source,
                         )
                     )
-        except (DWARFError, ValueError):
+        except (DWARFError, ValueError, KeyError):
+            # KeyError: pyelftools reads a CIE's FDE_encoding unconditionally, but the "R"
+            # augmentation that defines it is optional, so a CIE without one raises rather than
+            # falling back to the default pointer encoding. Losing the unwind hints for such an
+            # object is survivable; failing its load is not.
             log.warning("An exception occurred in pyelftools when loading FDE information.", exc_info=True)
 
     def _load_exception_handling(self, dwarf):
@@ -719,7 +777,11 @@ class ELF(MetaELF):
                         )
                         self.exception_handlings.append(handling)
 
-        except (DWARFError, ValueError):
+        except (DWARFError, ValueError, KeyError):
+            # KeyError: pyelftools reads a CIE's FDE_encoding unconditionally, but the "R"
+            # augmentation that defines it is optional, so a CIE without one raises rather than
+            # falling back to the default pointer encoding. Losing the unwind hints for such an
+            # object is survivable; failing its load is not.
             log.warning("An exception occurred in pyelftools when loading FDE information.", exc_info=True)
 
     def _load_line_info(self, dwarf):
@@ -814,6 +876,69 @@ class ELF(MetaELF):
             return lowpc, None
         return lowpc + base_addr, highpc + base_addr
 
+    @staticmethod
+    def _dwarf_type_size(die: DIE, max_size: int) -> int | None:
+        """Read an explicit size through representation-preserving qualifiers without inferring arrays or pointers."""
+        seen = set()
+        while True:
+            unit_offset = getattr(die.cu, "cu_offset", getattr(die.cu, "tu_offset", id(die.cu)))
+            identity = (id(die.cu.dwarfinfo), type(die.cu), unit_offset, die.offset)
+            if identity in seen:
+                return None
+            seen.add(identity)
+
+            byte_size = die.attributes.get("DW_AT_byte_size")
+            if byte_size is not None:
+                if type(byte_size.value) is int and 0 < byte_size.value <= max_size:
+                    return byte_size.value
+                return None
+
+            if die.tag not in _DWARF_SIZE_TRANSPARENT_TYPE_TAGS or "DW_AT_type" not in die.attributes:
+                return None
+
+            try:
+                die = die.get_DIE_from_attribute("DW_AT_type")
+            except (DWARFError, KeyError, NotImplementedError):
+                return None
+
+    def _load_dwarf_extern_size_hint(self, die: DIE) -> None:
+        declaration = die.attributes.get("DW_AT_declaration")
+        if declaration is None or not declaration.value or "DW_AT_type" not in die.attributes:
+            return
+
+        name_attr = die.attributes.get("DW_AT_linkage_name") or die.attributes.get("DW_AT_MIPS_linkage_name")
+        if name_attr is None:
+            external = die.attributes.get("DW_AT_external")
+            if external is None or not external.value:
+                return
+            name_attr = die.attributes.get("DW_AT_name")
+        if name_attr is None:
+            return
+
+        name = maybedecode(name_attr.value)
+        if name not in self.imports:
+            return
+
+        try:
+            type_die = die.get_DIE_from_attribute("DW_AT_type")
+        except (DWARFError, KeyError, NotImplementedError):
+            return
+
+        from cle.backends.externs import ExternObject  # pylint: disable=import-outside-toplevel
+
+        size = self._dwarf_type_size(type_die, ExternObject.default_map_size(self.arch))
+        if size is not None:
+            self.extern_size_hints[name] = max(self.extern_size_hints.get(name, 0), size)
+
+    def _load_dwarf_extern_size_hints(self, dwarf: DWARFInfo) -> None:
+        for cu in dwarf.iter_CUs():
+            try:
+                for die in cu.iter_DIEs():
+                    if die.tag == "DW_TAG_variable":
+                        self._load_dwarf_extern_size_hint(die)
+            except (DWARFError, KeyError, NotImplementedError):
+                continue
+
     def _load_dies(self, dwarf: DWARFInfo):
         """
         Load DIEs and CUs from DWARF.
@@ -835,8 +960,10 @@ class ELF(MetaELF):
                         var_type = VariableType.read_from_die(die, self)
                         if var_type is not None:
                             type_list[die.offset] = var_type
-            except KeyError:
-                # pyelftools is not very resilient - we need to catch KeyErrors here
+                    elif die.tag == "DW_TAG_variable":
+                        self._load_dwarf_extern_size_hint(die)
+            except (DWARFError, KeyError, NotImplementedError):
+                # pyelftools is not very resilient - skip compilation units it cannot parse
                 continue
 
             top_die = cu.get_top_DIE()
@@ -870,7 +997,7 @@ class ELF(MetaELF):
 
             cu_ = CompilationUnit(die_name, die_comp_dir, die_low_pc, die_high_pc, die_lang, self, die_ranges)
             compilation_units.append(cu_)
-            self._load_die_namespace(top_die, dwarf, aranges, cu_, expr_parser, type_list, cu, [])
+            self._load_die_namespace(top_die, aranges, cu_, expr_parser, type_list)
 
         self.type_list = type_list
         self.compilation_units = compilation_units
@@ -878,35 +1005,34 @@ class ELF(MetaELF):
     def _load_die_namespace(
         self,
         die: DIE,
-        dwarf: DWARFInfo,
         aranges,
         cu_: CompilationUnit,
         expr_parser,
         type_list,
-        cu,
-        namespace: list[str],
     ) -> None:
         for die_child in die.iter_children():
             if die_child.tag == "DW_TAG_variable":
                 # load global variable
-                var = Variable.from_die(die_child, expr_parser, self, namespace=namespace)
+                var = Variable.from_die(die_child, expr_parser, self)
+                var.name = self._dwarf_get_name_with_namespace(die_child)
                 var.decl_file = cu_.file_path
                 cu_.global_variables.append(var)
             elif die_child.tag == "DW_TAG_subprogram":
                 # load subprogram
                 sub_prog = self._load_die_lex_block(
-                    die_child, dwarf, aranges, expr_parser, type_list, cu, cu_.file_path, None, namespace=namespace
+                    die_child,
+                    aranges,
+                    expr_parser,
+                    type_list,
+                    cu_.file_path,
+                    None,
                 )
                 if sub_prog is not None:
                     assert isinstance(sub_prog, Subprogram)
                     cu_.functions[sub_prog.low_pc] = sub_prog
                     self.functions_debug_info[sub_prog.ranges[0][0]] = sub_prog
             elif die_child.tag == "DW_TAG_namespace":
-                if "DW_AT_name" in die_child.attributes:
-                    new_namespace = namespace + [die_child.attributes["DW_AT_name"].value.decode("utf-8")]
-                else:
-                    new_namespace = namespace
-                self._load_die_namespace(die_child, dwarf, aranges, cu_, expr_parser, type_list, cu, new_namespace)
+                self._load_die_namespace(die_child, aranges, cu_, expr_parser, type_list)
 
     @staticmethod
     def _dwarf_idx_to_filename(cu: CompileUnit, filename_idx: int, default_filename: str | None = None) -> str | None:
@@ -937,29 +1063,26 @@ class ELF(MetaELF):
     def _load_die_lex_block(
         self,
         die: DIE,
-        dwarf: DWARFInfo,
         aranges,
         expr_parser,
         type_list,
-        cu: CompileUnit,
         file_path,
         subprogram,
-        namespace: list[str] | None = None,
     ) -> LexicalBlock | None:
+        origin = None
         if "DW_AT_abstract_origin" in die.attributes:
-            try:
-                origin = cu.get_DIE_from_refaddr(cu.cu_offset + die.attributes["DW_AT_abstract_origin"].value)
-            except DWARFError:
-                origin = None
-        else:
-            origin = None
+            origin = die.get_DIE_from_attribute("DW_AT_abstract_origin")
+        specification = None
+        if "DW_AT_specification" in die.attributes:
+            specification = die.get_DIE_from_attribute("DW_AT_specification")
+        elif origin is not None and "DW_AT_specification" in origin.attributes:
+            specification = origin.get_DIE_from_attribute("DW_AT_specification")
 
-        if "DW_AT_name" in die.attributes:
-            name = "::".join((namespace or []) + [die.attributes["DW_AT_name"].value.decode("utf-8")])
-        elif origin is not None:
+        name = self._dwarf_get_name_with_namespace(die)
+        if name is None and origin is not None:
             name = self._dwarf_get_name_with_namespace(origin)
-        else:
-            name = None
+        if name is None and specification is not None:
+            name = self._dwarf_get_name_with_namespace(specification)
 
         if "DW_AT_decl_file" in die.attributes:
             filename_idx = die.attributes["DW_AT_decl_file"].value
@@ -968,8 +1091,8 @@ class ELF(MetaELF):
         else:
             filename_idx = None
 
-        if filename_idx is not None:
-            filename = self._dwarf_idx_to_filename(cu, filename_idx, file_path)
+        if filename_idx is not None and isinstance(die.cu, CompileUnit):
+            filename = self._dwarf_idx_to_filename(die.cu, filename_idx, file_path)
         else:
             filename = None
 
@@ -997,9 +1120,9 @@ class ELF(MetaELF):
         if subprogram is None:
             subprogram = block = Subprogram(name, low_pc, high_pc, ranges, filename, line, column)
         else:
-            block = LexicalBlock(low_pc, high_pc, ranges, filename, line, column)
+            block = LexicalBlock(low_pc, high_pc, ranges, filename, line, column, name)
 
-        for sub_die in cu.iter_DIE_children(die):
+        for sub_die in die.iter_children():
             if sub_die.tag in ["DW_TAG_variable", "DW_TAG_formal_parameter"]:
                 # load local variable
                 var = Variable.from_die(sub_die, expr_parser, self, block)
@@ -1007,7 +1130,12 @@ class ELF(MetaELF):
                 subprogram.local_variables.append(var)
             elif sub_die.tag == "DW_TAG_lexical_block":
                 sub_block = self._load_die_lex_block(
-                    sub_die, dwarf, aranges, expr_parser, type_list, cu, file_path, subprogram, namespace
+                    sub_die,
+                    aranges,
+                    expr_parser,
+                    type_list,
+                    file_path,
+                    subprogram,
                 )
                 if sub_block is not None:
                     block.child_blocks.append(sub_block)
@@ -1016,19 +1144,12 @@ class ELF(MetaELF):
                 low_pc, high_pc = self._load_low_high_pc_form_die(sub_die)
                 if "DW_AT_entry_pc" in sub_die.attributes:
                     subr.entry = sub_die.attributes["DW_AT_entry_pc"].value
-                if low_pc is not None and high_pc is not None:
-                    subr.ranges.append((low_pc, high_pc))
-                elif "DW_AT_ranges" in sub_die.attributes:
-                    aranges = dwarf.range_lists()
-                    ranges = self._load_ranges_form_die(sub_die, aranges)
-                    if ranges is not None:
-                        subr.ranges = ranges
                 call_filename = None
                 call_line = None
                 call_col = 0
-                if "DW_AT_call_file" in sub_die.attributes:
+                if "DW_AT_call_file" in sub_die.attributes and isinstance(die.cu, CompileUnit):
                     call_filename = self._dwarf_idx_to_filename(
-                        cu, sub_die.attributes["DW_AT_call_file"].value, file_path
+                        die.cu, sub_die.attributes["DW_AT_call_file"].value, file_path
                     )
                 if "DW_AT_call_line" in sub_die.attributes:
                     call_line = sub_die.attributes["DW_AT_call_line"].value
@@ -1040,7 +1161,6 @@ class ELF(MetaELF):
                 if "DW_AT_abstract_origin" in sub_die.attributes:
                     origin = sub_die.get_DIE_from_attribute("DW_AT_abstract_origin")
                     assert origin is not None
-                    subr.name = self._dwarf_get_name_with_namespace(origin)
                     if "DW_AT_external" in origin.attributes:
                         subr.extern = origin.attributes["DW_AT_external"].value
                     nargs = 0
@@ -1050,25 +1170,44 @@ class ELF(MetaELF):
                     subr.nargs = nargs
                     subr.void = "DW_AT_type" not in origin.attributes
 
+                    specification = None
+                    if "DW_AT_specification" in sub_die.attributes:
+                        specification = sub_die.get_DIE_from_attribute("DW_AT_specification")
+                    if specification is None and "DW_AT_specification" in origin.attributes:
+                        specification = origin.get_DIE_from_attribute("DW_AT_specification")
+                    if specification is not None:
+                        if "DW_AT_external" in specification.attributes:
+                            subr.extern = specification.attributes["DW_AT_external"].value
+                        subr.nargs = nargs
+                        subr.void = "DW_AT_type" not in specification.attributes
+
                 subprogram.inlined_functions.append(subr)
 
-                sub_block = self._load_die_lex_block(
-                    sub_die, dwarf, aranges, expr_parser, type_list, cu, file_path, subprogram, namespace
-                )
+                sub_block = self._load_die_lex_block(sub_die, aranges, expr_parser, type_list, file_path, subprogram)
                 if sub_block is not None:
                     if sub_block.source_file is not None and sub_block.source_line is not None:
                         subr.decl_site = (sub_block.source_file, sub_block.source_line, sub_block.source_column or 0)
                     block.child_blocks.append(sub_block)
+                    subr.name = sub_block.name
+                    subr.ranges = sub_block.ranges
 
         return block
 
     @staticmethod
     def _dwarf_get_name_with_namespace(origin_die: DIE) -> str | None:
+        real_origin = origin_die
         name_pieces = []
         while True:
             name_piece = origin_die.attributes.get("DW_AT_name", None)
             if name_piece is not None:
                 name_pieces.append(name_piece.value.decode("utf-8"))
+            elif (
+                origin_die is real_origin
+                and (name_piece := origin_die.attributes.get("DW_AT_linkage_name", None)) is not None
+            ):
+                return name_piece.value.decode("utf-8")
+            elif origin_die is real_origin:
+                break
 
             origin_die = cast(DIE, origin_die.get_parent())
             if origin_die is None or origin_die.tag != "DW_TAG_namespace":
@@ -1111,10 +1250,90 @@ class ELF(MetaELF):
         for seg in type_to_seg_mapping["PT_GNU_RELRO"]:
             self.__register_relro(seg)
 
+    # Tags whose value is an address. The fallback below compares them against DT_SYMTAB, so a tag
+    # holding a size or a string-table offset must not take part.
+    __DYNAMIC_POINTER_TAGS = frozenset(
+        {
+            "DT_PLTGOT",
+            "DT_HASH",
+            "DT_STRTAB",
+            "DT_SYMTAB",
+            "DT_RELA",
+            "DT_INIT",
+            "DT_FINI",
+            "DT_REL",
+            "DT_JMPREL",
+            "DT_INIT_ARRAY",
+            "DT_FINI_ARRAY",
+            "DT_PREINIT_ARRAY",
+            "DT_GNU_HASH",
+            "DT_VERSYM",
+            "DT_VERDEF",
+            "DT_VERNEED",
+            "DT_RELR",
+            "DT_MOVETAB",
+            "DT_SYMINFO",
+            "DT_CONFIG",
+            "DT_DEPAUDIT",
+            "DT_AUDIT",
+            "DT_TLSDESC_PLT",
+            "DT_TLSDESC_GOT",
+        }
+    )
+
+    def __num_dynamic_symbols(self, seg_readelf) -> int:
+        """
+        How many entries DT_SYMTAB holds.
+
+        pyelftools reads this out of DT_GNU_HASH or DT_HASH and has no answer when the table it
+        picks is malformed: a GNU hash table whose bucket array is empty makes it raise ValueError,
+        which aborts the whole load. Both tables only accelerate lookup by name, so a broken one is
+        no reason to give up on the symbol table itself. Fall back to the same bound pyelftools uses
+        when a file has neither table -- the nearest address above DT_SYMTAB -- restricted to tags
+        that really do hold addresses.
+        """
+        try:
+            return seg_readelf.num_symbols()
+        except (ELFError, ValueError) as ex:
+            log.warning("%s: hash table does not give a dynamic symbol count (%s)", self.binary, ex)
+
+        symtab = self._dynamic["DT_SYMTAB"]
+        entsize = self._dynamic["DT_SYMENT"]
+        if entsize <= 0:
+            return 0
+
+        end = None
+        for tagstr, val in self._dynamic.items():
+            if tagstr in self.__DYNAMIC_POINTER_TAGS and val > symtab and (end is None or val < end):
+                end = val
+        if end is None:
+            # No table follows it, so the symbol table runs to the end of whatever segment holds it.
+            for seg in self._reader.iter_segments():
+                if seg.header.p_type != "PT_LOAD":
+                    continue
+                start = seg.header.p_vaddr
+                if start <= symtab <= start + seg.header.p_filesz:
+                    end = start + seg.header.p_filesz
+                    break
+        if end is None:
+            log.warning("%s: cannot find the end of DT_SYMTAB; assuming it is empty", self.binary)
+            return 0
+        return (end - symtab) // entsize
+
     def __register_dyn(self, seg_readelf):
         """
         Parse the dynamic section for dynamically linked objects.
         """
+        # A separate debug-info file, such as the output of objcopy --only-keep-debug, turns every allocated section
+        # into SHT_NOBITS and drops the file backing of the segments that carried them. Its dynamic table has no
+        # contents anywhere, so the tags below would be decoded out of zero-fill.
+        if (
+            seg_readelf.header.p_filesz == 0
+            and next(seg_readelf.elffile.address_offsets(seg_readelf.header.p_vaddr), None) is None
+        ):
+            log.warning("The dynamic table of %s has no contents. Skipping it.", self.binary)
+            return
+
         # PATHOLOGICAL CASE
         # some elf files have a dyn with filesz = 0 but actually do contain content. this is valid. apparently.
         # this is a hack. there is certainly a better way to do this
@@ -1131,26 +1350,35 @@ class ELF(MetaELF):
                 False,
             )
 
+        # Take the string table first. pyelftools resolves a tag's string as it hands the tag back, so a
+        # dynamic segment with no string table fails on every tag rather than on the four that carry one.
+        try:
+            strtab = seg_readelf._get_stringtable()  # pylint: disable=protected-access
+        except (AssertionError, ELFError):
+            # pyelftools 0.33 asserts; older versions return None, which the check below already handles.
+            strtab = None
+
         runpath, rpath = "", ""
-        for tag in seg_readelf.iter_tags():
+        for entry in seg_readelf._iter_tags():  # pylint: disable=protected-access
             # Create a dictionary, self._dynamic, mapping DT_* strings to their values
-            tagstr = self.arch.translate_dynamic_tag(tag.entry.d_tag)
-            self._dynamic[tagstr] = tag.entry.d_val
+            tagstr = self.arch.translate_dynamic_tag(entry.d_tag)
+            self._dynamic[tagstr] = entry.d_val
             # For tags that may appear more than once, handle them here
+            if strtab is None:
+                continue
             if tagstr == "DT_NEEDED":
-                self.deps.append(maybedecode(tag.needed))
+                self.deps.append(maybedecode(strtab.get_string(entry.d_val)))
             elif tagstr == "DT_SONAME":
-                self.provides = maybedecode(tag.soname)
+                self.provides = maybedecode(strtab.get_string(entry.d_val))
             elif tagstr == "DT_RUNPATH":
-                runpath = maybedecode(tag.runpath)
+                runpath = maybedecode(strtab.get_string(entry.d_val))
             elif tagstr == "DT_RPATH":
-                rpath = maybedecode(tag.rpath)
+                rpath = maybedecode(strtab.get_string(entry.d_val))
 
         self.extra_load_path = self.__parse_rpath(runpath, rpath)
 
-        strtab = seg_readelf._get_stringtable()
         if strtab is None:
-            log.warning("Unexpected return value from pyelftools: stringtable object is None.")
+            log.warning("%s has a dynamic segment but no dynamic string table.", self.binary)
             return
         self.__neuter_streams(strtab)
 
@@ -1158,7 +1386,7 @@ class ELF(MetaELF):
         # TODO: pyelftools is less bad than it used to be. how much of this can go away?
         # None of the following things make sense without a string table or a symbol table
         if "DT_STRTAB" in self._dynamic and "DT_SYMTAB" in self._dynamic and "DT_SYMENT" in self._dynamic:
-            num_symbols = seg_readelf.num_symbols()  # this is not actually reliable
+            num_symbols = self.__num_dynamic_symbols(seg_readelf)
 
             # Construct our own symbol table to hack around pyreadelf assuming section headers are around
             entsize = self._dynamic["DT_SYMENT"]
@@ -1379,9 +1607,13 @@ class ELF(MetaELF):
                     return
 
         symtab = self._reader.get_section(section.header["sh_link"]) if "sh_link" in section.header else dynsym
-        if isinstance(symtab, sections.NullSection):
-            # Oh my god Atmel please stop
+        if symtab is not None and not isinstance(symtab, sections.SymbolTableSection):
+            # Oh my god Atmel please stop.
+            # sh_link can point at nothing (index 0) or at a section that is not a symbol table at all -- u-boot's
+            # .rel.dyn links to a .dynsym whose string table the linker script discarded. Use .symtab instead.
             symtab = self._reader.get_section_by_name(".symtab")
+            if not isinstance(symtab, sections.SymbolTableSection):
+                symtab = None
         if symtab is None and section.header.get("sh_type") != "SHT_RELR":
             # A stripped object can still carry a relocation section whose linked symbol table was stripped away.
             # Without the table there is nothing that can be registered.
@@ -1528,6 +1760,7 @@ class ELF(MetaELF):
 
         for sec_readelf in self._reader.iter_sections():
             remap_offset = 0
+            occupies_memory = True
             if self.is_relocatable and sec_readelf.header["sh_flags"] & 2:  # alloc flag
                 # Relocatable objects' section addresses are meaningless (they are meant to be relocated anyway)
                 # We thus have to map them manually to valid virtual addresses to emulate a linker's behaviour.
@@ -1537,10 +1770,14 @@ class ELF(MetaELF):
                     new_addr = (new_addr + (align - 1)) // align * align
                 remap_offset = new_addr - sh_addr
 
-                if sec_readelf.header["sh_type"] not in _NON_ALLOCATED_SECTION_NAMES:
+                if sec_readelf.header["sh_type"] in _NON_ALLOCATED_SECTION_NAMES:
+                    # No space is reserved for these and no backer is added below, so the address just
+                    # computed belongs to whichever section comes next.
+                    occupies_memory = False
+                else:
                     new_addr += sec_readelf.header["sh_size"]
 
-            section = ELFSection(sec_readelf, remap_offset=remap_offset)
+            section = ELFSection(sec_readelf, remap_offset=remap_offset, occupies_memory=occupies_memory)
             sec_list.append((sec_readelf, section))
 
             # Register sections first, process later - this is required by relocatable objects
@@ -1550,11 +1787,21 @@ class ELF(MetaELF):
         for sec_readelf, section in sec_list:
             if isinstance(sec_readelf, sections.SymbolTableSection):
                 self.__register_section_symbols(sec_readelf)
-            if isinstance(sec_readelf, RelocationSection | RelrRelocationSection) and not (
-                "DT_REL" in self._dynamic
-                or "DT_RELA" in self._dynamic
-                or "DT_JMPREL" in self._dynamic
-                or "DT_RELR" in self._dynamic
+            if (
+                isinstance(sec_readelf, RelocationSection | RelrRelocationSection)
+                # A linked image only carries relocations that are still outstanding in sections it maps. One that
+                # is not SHF_ALLOC is link-time output kept for the record -- u-boot's .rel.text, and anything built
+                # with --emit-relocs -- and the linker has already applied every entry in it. A REL entry reads its
+                # addend out of memory, so applying it a second time computes S + (S + A) and rewrites the code. In
+                # a relocatable object nothing is applied yet and no relocation section is allocated, so they all
+                # have to run.
+                and (self.is_relocatable or sec_readelf.header["sh_flags"] & 2)  # alloc flag
+                and not (
+                    "DT_REL" in self._dynamic
+                    or "DT_RELA" in self._dynamic
+                    or "DT_JMPREL" in self._dynamic
+                    or "DT_RELR" in self._dynamic
+                )
             ):
                 self.__register_relocs(sec_readelf, dynsym=None)
 
@@ -1656,7 +1903,9 @@ class ELF(MetaELF):
     def __process_debug_file(self, filename):
         with open(filename, "rb") as fp:
             try:
-                elf = elffile.ELFFile(fp)
+                # Lenient for the same reason the main reader is: iter_sections() below is outside this guard, and
+                # one section with a dangling sh_link would take the whole debug file down with it.
+                elf = _LenientELFFile(fp)
             except ELFError:
                 log.warning("pyelftools failed to load debug file %s", filename, exc_info=True)
                 return
@@ -1681,6 +1930,7 @@ class ELF(MetaELF):
 
                 # debug symbols don't have eh_frame ever from what I can tell
                 if dwarf:
+                    self._load_dwarf_extern_size_hints(dwarf)
                     self._load_line_info(dwarf)
 
     @staticmethod
