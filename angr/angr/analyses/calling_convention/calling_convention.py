@@ -6,7 +6,7 @@ import copy
 import logging
 from collections import defaultdict
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import archinfo
 import capstone
@@ -87,6 +87,8 @@ class CallSiteFact:
         self.return_value_used: bool = return_value_used
         self.return_fp_size: int | None = None  # 4=float, 8=double; None=integer/unknown
         self.args = []
+        # the register the call jumps through was the last argument candidate, and args leaves it out
+        self.call_target_dropped: bool = False
 
 
 class UpdateArgumentsOption:
@@ -288,7 +290,7 @@ class CallingConventionAnalysis(Analysis):
                             callsite_facts,
                             update_arguments=UpdateArgumentsOption.AlwaysUpdate,
                         )
-                        if prototype.args:
+                        if prototype.args or any(fact.call_target_dropped for fact in callsite_facts):
                             break
                 self.cc = cc  # type: ignore
                 self.prototype = prototype  # type: ignore
@@ -406,7 +408,9 @@ class CallingConventionAnalysis(Analysis):
             prototype = self._adjust_prototype(
                 prototype, callsite_facts, update_arguments=UpdateArgumentsOption.AlwaysUpdate
             )
-            if prototype.args:
+            # a call block whose only argument was the call target ends the search, as it did while the target counted
+            # as an argument
+            if prototype.args or fact.call_target_dropped:
                 break
 
         self.cc = cc
@@ -420,25 +424,40 @@ class CallingConventionAnalysis(Analysis):
         """
         assert self._function is not None
 
-        if len(self._function.jumpout_sites) != 1:
+        jumpout_sites = self._function.jumpout_sites
+        if len(jumpout_sites) > 1:
             l.warning(
                 "%r has more than one jumpout sites. It does not look like a PLT stub. Please report to GitHub.",
                 self._function,
             )
             return None
 
-        jo_site = self._function.jumpout_sites[0]
+        if jumpout_sites:
+            jo_site = jumpout_sites[0]
 
-        successors = list(self._function.transition_graph.successors(jo_site))
-        if len(successors) != 1:
-            l.warning(
-                "%r has more than one successors. It does not look like a PLT stub. Please report to GitHub.",
-                self._function,
-            )
-            return None
+            successors = list(self._function.transition_graph.successors(jo_site))
+            if len(successors) != 1:
+                l.warning(
+                    "%r does not have exactly one successor. It does not look like a PLT stub. Please report to "
+                    "GitHub.",
+                    self._function,
+                )
+                return None
+            target_addr = successors[0].addr
+        else:
+            plt_name = self.project.loader.find_plt_stub_name(self._function.addr)
+            real_symbol = self.project.loader.find_symbol(plt_name) if plt_name is not None else None
+            if real_symbol is None:
+                l.warning(
+                    "%r has no jumpout site or resolvable loader target. It does not look like a PLT stub. Please "
+                    "report to GitHub.",
+                    self._function,
+                )
+                return None
+            target_addr = real_symbol.rebased_addr
 
         try:
-            real_func = self.kb.functions.get_by_addr(successors[0].addr)
+            real_func = self.kb.functions.get_by_addr(target_addr)
         except KeyError:
             # the real function does not exist for some reason
             real_func = None
@@ -460,12 +479,34 @@ class CallingConventionAnalysis(Analysis):
                         # we only take the prototype from the SimProcedure if
                         # - the SimProcedure is a function
                         # - the prototype of the SimProcedure is not guessed
-                        return cc, hooker.prototype, hooker.library_name, False
+                        return (
+                            cc,
+                            cast(SimTypeFunction | None, hooker.prototype),
+                            cast(str | None, hooker.library_name),
+                            hooker.prototype is None,
+                        )
                 real_proto = real_func.get_prototype(self._flavor)
                 if real_proto is not None:
                     return cc, real_proto, real_func.prototype_libname, False
             else:
-                return cc, real_func.get_prototype(self._flavor), real_func.prototype_libname, False
+                real_proto = real_func.get_prototype(self._flavor)
+                return cc, real_proto, real_func.prototype_libname, real_proto is None
+
+        if self.project.is_hooked(target_addr):
+            hooker = self.project.hooked_by(target_addr)
+            if hooker is not None and hooker.is_function and not hooker.guessed_prototype:
+                cc = hooker.cc
+                if cc is None:
+                    cc_cls = default_cc_for_project(self.project)
+                    if cc_cls is None:
+                        return None
+                    cc = cc_cls(self.project.arch)
+                return (
+                    cc,
+                    cast(SimTypeFunction | None, hooker.prototype),
+                    cast(str | None, hooker.library_name),
+                    hooker.prototype is None,
+                )
 
         if self.analyze_callsites:
             # determine the calling convention by analyzing its callsites
@@ -681,7 +722,48 @@ class CallingConventionAnalysis(Analysis):
         include_preds: bool = False,
     ) -> CallSiteFact | None:
         func = self.kb.functions[caller_addr]
-        subgraph = self._generate_callsite_subgraph(func, caller_block_addr, include_preds=include_preds)
+        func_graph = self._func_graph if self._func_graph is not None else func.graph
+        the_block = next(iter(nn for nn in func_graph if nn.addr == caller_block_addr), None)
+        if the_block is None:
+            return None
+
+        preds = [src for src in func_graph.predecessors(the_block) if src is not the_block] if include_preds else []
+        fact = self._analyze_callsite_window(func, caller_block_addr, call_insn_addr, preds[0] if preds else None)
+        if fact is None or fact.args:
+            return fact
+        # the first predecessor sets no argument, but in a loop that makes the call, the back edge may reload an
+        # argument register while the loop entry leaves the incoming value in place. Only a predecessor that the call
+        # block reaches closes such a loop; any other may write argument registers for its own use. Look at each such
+        # predecessor on its own, since registers set on different paths do not add up to one argument list, and accept
+        # its result only if every argument is a register that the predecessor or the call block writes and is not the
+        # register that holds the call target: a stack slot may hold an earlier call's argument, and a register may hold
+        # what an earlier call returned
+        back_preds = [pred for pred in preds[1:] if networkx.has_path(func_graph, the_block, pred)]
+        if not back_preds:
+            return fact
+        target_reg = self._call_target_reg_offset(the_block)
+        for pred in back_preds:
+            other = self._analyze_callsite_window(
+                func, caller_block_addr, call_insn_addr, pred, written_regs_only=True, exclude_reg=target_reg
+            )
+            if (
+                other is not None
+                and len(other.args) > len(fact.args)
+                and all(isinstance(arg, SimRegArg) for arg in other.args)
+            ):
+                fact = other
+        return fact
+
+    def _analyze_callsite_window(
+        self,
+        func: Function,
+        caller_block_addr: int,
+        call_insn_addr: int,
+        pred,
+        written_regs_only: bool = False,
+        exclude_reg: int | None = None,
+    ) -> CallSiteFact | None:
+        subgraph = self._generate_callsite_subgraph(func, caller_block_addr, pred=pred)
         if subgraph is None:
             # failed to generate a subgraph when the caller block cannot be found in the function graph
             return None
@@ -701,7 +783,27 @@ class CallingConventionAnalysis(Analysis):
             flavor=self._flavor,
         )
         # rda_model: Optional[ReachingDefinitionsModel] = self.kb.defs.get_model(caller.addr)
-        return self._collect_callsite_fact(caller_block, call_insn_addr, rda.model)
+        return self._collect_callsite_fact(
+            caller_block, call_insn_addr, rda.model, written_regs_only=written_regs_only, exclude_reg=exclude_reg
+        )
+
+    def _call_target_reg_offset(self, caller_block) -> int | None:
+        """
+        The offset of the register that the call ending the given block jumps through, or None.
+        """
+        size = caller_block.original_size if isinstance(caller_block, ailment.Block) else caller_block.size
+        if not size:
+            return None
+        try:
+            # unoptimized, so that a target the block loads itself stays a read of the register the call uses
+            irsb = self.project.factory.block(caller_block.addr, size=size, opt_level=0).vex
+        except SimTranslationError:
+            return None
+        if isinstance(irsb.next, RdTmp):
+            for stmt in irsb.statements:
+                if isinstance(stmt, WrTmp) and stmt.tmp == irsb.next.tmp:
+                    return stmt.data.offset if isinstance(stmt.data, Get) else None
+        return None
 
     def _extract_and_analyze_callsites(
         self,
@@ -784,7 +886,7 @@ class CallingConventionAnalysis(Analysis):
         self,
         func: Function,
         callsite_block_addr: int,
-        include_preds: bool = False,
+        pred=None,
     ) -> networkx.DiGraph | None:
         func_graph = self._func_graph if self._func_graph is not None else func.graph
 
@@ -795,12 +897,8 @@ class CallingConventionAnalysis(Analysis):
         subgraph = networkx.DiGraph()
         subgraph.add_node(the_block)
 
-        if include_preds:
-            # add a predecessor
-            for src, _, data in func_graph.in_edges(the_block, data=True):
-                if src is not the_block:
-                    subgraph.add_edge(src, the_block, **data)
-                    break  # only add the first non-cycle in-edge
+        if pred is not None:
+            subgraph.add_edge(pred, the_block, **func_graph.get_edge_data(pred, the_block))
 
         for _, dst, data in func_graph.out_edges(the_block, data=True):
             subgraph.add_edge(the_block, dst, **data)
@@ -834,6 +932,8 @@ class CallingConventionAnalysis(Analysis):
         caller_block,
         call_insn_addr: int,
         rda: ReachingDefinitionsModel,
+        written_regs_only: bool = False,
+        exclude_reg: int | None = None,
     ) -> CallSiteFact:
         fact = CallSiteFact(
             True,  # by default we treat all return values as used
@@ -843,7 +943,15 @@ class CallingConventionAnalysis(Analysis):
         if default_cc_cls is not None:
             cc: SimCC = default_cc_cls(self.project.arch)
             self._analyze_callsite_return_value_uses(cc, caller_block.addr, rda, fact)
-            self._analyze_callsite_arguments(cc, caller_block, call_insn_addr, rda, fact)
+            self._analyze_callsite_arguments(
+                cc,
+                caller_block,
+                call_insn_addr,
+                rda,
+                fact,
+                written_regs_only=written_regs_only,
+                exclude_reg=exclude_reg,
+            )
 
         return fact
 
@@ -914,6 +1022,8 @@ class CallingConventionAnalysis(Analysis):
         call_insn_addr: int,
         rda: ReachingDefinitionsModel,
         fact: CallSiteFact,
+        written_regs_only: bool = False,
+        exclude_reg: int | None = None,
     ) -> None:
         # determine if potential register and stack arguments are set
         observation_key = "insn", call_insn_addr, OP_BEFORE
@@ -938,6 +1048,9 @@ class CallingConventionAnalysis(Analysis):
                 and not (d.codeloc.block_addr == caller_block.addr and d.codeloc.stmt_idx == DEFAULT_STATEMENT)
                 # registers clobbered by a preceding call are not arguments
                 and not (d.codeloc.stmt_idx is None and d.atom.reg_offset not in ret_reg_offsets)
+                # and, when only registers that instructions write count, neither is what a preceding call returned
+                and not (written_regs_only and d.codeloc.stmt_idx in (None, DEFAULT_STATEMENT))
+                and d.atom.reg_offset != exclude_reg
             ):
                 # do an extra check because of how entry and callN work on Xtensa
                 if isinstance(caller_block, ailment.Block) and self._likely_saving_temp_reg(
@@ -994,6 +1107,46 @@ class CallingConventionAnalysis(Analysis):
             fact.args = temp_args[:first_none_idx]
         else:
             fact.args = temp_args
+
+        # a last argument in the register an indirect call jumps through is the call target. Only the last one: before
+        # other arguments, that register may be one the convention skips, such as r1 before a 64-bit pair on ARM
+        if (
+            fact.args
+            and isinstance(fact.args[-1], SimRegArg)
+            and self.project.arch.registers[fact.args[-1].reg_name][0] == self._call_target_reg_offset(caller_block)
+        ):
+            fact.args = fact.args[:-1]
+            fact.call_target_dropped = True
+
+    def _call_target_reg_offset(self, caller_block) -> int | None:
+        """
+        The offset of the register that the call ending the given block jumps through, or None.
+        """
+        size = caller_block.original_size if isinstance(caller_block, ailment.Block) else caller_block.size
+        if not size:
+            return None
+        try:
+            # unoptimized, so that a target the block loads itself stays a read of the register the call uses
+            irsb = self.project.factory.block(caller_block.addr, size=size, opt_level=0).vex
+        except SimTranslationError:
+            return None
+        if not isinstance(irsb.next, RdTmp):
+            return None
+        ip_offset = self.project.arch.ip_offset
+        tmp_data = {}
+        ip_data = None
+        for stmt in irsb.statements:
+            if isinstance(stmt, WrTmp):
+                tmp_data[stmt.tmp] = stmt.data
+                if stmt.tmp == irsb.next.tmp:
+                    data = stmt.data
+                    # the RISC-V lifter writes the target to pc and jumps through pc
+                    if isinstance(data, Get) and data.offset == ip_offset and isinstance(ip_data, RdTmp):
+                        data = tmp_data.get(ip_data.tmp)
+                    return data.offset if isinstance(data, Get) else None
+            elif isinstance(stmt, Put) and stmt.offset == ip_offset:
+                ip_data = stmt.data
+        return None
 
     def _adjust_prototype(
         self,
@@ -2024,9 +2177,13 @@ class CallingConventionAnalysis(Analysis):
                 # This handles cases like fp_recursive where the FP return value is
                 # written in a predecessor block and the return block only does
                 # stack cleanup + ret.  We check both x87 PutI and vector register Put.
-                if not fpretval_updated:
+                # normalize() moves a split block's return-site flag onto the block that shares its
+                # end address, which may belong to another function, so a ret site is not always a
+                # node of the local transition graph.
+                local_graph = self._function.graph
+                if not fpretval_updated and ret_block in local_graph:
                     # First pass: direct predecessors (most common case + callee call detection)
-                    for pred in self._function.graph.predecessors(ret_block):
+                    for pred in local_graph.predecessors(ret_block):
                         try:
                             pred_irsb = self.project.factory.block(pred.addr, size=pred.size).vex
                         except SimTranslationError:
