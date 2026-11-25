@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "b7b9f67bca6887aed72cd5a5f577152800868931",
-      "committed_at": "2026-11-24T12:20:35-07:00",
-      "subject": "Build Phoenix condition nodes from claripy conditions (#7845)",
+      "commit": "8246de456e99f87e77524a382d6a7303bb9c9ade",
+      "committed_at": "2026-11-24T17:08:51-07:00",
+      "subject": "Make is_true/is_false and Bool arguments accept only booleans (#7847)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -36,9 +36,9 @@
     },
     "angr-platforms": {
       "upstream": "https://github.com/angr/angr-platforms",
-      "commit": "92ddcc828dc4648112ad0bd654eec4027724c0b4",
-      "committed_at": "2026-09-03T08:47:17-07:00",
-      "subject": "Migrate to clarirs (#76)",
+      "commit": "634143406cc105a3b051758ddf0724deed909a8b",
+      "committed_at": "2026-11-24T17:08:36-07:00",
+      "subject": "Fix use of claripy.is_true (#77)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": []
     },
@@ -123,7 +123,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-24T22:03:10+00:00",
+  "imported_at": "2026-11-25T04:18:18+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
