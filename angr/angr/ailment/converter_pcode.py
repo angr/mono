@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+import archinfo
 import pypcode
 from pypcode import OpCode, PcodeOp, Varnode
 
@@ -91,6 +92,7 @@ class PCodeIRSBConverter(Converter):
     """
 
     _current_op: PcodeOp
+    _next_op: PcodeOp | None
 
     @staticmethod
     def convert(irsb: IRSB, manager: Manager):  # pylint:disable=arguments-differ
@@ -110,6 +112,7 @@ class PCodeIRSBConverter(Converter):
         self._next_ins_addr = None
         self._current_behavior = None
         self._statement_idx = 0
+        self._next_op = None
 
         # Remap all uniques s.t. they are write-once with values starting from 0
         self._unique_tracker: dict[int, tuple[int, int]] = {}
@@ -147,8 +150,10 @@ class PCodeIRSBConverter(Converter):
         """
         self._statement_idx = 0
 
-        for op in self._irsb._ops:
+        ops = self._irsb._ops
+        for idx, op in enumerate(ops):
             self._current_op = op
+            self._next_op = ops[idx + 1] if idx + 1 < len(ops) else None
             if op.opcode == pypcode.OpCode.IMARK:
                 self._manager.ins_addr = op.inputs[0].offset
                 self._next_ins_addr = op.inputs[-1].offset + op.inputs[-1].size
@@ -180,10 +185,31 @@ class PCodeIRSBConverter(Converter):
                 self._special_op_handlers[self._current_behavior.opcode]()
             except NotImplementedError as ex:
                 log.warning("Unsupported opcode: %s", ex)
+                self._set_unmodeled_output()
         elif self._current_behavior.is_unary:
             self._convert_unary()
         else:
             self._convert_binary()
+
+    def _set_unmodeled_output(self) -> None:
+        """
+        Define the output of an op that could not be converted, so that later reads of it
+        still find a definition.
+        """
+        out = self._current_op.output
+        if out is None:
+            return
+        expr = DirtyExpression(
+            self._manager.next_atom(),
+            self._current_op.opcode.__name__,
+            [],
+            bits=out.size * 8,
+        )
+        try:
+            stmt = self._set_value(out, expr)
+        except NotImplementedError:
+            return
+        self._statements.append(stmt)
 
     def _convert_unary(self) -> None:
         """
@@ -276,7 +302,7 @@ class PCodeIRSBConverter(Converter):
             self._unique_tracker[offset] = self._unique_counter, size
             self._unique_counter += 1
             return self._unique_tracker[offset][0]
-        if offset in self._unique_tracker:
+        if offset in self._unique_tracker and self._unique_tracker[offset][1] == size:
             return self._unique_tracker[offset][0]
         # this might be a partial access of an existing temporary variable. return None for now
         return None
@@ -308,16 +334,24 @@ class PCodeIRSBConverter(Converter):
             if offset is None:
                 # this might be a partial access of an existing temporary variable
                 unique_offset = None
-                for delta in range(-1, -8, -1):
+                for delta in range(0, -8, -1):
                     if varnode.offset + delta in self._unique_tracker:
                         unique_offset = varnode.offset + delta
                         break
                 assert unique_offset is not None, "Cannot find the source unique variable"
                 # TODO: Check size
-                _, ori_tmp_size = self._unique_tracker[unique_offset]
-                t = Tmp(self._manager.next_atom(), unique_offset, ori_tmp_size * 8)
-                # FIXME: Asserting BE
-                right_shift_amount = varnode.offset + varnode.size - (unique_offset + ori_tmp_size)
+                ori_tmp_idx, ori_tmp_size = self._unique_tracker[unique_offset]
+                # Index the parent by its remapped index, not by its unique-space address: the defining
+                # write went through _remap_temp, so a Tmp built from the raw offset names nothing.
+                t = Tmp(self._manager.next_atom(), ori_tmp_idx, ori_tmp_size * 8)
+                # Which end of the parent the sub-range names depends on the byte order: on a
+                # little-endian machine the high half sits at the higher address, on a big-endian one at
+                # the lower. Computing this the big-endian way on a little-endian target silently
+                # returns the low half for both halves of a widening multiply.
+                if self._irsb.arch.memory_endness == archinfo.Endness.LE:
+                    right_shift_amount = varnode.offset - unique_offset
+                else:
+                    right_shift_amount = (unique_offset + ori_tmp_size) - (varnode.offset + varnode.size)
                 if right_shift_amount != 0:
                     t = BinaryOp(
                         self._manager.next_atom(),
@@ -520,16 +554,15 @@ class PCodeIRSBConverter(Converter):
         cval = Const(self._manager.next_atom(), 0, cond.bits)
         condition = BinaryOp(self._manager.next_atom(), "CmpNE", [cond, cval], signed=False)
         dest = Const(self._manager.next_atom(), dest_addr, self._irsb.arch.bits)
-        if self._irsb._ops[-1] is self._current_op:
-            # if the cbranch op is the last op, then we need to generate a fallthru target
+        if self._next_op is not None and self._next_op.opcode == OpCode.BRANCH:
+            # _convert_branch back-patches this statement with the branch destination
+            fallthru = None
+        else:
             fallthru = Const(
                 self._manager.next_atom(),
                 self._next_ins_addr,
                 self._irsb.arch.bits,
             )
-        else:
-            # there will be a Jump statement that follows the cbranch
-            fallthru = None
         stmt = ConditionalJump(self._statement_idx, condition, dest, fallthru, ins_addr=self._manager.ins_addr)
         self._statements.append(stmt)
 
