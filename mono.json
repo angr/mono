@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "33a5cd4df1f2eb1657bc203752e8e3ee57cfa6d3",
-      "committed_at": "2026-11-27T17:32:29-07:00",
-      "subject": "Memoize SSA defs and uses on the Rust AIL Block. (#7849)",
+      "commit": "041d70ad3e221ddc08fea042a41e379adfd70a29",
+      "committed_at": "2026-11-27T22:40:28-07:00",
+      "subject": "Port some graph util functions to Rust. (#7856)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,7 +123,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-28T02:36:13+00:00",
+  "imported_at": "2026-11-28T08:51:20+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
