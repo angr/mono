@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.metadata
 import sys
 
 import angr
@@ -20,6 +21,11 @@ print("archinfo", archinfo.__version__, "pypcode", pypcode.__version__)
 pinned_z3 = sys.argv[1]
 print("z3", z3.get_version_string(), z3.get_version(), "pinned", pinned_z3)
 assert tuple(z3.get_version()) == tuple(int(x) for x in pinned_z3.split(".")), (z3.get_version(), pinned_z3)
+
+pinned_pycparser = sys.argv[2]
+installed_pycparser = importlib.metadata.version("pycparser")
+print("pycparser", installed_pycparser, "pinned", pinned_pycparser)
+assert installed_pycparser == pinned_pycparser, (installed_pycparser, pinned_pycparser)
 
 irsb = pyvex.lift(b"\x90\xc3", 0x400000, archinfo.ArchAMD64())
 assert irsb.jumpkind == "Ijk_Ret", irsb.jumpkind

@@ -319,7 +319,7 @@
               '';
           import-smoke =
             runPython "angr-import-smoke" ./nix/checks/import_smoke.py
-              (pythonFor pkgs).pkgs.monoPinned.z3-solver.version;
+              "${(pythonFor pkgs).pkgs.monoPinned.z3-solver.version} ${(pythonFor pkgs).pkgs.monoPinned.pycparser.version}";
           # The fixtures live in this repository now and deliberately do
           # not go into the flake -- half a gigabyte of them would land in
           # every closure and every cache upload. This check needs exactly
