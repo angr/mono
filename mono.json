@@ -3,9 +3,9 @@
   "components": {
     "angr": {
       "upstream": "https://github.com/angr/angr",
-      "commit": "48d4130c44d29b22cd6accf77901250e3553cebf",
-      "committed_at": "2026-11-25T20:36:07-07:00",
-      "subject": "AIL: make Statement immutable from Python; add Statement.copy_with() (#7853)",
+      "commit": "33a5cd4df1f2eb1657bc203752e8e3ee57cfa6d3",
+      "committed_at": "2026-11-27T17:32:29-07:00",
+      "subject": "Memoize SSA defs and uses on the Rust AIL Block. (#7849)",
       "excluded": [],
       "sibling_sources_repointed_at_workspace": [
         "archinfo",
@@ -123,7 +123,7 @@
       "sibling_sources_repointed_at_workspace": []
     }
   },
-  "imported_at": "2026-11-26T05:36:17+00:00",
+  "imported_at": "2026-11-28T02:36:13+00:00",
   "fixtures": {
     "binaries": {
       "upstream": "https://github.com/angr/binaries",
