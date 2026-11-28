@@ -133,7 +133,9 @@ class SimEngineFCPVEX(
         return self._load_callback(addr, size)
 
     def _process_block_end(self, stmt_result: list, whitelist: set[int] | None) -> None:
-        if self.block.vex.jumpkind == "Ijk_Call":
+        jumpkind = self.block.vex.jumpkind
+        # a syscall returns its result in the same register as a call
+        if jumpkind is not None and (jumpkind == "Ijk_Call" or jumpkind.startswith("Ijk_Sys")):
             self.state.register_written(self.arch.ret_offset, self.arch.bytes, None)
 
     def _top(self, bits: int):
@@ -303,6 +305,8 @@ class FastConstantPropagation(Analysis):
         self._load_callback = load_callback
 
         self.replacements = {}
+        # block address -> register offset -> the register's value on entry to that block
+        self.block_entry_regs: dict[int, dict[int, SV]] = {}
 
         self._analyze()
 
@@ -354,6 +358,7 @@ class FastConstantPropagation(Analysis):
                 continue
 
             block = self.project.factory.block(node.addr, size=node.size, cross_insn_opt=self._vex_cross_insn_opt)
+            self.block_entry_regs[node.addr] = state.regs.copy()
             engine.process(state, block=block)
 
             # if the node ends with a function call, call _handle_function
@@ -366,7 +371,7 @@ class FastConstantPropagation(Analysis):
                         callee = self.kb.functions.get_by_addr(callee.addr, meta_only=True)
                     else:
                         callee = None
-                    state = self._handle_function(state, callee)
+                    state = self._handle_function(state, callee, ret_addr=node.addr + node.size)
 
             states[node] = state
 
@@ -406,7 +411,7 @@ class FastConstantPropagation(Analysis):
             state.bp_value = max(state.bp_value, s.bp_value)
         return state
 
-    def _handle_function(self, state: FCPState, func: Function | None) -> FCPState:
+    def _handle_function(self, state: FCPState, func: Function | None, ret_addr: int | None = None) -> FCPState:
         cc = self.project.factory.cc() if func is None or func.calling_convention is None else func.calling_convention
 
         out_state = state.copy()
@@ -429,6 +434,11 @@ class FastConstantPropagation(Analysis):
         for reg_name in cc.CALLER_SAVED_REGS:
             offset = self.project.arch.registers[reg_name][0]
             out_state.register_written(offset, self.project.arch.registers[reg_name][1], None)
+
+        if func is not None and ret_addr is not None and "get_pc" in func.info:
+            # an x86 get-pc thunk (`mov reg, [esp]; ret`) returns its own return address in reg
+            offset, size = self.project.arch.registers[func.info["get_pc"]]
+            out_state.register_written(offset, size, ret_addr)
 
         return out_state
 
