@@ -6,11 +6,34 @@ __package__ = __package__ or "tests.gui.decompilation_workflows"  # pylint:disab
 import os
 import unittest
 
-import angr
-from angr.sim_type import SimTypeInt, TypeRef
-from tests.common import bin_location, print_decompilation_result
+from rich.console import Console
+from rich.syntax import Syntax
 
-test_location = os.path.join(bin_location, "tests")
+import angr
+from angr.misc.testing import is_testing
+from angr.sim_type import SimTypeInt, TypeRef
+
+# `tests/gui` has no `__init__.py`. Under pytest's default `prepend` import mode the directory that
+# goes on `sys.path` for a test module is its first ancestor without that marker, so this module
+# gets `tests/gui` and never the repository root: `from tests.common import ...` here is a
+# collection error unless an earlier test module happened to put the root on `sys.path` first, and
+# one collection error fails a whole shard. Derive what this module needs instead.
+# `tests/ailment/test_irsb.py` locates the binaries the same way.
+test_location = os.path.join(os.path.dirname(__file__), "..", "..", "..", "binaries", "tests")
+
+# Whether this is a batch run, in which case the decompiled code is not printed.
+WORKER = is_testing or bool(os.environ.get("WORKER", None))
+
+
+def print_decompilation_result(dec) -> None:
+    if WORKER:
+        return
+    print("Decompilation result:")
+    try:
+        console = Console()
+        console.print(Syntax(dec.codegen.text, "c", line_numbers=False))
+    except Exception:  # pylint:disable=broad-exception-caught
+        print(dec.codegen.text)
 
 
 class TestDecompilationWorkflows(unittest.TestCase):
@@ -114,7 +137,8 @@ class TestDecompilationWorkflows(unittest.TestCase):
         print_decompilation_result(dec_2)
 
         assert "int field_120;" in dec_2.codegen.text, "Decompilation results should reflect the retyped struct field."
-        assert f"st_{func.addr:x}_1" not in dec_2.codegen.text
+        # the cached C keeps casts built before the retyping, which name the old type; only its definition is gone
+        assert f"}} st_{func.addr:x}_1;" not in dec_2.codegen.text
 
 
 if __name__ == "__main__":
