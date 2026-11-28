@@ -78,14 +78,14 @@
       "excluded": {
         "tests/exploration_techniques/test_tracer.py::TestTracer::test_cgc_random_syscall_handling_native_interface": "angr's CGC random-syscall emulation desyncs from the trace that shellphish-qemu 0.12.4's cgc-tracer produces (TracerDesyncError). Deterministic, and unrelated to packaging: the qemu binary runs and unicorn is 2.1.4 as angr pins it. The other 24 tracer tests pass.",
         "tests/engines/test_unicorn.py::TestUnicorn::test_similarity_fauxware": {
-          "reason": "unicorn and VEX disagree away from Linux: AngrIncongruencyError, 'Different memory or registers'. Deterministic on both -- it failed all three attempts under --reruns on macOS, and surfaced as an access violation on Windows before that. Upstream runs angr's Windows and macOS suites nightly and gates on neither; its nightly has been red every day this week. Runs and gates on Linux.",
+          "reason": "unicorn and VEX disagree away from Linux: AngrIncongruencyError, 'Different memory or registers'. It is intermittent and nothing under test moves it: the macOS angr shard 3 of 3 passed this test in run 33175323819 and failed it in the next, 33178855303, over a byte-identical angr tree (1d874555) and the same partition -- both split --splits 3 --group 3 against the committed ci/durations/angr.json, and the two heads differ only in ci.yml, ci/coverage.json and ci/run-native.py. Windows shows the same split: of the five shards that ran it before it was deselected there, three passed and two failed, one with an OSError access violation and one with the same AngrIncongruencyError. The reruns do not absorb this shape: --only-rerun matches the exception text against 'crashed' and 'access violation', an AngrIncongruencyError matches neither, so it fails the shard on one attempt. Upstream runs angr's Windows and macOS suites nightly and gates on neither. Runs and gates on Linux.",
           "platforms": [
             "win32",
             "darwin"
           ]
         },
         "tests/exploration_techniques/test_veritesting.py": {
-          "reason": "veritesting is unstable on Windows and upstream has the same problem: its own nightly fails Test Windows (3) on test_veritesting_b, and has every day this week. Here the module has produced an access violation, a crashed xdist worker, a SimSolverModeError and a bare assertion failure across four runs -- different symptoms, one unstable area. The reruns absorb the transient shapes; these are what is left. Runs and gates on Linux and macOS, where it passes.",
+          "reason": "veritesting is unstable on Windows and upstream has the same problem: its nightly failed Test Windows (3) on test_veritesting_b on 2026-08-28, in run 33138392203. Here the module has produced an access violation, a crashed xdist worker, a SimSolverModeError and a bare assertion failure -- different symptoms, one unstable area. The reruns reach only the first two, and by different routes -- a crashed worker is rescheduled on the --reruns budget alone, an access violation matches --only-rerun. The other two match neither regex, so in job 98895004886, with both filters set, the SimSolverModeError and the bare assert each failed on one attempt. Runs and gates on Linux and macOS, where it passes.",
           "platforms": [
             "win32"
           ]
